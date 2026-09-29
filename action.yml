@@ -1,4 +1,4 @@
-name: Perseid
+name: Perseid OpenAPI SDK Generator
 description: Generate SDKs from an OpenAPI spec and open pull requests with the result
 branding:
   icon: package
