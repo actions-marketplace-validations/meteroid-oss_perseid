@@ -9,6 +9,7 @@ use std::{
 
 use anyhow::{Context, Result, bail, ensure};
 use camino::Utf8PathBuf;
+use itertools::Itertools as _;
 use serde_json::Value;
 use tracing_subscriber::prelude::*;
 
@@ -76,6 +77,51 @@ fn layout(language: &str, context: &Value) -> (PathBuf, Vec<(&'static str, PathB
     (runtime, tasks)
 }
 
+fn extension(language: &str) -> &str {
+    match language {
+        "rust" => "rs",
+        "typescript" => "ts",
+        "python" => "py",
+        other => other,
+    }
+}
+
+/// Directories never scanned for stale files: dependencies, build output and VCS metadata.
+fn skipped(name: &str) -> bool {
+    name.starts_with('.')
+        || name.starts_with("perseid-stage-")
+        || matches!(
+            name,
+            "node_modules" | "target" | "build" | "dist" | "vendor" | "__pycache__" | "venv"
+        )
+}
+
+/// Collects `extension` files under `root` (relative to `dir`), so directories that no longer
+/// receive any generated file are still checked for leftovers.
+fn scan_sources(
+    dir: &Path,
+    root: &Path,
+    extension: &str,
+    out: &mut BTreeSet<PathBuf>,
+) -> Result<()> {
+    let Ok(entries) = std::fs::read_dir(dir.join(root)) else {
+        return Ok(());
+    };
+    for entry in entries {
+        let entry = entry?;
+        let name = entry.file_name();
+        let path = clean(&root.join(&name));
+        if entry.file_type()?.is_dir() {
+            if !skipped(&name.to_string_lossy()) {
+                scan_sources(dir, &path, extension, out)?;
+            }
+        } else if path.extension().is_some_and(|e| e == extension) {
+            out.insert(path);
+        }
+    }
+    Ok(())
+}
+
 /// Renders templates, then runtime files, into `stage`. Returns their paths relative to it.
 fn render(
     config: &Config,
@@ -92,12 +138,7 @@ fn render(
         assets_dir.path(),
     )?;
     let (runtime, tasks) = layout(language, context);
-    let extension = match language {
-        "rust" => "rs",
-        "typescript" => "ts",
-        "python" => "py",
-        other => other,
-    };
+    let extension = extension(language);
     let filters = config.filters();
     let mut produced = Vec::new();
     for (template, output) in tasks {
@@ -123,7 +164,11 @@ fn render(
     let runtime_dir = assets_dir.path().join("runtime").join(language);
     if runtime_dir.is_dir() {
         for file in assets::walk(&runtime_dir)? {
-            let name = tokens(file.strip_prefix(&runtime_dir)?.to_str().unwrap(), context)?;
+            let relative = file.strip_prefix(&runtime_dir)?;
+            let Some(relative) = feature_path(relative, context) else {
+                continue;
+            };
+            let name = tokens(relative.to_str().unwrap(), context)?;
             let content = tokens(&std::fs::read_to_string(&file)?, context)?;
             let path = clean(&runtime.join(name));
             fsx::write(&stage.join(&path), content.as_bytes())?;
@@ -140,6 +185,16 @@ fn render(
         );
     }
     Ok(produced)
+}
+
+/// Runtime files under `features/<name>/` are only installed when `sdk.<name>` is true.
+fn feature_path<'a>(relative: &'a Path, context: &Value) -> Option<&'a Path> {
+    let mut parts = relative.components();
+    if parts.next()?.as_os_str() != "features" {
+        return Some(relative);
+    }
+    let feature = parts.next()?.as_os_str().to_str()?;
+    (context.get(feature) == Some(&Value::Bool(true))).then_some(parts.as_path())
 }
 
 /// Substitutes `@@UPPER_SNAKE@@` tokens with `sdk` context values.
@@ -225,27 +280,42 @@ pub fn sdk(
         )?;
     }
     let mut changes = Vec::new();
+    let mut handwritten = Vec::new();
     let mut dirs = BTreeSet::new();
     for path in &produced {
         let new = std::fs::read(stage.path().join(path))?;
         match std::fs::read(dir.join(path)) {
             Ok(old) if old == new => {}
+            Ok(_) if !generated(&dir.join(path)) => handwritten.push(path.clone()),
             Ok(_) => changes.push((Change::Modified(path.clone()), Some(new))),
             Err(_) => changes.push((Change::Added(path.clone()), Some(new))),
         }
         dirs.insert(path.parent().unwrap_or(Path::new("")).to_owned());
     }
+    ensure!(
+        handwritten.is_empty(),
+        "refusing to overwrite files without the `@generated` marker: {}. Delete or rename them \
+         to let perseid generate these paths",
+        handwritten
+            .iter()
+            .map(|p| p.display().to_string())
+            .join(", ")
+    );
     let produced: BTreeSet<_> = produced.into_iter().collect();
+    let mut candidates = BTreeSet::new();
     for relative in dirs {
         let Ok(entries) = std::fs::read_dir(dir.join(&relative)) else {
             continue;
         };
         for entry in entries {
-            let path = relative.join(entry?.file_name());
-            if dir.join(&path).is_file() && !produced.contains(&path) && generated(&dir.join(&path))
-            {
-                changes.push((Change::Removed(path), None));
-            }
+            candidates.insert(relative.join(entry?.file_name()));
+        }
+    }
+    let (runtime, _) = layout(sdk.language, &context);
+    scan_sources(dir, &runtime, extension(sdk.language), &mut candidates)?;
+    for path in candidates {
+        if dir.join(&path).is_file() && !produced.contains(&path) && generated(&dir.join(&path)) {
+            changes.push((Change::Removed(path), None));
         }
     }
     if !options.check {
