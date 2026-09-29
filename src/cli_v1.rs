@@ -53,12 +53,64 @@ struct CliArgs {
 
 #[derive(Clone, Subcommand)]
 enum Command {
+    /// Bootstrap SDK packages and project configuration without overwriting files.
+    Init(crate::project::init::Init),
+    /// Project lifecycle commands (also available directly at the top level).
+    Project {
+        #[command(subcommand)]
+        command: crate::project::ProjectCommand,
+    },
+    Sync {
+        #[arg(long, default_value = "perseid.toml")]
+        config: PathBuf,
+    },
+    Plan(crate::project::Selection),
+    Check(crate::project::Selection),
+    Version {
+        #[command(flatten)]
+        selection: crate::project::Selection,
+        bump: String,
+        #[arg(long)]
+        notes: PathBuf,
+    },
+    Release {
+        #[command(flatten)]
+        selection: crate::project::Selection,
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Prepare a spec with the optional compatibility adapter.
+    Prepare {
+        #[arg(long)]
+        input: PathBuf,
+        #[arg(long)]
+        output: PathBuf,
+        #[arg(long)]
+        report: PathBuf,
+        #[arg(long)]
+        exclude_unsupported: bool,
+        #[arg(long)]
+        normalize_tags: bool,
+    },
+    /// Generate from the legacy codegen/codegen.toml configuration.
+    Sdk {
+        #[arg(long, default_value = "codegen/codegen.toml")]
+        config: PathBuf,
+        #[arg(long = "language")]
+        languages: Vec<String>,
+        #[arg(long)]
+        no_format: bool,
+        #[arg(long)]
+        check: bool,
+    },
     /// Generate code from an OpenAPI spec.
     Generate {
         /// Path to a template file to use (`.jinja` extension can be omitted).
         #[arg(short, long)]
-        template: Utf8PathBuf,
+        template: Option<Utf8PathBuf>,
 
+        #[command(flatten)]
+        project: crate::project::Generation,
         /// Path to the input file(s).
         #[arg(short, long)]
         input_file: Vec<String>,
@@ -79,10 +131,11 @@ enum Command {
     },
 }
 
-#[derive(Copy, Clone, clap::ValueEnum)]
+#[derive(Copy, Clone, clap::ValueEnum, Default)]
 #[clap(rename_all = "kebab-case")]
 pub(crate) enum IncludeMode {
     /// Only public options
+    #[default]
     OnlyPublic,
     /// Both public operations and operations marked with `x-internal`
     PublicAndInternal,
@@ -94,6 +147,70 @@ pub(crate) enum IncludeMode {
 
 pub fn run_cli_v1_main() -> anyhow::Result<()> {
     let args = CliArgs::parse();
+    use crate::project::ProjectCommand;
+    let project = match &args.command {
+        Command::Init(args) => return crate::project::init::run(args),
+        Command::Project { command } => Some(command.clone()),
+        Command::Sync { config } => Some(ProjectCommand::Sync {
+            config: config.clone(),
+        }),
+        Command::Plan(selection) => Some(ProjectCommand::Plan(selection.clone())),
+        Command::Check(selection) => Some(ProjectCommand::Check(selection.clone())),
+        Command::Version {
+            selection,
+            bump,
+            notes,
+        } => Some(ProjectCommand::Version {
+            selection: selection.clone(),
+            bump: bump.clone(),
+            notes: notes.clone(),
+        }),
+        Command::Release { selection, dry_run } => Some(ProjectCommand::Release {
+            selection: selection.clone(),
+            dry_run: *dry_run,
+        }),
+        Command::Generate {
+            template: None,
+            project,
+            ..
+        } => Some(ProjectCommand::Generate(project.clone())),
+        Command::Prepare {
+            input,
+            output,
+            report,
+            exclude_unsupported,
+            normalize_tags,
+        } => {
+            let (spec, coverage) = crate::project::prepare::prepare(
+                crate::project::io::read_json(input)?,
+                &input.to_string_lossy(),
+                &crate::project::prepare::Preparation {
+                    exclude_unsupported: *exclude_unsupported,
+                    normalize_tags: *normalize_tags,
+                },
+            )?;
+            crate::project::io::write(output, &crate::project::io::json(&spec)?)?;
+            return crate::project::io::write(report, &crate::project::io::json(&coverage)?);
+        }
+        Command::Sdk {
+            config,
+            languages,
+            no_format,
+            check,
+        } => {
+            return crate::runner::configured(
+                config,
+                languages,
+                *no_format,
+                *check,
+                &crate::project::assets::Assets::load()?,
+            );
+        }
+        _ => None,
+    };
+    if let Some(command) = project {
+        return crate::project::run(&command);
+    }
     let sdk = if let Some(path) = &args.context_file {
         serde_json::from_str(&fs::read_to_string(path)?).context("parsing template context")?
     } else {
@@ -111,6 +228,7 @@ pub fn run_cli_v1_main() -> anyhow::Result<()> {
     let input_files = match &args.command {
         Command::Generate { input_file, .. } => input_file,
         Command::Debug { input_file } => input_file,
+        _ => unreachable!("handled before loading the spec"),
     };
 
     let api = input_files
@@ -152,6 +270,7 @@ pub fn run_cli_v1_main() -> anyhow::Result<()> {
             no_postprocess,
             ..
         } => {
+            let template = template.context("Missing template")?;
             let generated_paths = match &output_dir {
                 Some(path) => {
                     let generated_paths =
@@ -198,6 +317,7 @@ pub fn run_cli_v1_main() -> anyhow::Result<()> {
             let serialized = ron::ser::to_string_pretty(&api, Default::default())?;
             fs::write("debug.ron", serialized)?;
         }
+        _ => unreachable!("handled before loading the spec"),
     }
 
     if error_occurred.load(Ordering::SeqCst) {
@@ -207,7 +327,7 @@ pub fn run_cli_v1_main() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn get_webhooks(spec: &OpenApi) -> Vec<String> {
+pub(crate) fn get_webhooks(spec: &OpenApi) -> Vec<String> {
     let empty_obj = serde_json::Map::new();
     let mut referenced_components = std::collections::BTreeSet::<String>::new();
     if let Some(webhooks) = spec.extensions.get("x-webhooks") {

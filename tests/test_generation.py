@@ -1,6 +1,5 @@
 """Regression coverage for configuration, overrides, and all preserved templates."""
 
-import importlib.util
 import json
 import os
 from pathlib import Path
@@ -9,28 +8,10 @@ import tempfile
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
-spec = importlib.util.spec_from_file_location("perseid_generate", ROOT / "generate.py")
-generate = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(generate)
+LANGUAGES = ("rust", "java", "typescript", "python", "go")
 
 
 class GenerationTests(unittest.TestCase):
-    def test_runtime_tokens_are_explicit(self):
-        self.assertEqual(
-            generate.render_runtime(
-                "@@CLIENT_NAME@@: @@PACKAGE_NAME@@",
-                {"client_name": "Example", "package_name": "example"},
-            ),
-            "Example: example",
-        )
-        with self.assertRaises(ValueError):
-            generate.render_runtime("@@MISSING@@", {})
-
-    def test_output_paths_cannot_escape_root(self):
-        with tempfile.TemporaryDirectory() as root:
-            with self.assertRaises(ValueError):
-                generate.safe_path(Path(root), "../outside")
-
     def test_all_languages_and_runtime_overrides(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -112,7 +93,7 @@ patch_nullable = false
                 "python": "py",
                 "go": "go",
             }
-            for language in generate.LANGUAGES:
+            for language in LANGUAGES:
                 config += f'\n[{language}]\nruntime_output_dir = "{language}/runtime"\n'
                 if language == "rust":
                     config += '[rust.runtime_overrides]\n"request.rs" = "request.rs"\n'
@@ -140,7 +121,7 @@ patch_nullable = false
             ]
             subprocess.run(command, env=env, check=True, capture_output=True)
             manifest = json.loads((root / "codegen/generated_files.json").read_text())
-            self.assertEqual(set(manifest), set(generate.LANGUAGES))
+            self.assertEqual(set(manifest), set(LANGUAGES))
             self.assertIn("override Example", (root / "rust/api/mod.rs").read_text())
             self.assertIn(
                 "runtime override Example",
@@ -171,6 +152,49 @@ patch_nullable = false
             self.assertTrue(
                 all((root / p).read_bytes() == content for p, content in before.items())
             )
+            # Legacy hooks must retain access to installed dependencies and .git.
+            biome = root / "typescript/node_modules/.bin/biome"
+            biome.parent.mkdir(parents=True)
+            biome.write_text("#!/bin/sh\necho called >> biome-calls\n")
+            biome.chmod(0o755)
+            (root / ".git").mkdir()
+            config = config.replace(
+                "[typescript]\n",
+                "[typescript]\nformat_commands = ['python3 \"$PERSEID_DIR/scripts/format_typescript.py\" typescript']\ncheck_commands = ['test -d .git && test -f typescript/node_modules/.bin/biome']\n",
+            )
+            (root / "codegen/codegen.toml").write_text(config)
+            subprocess.run(
+                [arg for arg in command if arg != "--no-format"]
+                + ["--language", "typescript", "--check"],
+                env=env,
+                check=True,
+                capture_output=True,
+            )
+            self.assertEqual(
+                (root / "typescript/biome-calls").read_text(), "called\ncalled\n"
+            )
+
+            # Exercise a supported RON fixture; the inherited query-schema IR
+            # serializer has a separate pre-existing roundtrip limitation.
+            ron_spec = json.loads((root / "spec.json").read_text())
+            ron_spec["paths"]["/widgets"]["get"].pop("parameters")
+            (root / "ron-source.json").write_text(json.dumps(ron_spec))
+            subprocess.run(
+                [str(binary), "debug", "--input-file", str(root / "ron-source.json")],
+                cwd=root,
+                env=env,
+                check=True,
+                capture_output=True,
+            )
+            ron_config = config.replace(
+                'input_files = ["spec.json"]', 'input_files = ["debug.ron"]'
+            )
+            (root / "codegen/codegen.toml").write_text(ron_config)
+            completed = subprocess.run(command, env=env, capture_output=True)
+            self.assertEqual(completed.returncode, 0, completed.stderr.decode())
+            (root / "codegen/codegen.toml").write_text(config)
+            subprocess.run(command, env=env, check=True, capture_output=True)
+
             # A new transport must fail clearly for targets without its runtime.
             source = json.loads((root / "spec.json").read_text())
             source["paths"]["/events"] = {

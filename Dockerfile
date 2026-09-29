@@ -7,26 +7,45 @@ FROM chef AS planner
 COPY Cargo.toml .
 COPY Cargo.lock .
 COPY src /app/src
+COPY build.rs /app/build.rs
+COPY templates /app/templates
+COPY runtime /app/runtime
+COPY scripts /app/scripts
 
 RUN cargo chef prepare --recipe-path recipe.json
 
 FROM chef AS perseid-builder
 
+# A static musl binary keeps native HTTP/DNS working on Alpine; gcompat cannot
+# provide every resolver symbol used by a glibc-linked Rust HTTP client.
+RUN rustup target add x86_64-unknown-linux-musl && \
+    apt-get update && apt-get install -y --no-install-recommends musl-tools && \
+    rm -rf /var/lib/apt/lists/*
+
 COPY --from=planner /app/recipe.json recipe.json
 
-RUN cargo chef cook --release --recipe-path recipe.json
+RUN cargo chef cook --release --target x86_64-unknown-linux-musl --recipe-path recipe.json
 
 COPY Cargo.toml .
 COPY Cargo.lock .
 COPY src /app/src
+COPY build.rs /app/build.rs
+COPY templates /app/templates
+COPY runtime /app/runtime
+COPY scripts /app/scripts
 
-RUN cargo build --release --bin perseid
+RUN cargo build --release --target x86_64-unknown-linux-musl --bin perseid
 
+
+# Standalone formatters; no Go or Python runtime is required in the final image.
+FROM golang:1.24.7-alpine3.21 AS go-formatter
+FROM ghcr.io/astral-sh/ruff:0.14.10 AS python-formatter
 
 # main image
 FROM alpine:3.21
-ENV PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/root/.cargo/bin"
-RUN apk add --no-cache openjdk21-jre-headless curl gcompat libgcc libstdc++ python3 bash
+ENV CARGO_HOME=/opt/cargo RUSTUP_HOME=/opt/rustup
+ENV PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/opt/cargo/bin"
+RUN apk add --no-cache openjdk21-jre-headless curl gcompat libgcc libstdc++ bash git github-cli
 
 # Java formatter
 RUN echo "25157797a0a972c2290b5bc71530c4f7ad646458025e3484412a6e5a9b8c9aa6 google-java-format-1.25.2-all-deps.jar" > google-java-format-1.25.2-all-deps.jar.sha256 && \
@@ -35,7 +54,7 @@ RUN echo "25157797a0a972c2290b5bc71530c4f7ad646458025e3484412a6e5a9b8c9aa6 googl
     rm google-java-format-1.25.2-all-deps.jar.sha256 && \
     mv google-java-format-1.25.2-all-deps.jar /usr/bin/  && \
     echo "#!/bin/sh" >> /usr/bin/google-java-format && \
-    echo '/usr/bin/java -jar /usr/bin/google-java-format-1.25.2-all-deps.jar $@' >> /usr/bin/google-java-format && \
+    echo '/usr/bin/java -jar /usr/bin/google-java-format-1.25.2-all-deps.jar "$@"' >> /usr/bin/google-java-format && \
     chmod +x /usr/bin/google-java-format
 
 
@@ -59,24 +78,21 @@ RUN apk add --no-cache binutils && \
     --no-update-default-toolchain \
     --default-toolchain nightly-2025-02-27 \
     --component rustfmt && \
-    rm -rf /root/.rustup/toolchains/nightly-*/lib/rustlib && \
-    rm /root/.rustup/toolchains/nightly-*/bin/cargo* && \
-    rm /root/.rustup/toolchains/nightly-*/bin/rust-* && \
-    rm /root/.rustup/toolchains/nightly-*/bin/rustc && \
-    rm /root/.rustup/toolchains/nightly-*/bin/rustdoc && \
-    rm -rf /root/.rustup/toolchains/nightly-*/share && \
-    strip /root/.rustup/toolchains/nightly-*/lib/librustc_driver-*.so && \
+    rm -rf /opt/rustup/toolchains/nightly-*/lib/rustlib && \
+    rm /opt/rustup/toolchains/nightly-*/bin/cargo* && \
+    rm /opt/rustup/toolchains/nightly-*/bin/rust-* && \
+    rm /opt/rustup/toolchains/nightly-*/bin/rustc && \
+    rm /opt/rustup/toolchains/nightly-*/bin/rustdoc && \
+    rm -rf /opt/rustup/toolchains/nightly-*/share && \
+    strip /opt/rustup/toolchains/nightly-*/lib/librustc_driver-*.so && \
     apk del binutils
 
+COPY --from=go-formatter /usr/local/go/bin/gofmt /usr/bin/gofmt
+COPY --from=python-formatter /ruff /usr/bin/ruff
+
 # perseid
-COPY --from=perseid-builder /app/target/release/perseid /usr/bin/
+COPY --from=perseid-builder /app/target/x86_64-unknown-linux-musl/release/perseid /usr/bin/
 
-# Shared assets are versioned with the generator binary.
-COPY templates /opt/perseid/templates
-COPY runtime /opt/perseid/runtime
-COPY scripts /opt/perseid/scripts
-COPY generate.py Cargo.toml /opt/perseid/
-
-ENV PERSEID_BIN=/usr/bin/perseid
-ENV PERSEID_DIR=/opt/perseid
+# Templates/runtimes/helpers are embedded in the native binary.
+ENTRYPOINT ["perseid"]
 ENV PERSEID_JAVA_FORMAT_JAR=/usr/bin/google-java-format-1.25.2-all-deps.jar

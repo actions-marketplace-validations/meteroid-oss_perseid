@@ -8,13 +8,32 @@ supply their own specs and configuration. Version 0.1.0 is the initial extractio
 This is an SDK generator for the schema and HTTP patterns supported by its
 parser and templates, not a complete implementation of every OpenAPI feature.
 
-## Use from an SDK repository
+## Project orchestration
 
-Check out Perseid and run it against an SDK repository's configuration:
+Perseid also synchronizes specs, generates SDKs across one or several repositories,
+opens coordinated GitHub update PRs, and prepares/publishes versioned releases.
+A root `perseid.toml` supplies the spec source and targets; language presets avoid
+repeating template tasks. SDK repositories own independent versions and local
+`.perseid/overrides.toml` customizations. GitHub is optional for local generation.
 
 ```sh
-python3 /path/to/perseid/generate.py --config /path/to/sdk/codegen/codegen.toml
-python3 /path/to/perseid/generate.py --config /path/to/sdk/codegen/codegen.toml --language rust --check
+perseid init --name example --language rust --language typescript --spec openapi.json
+perseid sync
+perseid generate --check
+perseid generate --pr --dry-run
+```
+
+See the [orchestration guide](docs/orchestration.md) and
+[small configuration example](examples/perseid.toml). The existing interfaces
+below remain supported, including all template/runtime extension points.
+
+## Use from an SDK repository
+
+Run the native CLI against an SDK repository's existing configuration:
+
+```sh
+perseid sdk --config /path/to/sdk/codegen/codegen.toml
+perseid sdk --config /path/to/sdk/codegen/codegen.toml --language rust --check
 ```
 
 By default it generates every configured language. Repeat `--language` to
@@ -24,14 +43,21 @@ these commands; the generator does not require a particular checkout layout.
 The config belongs at `<sdk-root>/codegen/codegen.toml`. Paths in the config
 are relative to the SDK root, except `task.template`, which is relative to
 Perseid's template directory. Commands run from the SDK root with `PERSEID_DIR` set.
-Only explicitly configured languages run. `--no-format` skips formatters;
+Only explicitly configured languages run. Standard formatters run automatically
+from `PATH`; the Docker image bundles all five. `format_commands` replaces the
+default adapter when supplied, and `--no-format` skips formatting;
 `--local` remains accepted for compatibility and is the default behavior.
 
-Requires Python 3.11+, Rust 1.88+, and the SDK's formatting/build toolchains.
-The runner builds Perseid with `cargo build --locked`. `PERSEID_BIN` may point to a
-prebuilt binary, but the matching Perseid checkout is still needed for templates,
-runtime files and scripts. Both the binary and the SDK configuration must
-match the assets' package version.
+The CLI and configured runner are native Rust. A prebuilt binary needs no Python,
+Rust compiler, Docker daemon, or source checkout for local generation: all shared
+templates/runtimes and optional helper scripts are embedded. Building Perseid
+requires Rust 1.88+; SDK checks need their own language toolchains.
+
+`generate.py` and `project.py` remain optional compatibility wrappers. They use
+`PERSEID_BIN` or build the native binary with Cargo; they contain no generation or
+orchestration implementation. `PERSEID_DIR` can select an external asset directory
+for development; its contents participate in the input fingerprint. Configured
+Python formatting hooks still need Python, just like other consumer-selected tools.
 
 A Rust configuration looks like this (the SDK package and its dependencies
 must already exist):
@@ -112,10 +138,11 @@ The initial runtime contracts preserve the existing SDK error adapters:
 | Java | `<java_package>.exceptions.ApiException` and `Version.VERSION` |
 | Go | `newAPIError`, `TransportError`, `DecodeError` in the SDK package |
 
-An SDK must supply those adapters and the runtime's language dependencies,
-or override the runtime files. Perseid does not yet scaffold
-a complete publishable package or provide universal authentication adapters;
-the supplied clients implement bearer-token authentication.
+`perseid init` supplies generic adapters and package manifests for these contracts.
+Existing SDKs can retain their own adapters or override the runtime files.
+Scaffolded support files belong to the SDK and are not overwritten by generation.
+The supplied clients implement bearer-token authentication; configure package
+identity, registry credentials and publishing hooks before releasing.
 
 ## Extension points
 
@@ -180,8 +207,11 @@ The runner stages all rendering before replacing SDK files. It tracks ownership
 per language in `codegen/generated_files.json`, preserves other languages during
 partial regeneration, and deletes only stale tracked files with an `@generated`
 marker. `scripts/clean_generated.py <sdk-root>` removes those tracked outputs.
-Rendering failures leave previous SDK output intact; formatter/check failures
-leave the generated output available for inspection.
+Rendering failures leave previous SDK output intact. The legacy `sdk` command runs
+format/check hooks in the existing workspace after rendering, preserving installed
+dependencies and Git context. Its hook failures leave generated changes available
+for inspection. Project `generate --check` stages generation and hooks together
+before applying any destination changes.
 
 ## Rust uploads and event streams
 
@@ -227,14 +257,15 @@ overrides together.
 
 ## Tooling and checks
 
-The consumers choose their own format/check commands. Shared helpers provide
-pinned google-java-format 1.25.2 (checksum verified, Java 21) and Ruff 0.14.10
-(via `uvx`, or an installed matching version). Java formatting reads the output
-manifest and touches only generated files. `PERSEID_JAVA_FORMAT_JAR` can select an
-already downloaded formatter; its checksum is still checked. TypeScript uses
-the SDK's locked Biome dependency via `scripts/format_typescript.py <package-dir>`;
-its import cleanup and formatting touch only generated files. Rust and Go use
-rustfmt and gofmt.
+Standard formatting runs natively using rustfmt, google-java-format, Biome, Ruff,
+and gofmt on `PATH`. The Docker image bundles pinned versions of all five; only
+selected languages require a formatter. Adapters touch only generated files.
+Use `format_commands` for an override or `--no-format` to skip formatting.
+SDK compilation/tests remain configured through `check_commands`.
+
+The older Python helpers remain available for existing configurations; using those
+explicit hooks still requires Python. See the [orchestration guide](docs/orchestration.md)
+for tool versions, Docker usage, init, and destination-owned overrides.
 
 ```sh
 cargo fmt --check
@@ -255,9 +286,11 @@ transport tests through `check_commands`.
 
 The Rust binary is also usable directly (`cargo run -- --help`) for generation
 or IR debugging. `Dockerfile` retains the inherited binary/formatter image and
-ships the shared assets under `/opt/perseid`. The normal runner uses local tools;
+embeds the shared assets in the binary. Generation runs in-process; configured hooks
+use local tools;
 container-based SDK checks need the SDK dependencies and language toolchains.
-The Docker build has not been validated as part of this extraction.
+The Docker image includes the `project` commands and uses `perseid` as its entry
+point; use `--entrypoint` for shell commands.
 
 For consumer CI, check out the same Perseid revision used locally and verify
 the configured `perseid_version` matches. Upgrade that pin and regenerate when
