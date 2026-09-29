@@ -1,0 +1,86 @@
+name: Perseid
+description: Generate SDKs from an OpenAPI spec and open pull requests with the result
+branding:
+  icon: package
+  color: purple
+
+inputs:
+  command:
+    description: Arguments passed to perseid
+    default: generate --pr
+  version:
+    description: Perseid version (default, the action's own tag, else latest)
+    default: ''
+  token:
+    description: GitHub token, needs contents and pull-requests write on every target repository
+    default: ${{ github.token }}
+  working-directory:
+    description: Directory containing perseid.toml
+    default: .
+
+runs:
+  using: composite
+  steps:
+    - name: Install perseid
+      id: setup
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        PERSEID_VERSION: ${{ inputs.version || (startsWith(github.action_ref, 'v') && github.action_ref) || 'latest' }}
+        PERSEID_INSTALL: ${{ runner.temp }}/perseid
+      run: |
+        sh "$GITHUB_ACTION_PATH/install.sh"
+        echo "$PERSEID_INSTALL" >> "$GITHUB_PATH"
+        languages=$(grep -oE '^\[(rust|typescript|python|go|java)[].]' perseid.toml | tr -d '[].' | sort -u | tr '\n' ' ')
+        echo "languages=$languages" >> "$GITHUB_OUTPUT"
+
+    - if: contains(steps.setup.outputs.languages, 'rust')
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        components: rustfmt
+
+    - if: contains(steps.setup.outputs.languages, 'go')
+      uses: actions/setup-go@v5
+      with:
+        go-version: '1.24'
+        cache: false
+
+    - name: Install formatters
+      shell: bash
+      env:
+        LANGUAGES: ${{ steps.setup.outputs.languages }}
+        BIN: ${{ runner.temp }}/perseid
+      run: |
+        arch=$([ "$(uname -m)" = x86_64 ] && echo x64 || echo arm64)
+        fetch() { curl -fsSL --retry 3 -o "$1" "$2"; }
+        case " $LANGUAGES " in *" typescript "*)
+          fetch "$BIN/biome" "https://github.com/biomejs/biome/releases/download/%40biomejs%2Fbiome%402.1.4/biome-linux-$arch"
+          chmod +x "$BIN/biome" ;;
+        esac
+        case " $LANGUAGES " in *" python "*)
+          triple=$([ "$arch" = x64 ] && echo x86_64 || echo aarch64)-unknown-linux-gnu
+          fetch ruff.tar.gz "https://github.com/astral-sh/ruff/releases/download/0.14.10/ruff-$triple.tar.gz"
+          tar -xzf ruff.tar.gz --strip-components 1 -C "$BIN" "ruff-$triple/ruff" && rm ruff.tar.gz ;;
+        esac
+        case " $LANGUAGES " in *" java "*)
+          gjf=https://github.com/google/google-java-format/releases/download/v1.25.2
+          if [ "$arch" = x64 ]; then
+            fetch "$BIN/google-java-format" "$gjf/google-java-format_linux-x86-64"
+          else
+            fetch "$BIN/google-java-format.jar" "$gjf/google-java-format-1.25.2-all-deps.jar"
+            printf '#!/bin/sh\nexec java -jar %s "$@"\n' "$BIN/google-java-format.jar" > "$BIN/google-java-format"
+          fi
+          chmod +x "$BIN/google-java-format" ;;
+        esac
+
+    - name: Run perseid
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        GH_TOKEN: ${{ inputs.token }}
+        COMMAND: ${{ inputs.command }}
+      run: |
+        gh auth setup-git
+        git config user.name >/dev/null || git config --global user.name 'github-actions[bot]'
+        git config user.email >/dev/null || git config --global user.email '41898282+github-actions[bot]@users.noreply.github.com'
+        perseid $COMMAND

@@ -21,7 +21,7 @@ pub fn populate_env(
     mut env: minijinja::Environment<'static>,
 ) -> Result<minijinja::Environment<'static>, minijinja::Error> {
     // === Custom functions ===
-    env.add_function("vec", crate::cli_v2::value_vec::new_value_vec);
+    env.add_function("vec", crate::value_vec::new_value_vec);
 
     // === Custom filters ===
 
@@ -255,8 +255,8 @@ pub fn populate_env(
                         .as_str()
                         .ok_or_else(|| anyhow::anyhow!("Invalid output directory"))?,
                 );
-                let destination = crate::project::io::relative(actual, relative)?;
-                crate::project::io::write(&destination, file_contents.as_bytes())?;
+                let destination = crate::fsx::relative(actual, relative)?;
+                crate::fsx::write(&destination, file_contents.as_bytes())?;
                 Ok(destination)
             })();
             let destination = result.map_err(|error| {

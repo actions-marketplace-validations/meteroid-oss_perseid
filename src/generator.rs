@@ -23,18 +23,8 @@ enum TemplateKind {
     Summary,
 }
 
-pub(crate) fn generate(
-    api: Api,
-    tpl_name: String,
-    output_dir: &Utf8Path,
-    no_postprocess: bool,
-    sdk: serde_json::Value,
-) -> anyhow::Result<Vec<Utf8PathBuf>> {
-    generate_with_output_context(api, tpl_name, output_dir, no_postprocess, sdk, None)
-}
-
 pub(crate) fn generate_with_output_context(
-    api: Api,
+    mut api: Api,
     tpl_name: String,
     output_dir: &Utf8Path,
     no_postprocess: bool,
@@ -61,6 +51,10 @@ pub(crate) fn generate_with_output_context(
         bail!(
             "multipart uploads, binary uploads and event streams currently require the Rust target"
         );
+    }
+
+    if tpl_file_ext != "rs" {
+        api.inline_aliases()?;
     }
 
     let tpl_kind = match tpl_base_name {
@@ -222,7 +216,7 @@ impl Generator<'_> {
 
         let file_path = match state.get_temp("summary_filename") {
             Some(summary_filename) => {
-                let path = crate::project::io::relative(
+                let path = crate::fsx::relative(
                     self.output_dir.as_std_path(),
                     summary_filename
                         .as_str()
