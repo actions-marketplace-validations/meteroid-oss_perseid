@@ -1,3 +1,6 @@
 /target/
 /tests/csharp/bin/
 /tests/csharp/obj/
+/tests/sdk/csharp/**/bin/
+/tests/sdk/csharp/**/obj/
+local/
