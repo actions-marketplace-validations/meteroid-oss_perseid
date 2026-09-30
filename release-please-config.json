@@ -1,0 +1,12 @@
+{
+  "$schema": "https://raw.githubusercontent.com/googleapis/release-please/main/schemas/config.json",
+  "bootstrap-sha": "320db594b73c917b70e9c534a8671f83541f1aba",
+  "packages": {
+    ".": {
+      "release-type": "rust",
+      "bump-minor-pre-major": true,
+      "bump-patch-for-minor-pre-major": true,
+      "include-component-in-tag": false
+    }
+  }
+}
