@@ -63,7 +63,7 @@ jobs:
           token: ${{ secrets.SDK_TOKEN }}   # contents + pull requests write on the SDK repositories
 ```
 
-Self-hosted runners and other CIs use `ghcr.io/meteroid-oss/perseid`, which bundles every pinned formatter.
+Self-hosted runners and other CIs can use `ghcr.io/meteroid-oss/perseid`, which bundles every pinned formatter.
 
 ## Docs
 
@@ -75,11 +75,13 @@ Self-hosted runners and other CIs use `ghcr.io/meteroid-oss/perseid`, which bund
 
 ## Status
 
-Early, and honest about it. OpenAPI 3.0 and 3.1, JSON or YAML; Swagger 2.0 must be converted first
-(`npx swagger2openapi`). Proven on [Meteroid's API](https://github.com/meteroid-oss/meteroid-clients);
-SDKs from the Stripe, GitHub, OpenAI, Twilio, DigitalOcean and Linode specs compile in every
-language, with one operation left out on Stripe and OpenAI. Unsupported constructs fail generation
-loudly, naming the operation or schema: `exclude = ["<operation id>"]` skips one, and an issue with
+OpenAPI 3.0 and 3.1, JSON or YAML; Swagger 2.0 must be converted first (`npx swagger2openapi`)
+
+Used on [Meteroid's API](https://github.com/meteroid-oss/meteroid-clients);
+
+SDKs from the Stripe, GitHub, OpenAI, Twilio, DigitalOcean and Linode specs compile in every language, with one operation left out on Stripe and OpenAI.
+
+Unsupported constructs fail generation loudly, naming the operation or schema: `exclude = ["<operation id>"]` skips one, and an issue with
 the spec attached is the fastest way to get it supported.
 
 ## License
