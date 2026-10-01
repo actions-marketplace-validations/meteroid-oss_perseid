@@ -251,7 +251,9 @@ fn hub_config(api: &GitHub, hub: &str, branch: &str) -> Result<(Config, String)>
         }
     };
     let text = bootstrap::read(api, hub, branch, &path)?.unwrap_or_default();
-    Ok((Config::parse(&text, &format!("{hub}/{path}"))?, path))
+    let mut config = Config::parse(&text, &format!("{hub}/{path}"))?;
+    config.home = config::Home::github(hub, &path);
+    Ok((config, path))
 }
 
 fn admin(info: &Value) -> bool {
