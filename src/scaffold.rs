@@ -13,9 +13,9 @@ use crate::{
     generate::tokens,
 };
 
-/// Gives an SDK without a package manifest its skeleton: manifest, README, error types.
-pub fn bootstrap(config: &Config, sdk: &Sdk, repo: &Path) -> Result<Vec<PathBuf>> {
-    let dir = repo.join(&sdk.path);
+/// Gives the SDK at `dir` its skeleton when it has no package manifest: manifest, README, error
+/// types.
+pub fn bootstrap(config: &Config, sdk: &Sdk, dir: &Path) -> Result<Vec<PathBuf>> {
     let manifests: &[&str] = match sdk.language {
         "rust" => &["Cargo.toml"],
         "typescript" => &["package.json"],
@@ -25,7 +25,7 @@ pub fn bootstrap(config: &Config, sdk: &Sdk, repo: &Path) -> Result<Vec<PathBuf>
         _ => &["build.gradle", "build.gradle.kts", "pom.xml"],
     };
     let dotnet = || {
-        std::fs::read_dir(&dir).is_ok_and(|entries| {
+        std::fs::read_dir(dir).is_ok_and(|entries| {
             entries
                 .flatten()
                 .any(|e| e.path().extension().is_some_and(|x| x == "sln"))
@@ -35,7 +35,7 @@ pub fn bootstrap(config: &Config, sdk: &Sdk, repo: &Path) -> Result<Vec<PathBuf>
         return Ok(vec![]);
     }
     let mut created = Vec::new();
-    for (path, content) in skeleton(config, sdk, &dir)? {
+    for (path, content) in skeleton(config, sdk, dir)? {
         let target = dir.join(path);
         if !target.exists() {
             fsx::write(&target, &content)?;
@@ -126,6 +126,10 @@ pub fn release_workflow(branch: &str) -> Vec<u8> {
         .expect("the embedded release workflow");
     String::from_utf8_lossy(template)
         .replace("\"@@BRANCH@@\"", &Value::from(branch).to_string())
+        .replace(
+            "meteroid-oss/perseid/publish@v0",
+            &crate::github::uses("publish"),
+        )
         .into_bytes()
 }
 

@@ -3,8 +3,9 @@
 ## Repository layouts
 
 `perseid.toml` lives in the repository that holds the SDKs, or orchestrates them: it lists the SDKs
-(`sdks`), where they live (`repo`) and the spec they are generated from (`spec`), and `perseid setup`
-makes GitHub match it. It never says where the spec comes from: when another repository holds the
+(`sdks`), where they live (`repo`) and the spec they are generated from (`spec`). `perseid init`
+writes the workflows it calls for, which you commit, and `perseid setup-github` sets up what files
+can't hold, once you agree. It never says where the spec comes from: when another repository holds the
 spec, `perseid connect` run there pushes it here.
 
 Which one to pick: the SDKs next to the API unless other teams own them, one repository per
@@ -49,8 +50,9 @@ acme/api ──spec──▶ acme/api-sdks ──PRs──▶ acme/api-typescrip
 
 ```sh
 # in acme/api-sdks
-npx perseid init                  # perseid.toml: spec = "openapi.json", sdks, repo
-npx perseid setup                 # sdks.yml, release files, the App for other repositories
+npx perseid init                  # perseid.toml (spec = "openapi.json", sdks, repo) and workflows
+git add -A && git commit -m "ci: generate the SDKs with perseid" && git push
+npx perseid setup-github          # SDK repositories and the App, once you agree
 # in acme/api, once perseid.toml is on acme/api-sdks's default branch
 npx perseid connect acme/api-sdks # deploy key, perseid-push.yml to commit
 ```
@@ -69,27 +71,64 @@ their description names the URL and a digest of what it served.
 
 ## GitHub Action
 
+`perseid init` writes `.github/workflows/sdks.yml`, the same with or without a GitHub App. It
+pins the release line, `@v0.6`: before 1.0 a minor release may break, and `perseid init` writes
+the line of the perseid that wrote the workflow, updating it when you run it again with a newer one.
+
 ```yaml
-# .github/workflows/sdks.yml in the repository that owns openapi.json
+name: SDKs
+
 on:
   push:
-    branches: [main]
-    paths: [openapi.json, perseid.toml]
+    branches: ["main"]
+    paths: ["openapi.json","perseid.toml",".github/workflows/sdks.yml"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency: sdks
+
 jobs:
   sdks:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
-      - uses: meteroid-oss/perseid@v0
+      - uses: actions/checkout@v5
+      - if: hashFiles('openapi.json') != ''
+        uses: meteroid-oss/perseid@v0.6
         with:
-          token: ${{ secrets.SDK_TOKEN }}   # contents + pull requests write on the SDK repositories
+          app-id: ${{ vars.SDK_APP_ID }}
+          app-private-key: ${{ secrets.SDK_APP_PRIVATE_KEY }}
 ```
 
-The Action installs the perseid version matching its own ref and runs `generate --pr`: it commits
-the generated files on top of the branch it runs on to `perseid/update` and opens or updates a
-pull request, in this repository or in the SDK repositories named by `repo`. For pull request
-checks, pass `command: generate --check`, which fails on drift. See [Tokens](#tokens) for which
-`token` to pass.
+The Action installs the perseid version matching its own ref, then:
+
+1. `perseid tools list --github-output` reads the SDKs of `perseid.toml`, for the toolchains to set
+   up (Rust, Go, .NET), and the account and repositories of the App token;
+2. `perseid tools install` downloads the pinned formatters they need and oasdiff;
+3. with `app-id`, it mints a token of that App, for the repository holding `perseid.toml` and the
+   SDK repositories of the App's account, with Contents and Pull requests write only;
+4. it runs `generate --pr`: perseid commits the generated files on top of the branch it runs on
+   to `perseid/update` and opens or updates a pull request, in this repository or in the SDK
+   repositories named by `repo`, sized and described as [Releases](#releases) says.
+
+| Input | Default | |
+|---|---|---|
+| `command` | `generate --pr` | arguments passed to perseid: `generate --check` fails on drift, for pull request checks |
+| `app-id`, `app-private-key` | | a GitHub App whose token the Action mints and uses instead of `token` |
+| `token` | `github.token` | without an App, a token with Contents and Pull requests write on every target repository (see [Tokens](#tokens)) |
+| `working-directory` | `.` | the directory holding `perseid.toml` |
+| `version` | the Action's ref | the perseid version to run |
+| `bump` | `auto` | `--bump`: `auto`, `major`, `minor` or `patch` |
+| `base-spec` | | `--base-spec`: the previous spec `auto` compares with |
+| `relax-enum-additions` | `true` | `--relax-enum-additions` |
+| `auto-merge` | `false` | `--auto-merge` |
+| `ci-workflows` | | `--dispatch`, with the default token only |
+
+The inputs reach `perseid generate` as `PERSEID_BUMP`, `PERSEID_BASE_SPEC`,
+`PERSEID_RELAX_ENUM_ADDITIONS`, `PERSEID_AUTO_MERGE` and `PERSEID_DISPATCH`, which it reads like
+its flags.
 
 `generate --pr` also works locally: it copies the generated files, the spec and a new SDK's
 skeleton into a temporary worktree of `origin/<your branch>` (the default branch when yours isn't
@@ -97,7 +136,7 @@ pushed) and commits there, so your branch, index, handwritten changes and unpush
 out of the pull request. Without a git identity configured, commits are
 authored by `github-actions[bot]`.
 
-## Quick setup: `perseid setup` and `perseid connect`
+## Quick setup: `perseid init`, `perseid setup-github` and `perseid connect`
 
 You need:
 
@@ -109,36 +148,41 @@ You need:
 - for each SDK you publish, an account on its registry (npm, PyPI, crates.io, Maven Central,
   NuGet) to set up trusted publishing at the end.
 
-`perseid init` writes `perseid.toml`, and nothing else: it finds the spec of the repository
-(`git ls-files` for an `openapi`/`swagger` JSON or YAML file holding an `openapi:` or `swagger:`
-key), asks which SDKs to generate and where they live. Without a terminal, pass `--sdks`, and
-optionally `--repo`, `--spec` and `--name`. Without a spec, `spec` is `openapi.json`, which
+`perseid init` works in your clone only: it finds the spec of the repository (`git ls-files` for an
+`openapi`/`swagger` JSON or YAML file holding an `openapi:` or `swagger:` key), asks which SDKs to
+generate, where they live and the client name, then writes `perseid.toml`, prints the package each
+SDK publishes, and writes the workflows: `.github/workflows/sdks.yml` and, for the SDKs living
+here, `sdk-release.yml` and the release-please files. Commit and push them: the workflows run from
+the default branch. Run `init` again after editing `perseid.toml` to refresh them; it rewrites the
+workflows it wrote, and only warns about one whose first line you removed. Without a terminal,
+pass `--sdks`, and optionally `--repo`, `--spec` and `--name`. Without a spec, `spec` is `openapi.json`, which
 `perseid connect` will push; `perseid generate --spec <path|url>` previews the SDKs meanwhile.
 `perseid generate` starts each SDK from its package skeleton (manifest, README, errors) the first
-time.
+time, and prints where each one went. An SDK with its own `repo` is generated into a shallow clone
+of it under `.perseid/repos/<owner>/<name>`, reset on each run: changes there perseid didn't generate stop `generate`
+unless `--pr` is passed. Before `perseid setup-github` creates those repositories,
+`perseid generate --out <dir>` previews every SDK in `<dir>/<language>` (or `<dir>/<path>`) without cloning anything,
+and `--out <dir> --check` compares against that directory.
 
-Then, in the same clone, `perseid setup` signs in with `GH_TOKEN`, the `gh` CLI's token or a
-browser login (it stores no token), compares `perseid.toml` with GitHub and prints the plan: `+` to
-add, `~` to change, `=` already in place, and warnings such as generated paths taken by files
-perseid didn't write. Once confirmed, it:
+Then, in the same clone, `perseid setup-github` checks `perseid.toml`, signs in with `GH_TOKEN`,
+the `gh` CLI's token or a browser login (it stores no token), compares it with GitHub and prints
+the plan: `+` to add, `~` to change, `=` already in place, and warnings such as generated paths
+taken by files perseid didn't write, or workflows not pushed yet. Once you agree, it:
 
-1. creates the missing SDK repositories, as private or public as the one it runs in, and reuses
-   existing ones: it only adds missing files and merges release-please packages into an existing
-   `release-please-config.json`;
-2. commits `sdk-release.yml` and the release-please files to each SDK repository with your
-   token, so the App needs no permission on workflow files (`release = false` in `perseid.toml`
-   leaves them out), and rewrites `sdk-release.yml` when it differs from what setup writes;
-3. creates a GitHub App in your browser (Contents and Pull requests write, no webhook) when SDKs
-   live in other repositories than the workflow's, stores its `SDK_APP_ID` variable and
-   `SDK_APP_PRIVATE_KEY` secret where they are used, and waits while you install it; when every
-   SDK lives here, it lets GitHub Actions open pull requests instead (its workflow then uses the
-   default token);
-4. opens a pull request adding `.github/workflows/sdks.yml`, `perseid.toml` and the release files
-   (a new, empty repository gets its files committed directly), and stages them in your clone;
-5. lists the pull requests to merge, what each registry needs and, when the spec isn't in the
+1. creates the missing SDK repositories, as private or public as the one it runs in;
+2. adds `sdk-release.yml` and the release-please files to each SDK repository: committed to a
+   new, empty one, through a pull request to an existing one, merging release-please packages into
+   an existing `release-please-config.json` (`release = false` in `perseid.toml` leaves them out);
+3. creates a GitHub App in your browser (Contents and Pull requests write, no webhook), stores its
+   `SDK_APP_ID` variable and `SDK_APP_PRIVATE_KEY` secret where they are used, and waits while you
+   install it. Pull requests the App opens run your CI. With every SDK here, `--no-app` lets GitHub
+   Actions open them with the default token instead, which needs no credentials but runs no CI on
+   them;
+4. lists the pull requests to merge, what each registry needs and, when the spec isn't in the
    repository yet, the `perseid connect` to run in the one holding it.
 
-`perseid setup` never touches the API repository. `perseid connect <owner/sdks-repo>`, run in it,
+Declining changes nothing and prints how to make each change yourself. `perseid setup-github`
+never touches the API repository. `perseid connect <owner/sdks-repo>`, run in it,
 does: it finds its spec (or `--spec <path>`; `--build "<command>"` when CI writes it instead of
 committing it), asks when to push it, proposing `release` when the repository publishes GitHub
 releases and `change` otherwise (`--on change|release|tag`, `--tags` for `tag`), then plans:
@@ -164,8 +208,9 @@ automation fares. In the SDKs repository: the last spec pushed (commit, release 
 `perseid/update` pull requests, the last `sdks.yml` run and the App installation. In the API
 repository, without a `perseid.toml`: the key and secret `perseid-push.yml` needs, the
 last spec the SDKs repository received and the last `perseid-push.yml` run. Each problem comes with
-the fix; it exits with 1 when something needs you. Without GitHub credentials it checks the clone
-only.
+the fix. It exits with 2 when something waits on you (changes to apply, workflows to refresh with
+`perseid init` or to push), 1 on errors, 0 otherwise. Without GitHub credentials it checks the
+clone only.
 
 ### Spec pushes
 
@@ -214,7 +259,7 @@ Events caused by the default `GITHUB_TOKEN` start no workflow, except `workflow_
 ([GitHub docs](https://docs.github.com/en/actions/concepts/security/github_token)).
 
 **SDKs in this repository**: no token needed. Give the job `contents: write`,
-`pull-requests: write` and `actions: write`, and list your CI workflows in `ci-workflows`: with the
+`pull-requests: write` and `actions: write`, and list your CI workflows in `ci-workflows` (`--dispatch`): with the
 default token, the Action dispatches them on `perseid/update` after opening or updating the pull
 request. Each needs `on: workflow_dispatch`. Checks of dispatched runs show on the branch and in
 the Actions tab, but neither in the pull request's checks nor as required status checks, which only
@@ -251,7 +296,7 @@ repository variable lists workflow files and no other token is configured.
 **SDKs in other repositories**: the default token cannot reach them. Either:
 
 - a fine-grained personal access token limited to the SDK repositories, with Contents and Pull
-  requests read and write, stored as a secret (`SDK_TOKEN` above);
+  requests read and write, stored as a secret and passed as `token`;
 - or, for organizations, your own GitHub App, whose installation tokens expire after an hour and are
   therefore minted in the workflow, never stored:
   1. create a GitHub App (organization settings, Developer settings, GitHub Apps), webhook off,
@@ -259,22 +304,16 @@ repository variable lists workflow files and no other token is configured.
   2. install it on the spec and SDK repositories;
   3. store its App ID as the `SDK_APP_ID` variable and a generated private key as the
      `SDK_APP_PRIVATE_KEY` secret;
-  4. mint the token in the job:
+  4. pass them to the Action, which mints the token on each run, for the repository holding
+     `perseid.toml` and the SDK repositories of the App's account (`perseid tools list
+     --github-output` prints them as `owner` and `repositories`), with Contents and Pull requests
+     write only; without an `app-id`, it uses `token`:
 
 ```yaml
-    steps:
-      - uses: actions/checkout@v4
-      - id: app
-        if: vars.SDK_APP_ID != ''
-        uses: actions/create-github-app-token@v2
+      - uses: meteroid-oss/perseid@v0.6
         with:
           app-id: ${{ vars.SDK_APP_ID }}
-          private-key: ${{ secrets.SDK_APP_PRIVATE_KEY }}
-          owner: ${{ github.repository_owner }}
-          repositories: acme-typescript,acme-python   # the SDK repositories
-      - uses: meteroid-oss/perseid@v0
-        with:
-          token: ${{ steps.app.outputs.token || secrets.SDK_TOKEN }}
+          app-private-key: ${{ secrets.SDK_APP_PRIVATE_KEY }}
 ```
 
 Pull requests and merges made with either token start workflows like a person's would, so SDK CI,
@@ -293,7 +332,7 @@ write per job, as the examples do.
 
 ## Self-hosted runners and other CIs
 
-`ghcr.io/meteroid-oss/perseid` bundles perseid, git, gh and every pinned formatter.
+`ghcr.io/meteroid-oss/perseid` bundles perseid, git, gh, oasdiff and every pinned formatter.
 
 ```yaml
 jobs:
@@ -308,19 +347,23 @@ jobs:
 ```
 
 Or anywhere: `docker run --rm -u "$(id -u):$(id -g)" -v "$PWD:/work" ghcr.io/meteroid-oss/perseid generate --check`.
+Without the image, `perseid tools install [--dir <bin>]` downloads the pinned formatters the SDKs
+of `perseid.toml` need (or those of the languages it is given) and oasdiff, next to perseid by
+default; `perseid tools list` prints them with their versions. Rust, Go and .NET toolchains bring
+`rustfmt`, `gofmt` and the `dotnet` that installs `csharpier`.
 
 ## Releases
 
-Every SDK keeps its own version, in its own manifest, and is released on its own. `perseid setup`
-adds [release-please](https://github.com/googleapis/release-please) (`release-please-config.json`)
+Every SDK keeps its own version, in its own manifest, and is released on its own. `perseid init`
+writes [release-please](https://github.com/googleapis/release-please) (`release-please-config.json`)
 and `.github/workflows/sdk-release.yml` to the root of each repository holding SDKs (skip them with
 `release = false` in `perseid.toml`). With `perseid.toml` in a folder, the release files still go
 at the root, where GitHub and release-please read them, and the release-please packages are named
 by their path from the root (`api/typescript`).
 
 `sdk-release.yml` runs release-please on pushes to the repository's default branch, never in forks.
-Setup rewrites it when it differs from what it writes: delete its first line,
-``# Written by `perseid setup` ``, to keep your own version (setup then only warns). Registries
+`perseid init` rewrites it when it differs from what it writes: delete its first line,
+``# Written by `perseid init` ``, to keep your own version (init then only warns). Registries
 trust its file name and its `release` environment, so keep both. Running it by hand publishes one
 package again, from the selected tag or branch: its `path` input must name a package of
 `release-please-config.json` (`.` for the root). The publish job installs npm dependencies without
@@ -328,9 +371,14 @@ running their scripts, which would otherwise see its OIDC token.
 
 Releases go as follows:
 
-1. The Action titles its pull request as a conventional commit sized by
+1. `generate --pr` titles its pull request as a conventional commit sized by
    [oasdiff](https://github.com/oasdiff/oasdiff): `feat(api)!:` for breaking API changes,
-   `feat(api):` for other API changes, `fix(api):` otherwise (`bump` input, `--bump` flag).
+   `feat(api):` for other API changes, `fix(api):` otherwise, and appends oasdiff's changelog to
+   its description. It compares the spec with `--base-spec` (`base-spec` input), else with the spec
+   file before the pushed commits (`GITHUB_EVENT_BEFORE`, which the Action sets), else at the
+   previous commit; without any, or without oasdiff, it asks for a minor release. `--bump
+   major|minor|patch` (`bump` input) skips the comparison. An open pull request keeps its largest
+   bump.
 2. Merging it, or any `fix:`/`feat:` commit touching an SDK, opens a release PR bumping the
    touched SDKs and their changelogs. Before 1.0, breaking changes bump the minor version.
 3. Merging the release PR tags each SDK (`rust/v0.4.0`; Go tags carry the module's folder, such as
@@ -339,10 +387,10 @@ Releases go as follows:
    npm and PyPI, a Central Portal token and GPG key for Maven Central, an API key for NuGet, the
    module proxy for Go. Versions already on the registry are skipped, so re-running a failed job is safe.
 
-`relax-enum-additions` (default `true`) counts enum values added to responses as minor changes.
+`--relax-enum-additions` (default `true`) counts enum values added to responses as minor changes.
 That is only safe while the SDKs accept unknown enum values, which generated SDKs do.
 
-`auto-merge: true` enables GitHub auto-merge on the generated pull requests and, through their
+`--auto-merge` (`auto-merge: true`) enables GitHub auto-merge on the generated pull requests and, through their
 `perseid:auto-release` label, on the release PRs they lead to. It needs:
 
 - "Allow auto-merge" in the repository settings;
@@ -363,5 +411,6 @@ published with it, and caches it.
 
 Output goes through `rustfmt`, `biome`, `ruff`, `gofmt`, `google-java-format` and `csharpier`,
 with your SDK's own formatter configuration. Locally, missing `biome` or `ruff` run pinned through
-`npx` or `uvx`. The Action reads the languages from `perseid.toml` and installs only the pinned
-native formatters they need: no JVM, Node or Python setup (`csharpier` installs as a .NET tool).
+`npx` or `uvx`. The Action runs `perseid tools install`, which reads the languages from
+`perseid.toml` and downloads only the pinned native formatters they need: no JVM, Node or Python
+setup (`csharpier` installs as a .NET tool).

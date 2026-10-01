@@ -1,11 +1,13 @@
-//! `perseid setup` and `perseid status`: the GitHub side of the layout perseid.toml declares,
-//! planned then applied from the terminal with the user's own GitHub credentials.
+//! `perseid setup-github` and `perseid status`: the GitHub side of the layout perseid.toml
+//! declares, planned then applied from the terminal with the user's own GitHub credentials, once
+//! they agree. Files go through the user's own commits: `perseid init` writes them.
 
 mod api;
 mod app;
 mod auth;
 mod bootstrap;
 mod connect;
+mod files;
 mod layout;
 mod link;
 mod plan;
@@ -22,15 +24,17 @@ use std::{
 use anyhow::{Context, Result, bail};
 
 pub use connect::{Connect, connect};
+pub use files::{Written, write as write_files};
 pub use layout::origin_repo;
 pub use link::{Auth, Push, PushOn, push_workflow};
 pub use push::{PushSpec, push_spec};
 pub use status::status;
 
-use crate::config::{Config, Sdk, Source};
+use crate::config::{Config, Source};
 use api::GitHub;
 
 pub const SETUP_BRANCH: &str = "perseid/setup";
+const SDKS_WORKFLOW_NAME: &str = "sdks.yml";
 
 pub struct Options {
     pub yes: bool,
@@ -126,46 +130,51 @@ impl Ui {
     }
 }
 
-/// `perseid setup`: plans what GitHub lacks for perseid.toml to hold, then applies it once
-/// confirmed. With `--dry-run`, exits 2 when changes are pending.
-pub fn setup(config_path: &Path, options: &Options) -> Result<ExitCode> {
+/// `perseid setup-github`: plans what GitHub lacks for perseid.toml to hold, then applies it
+/// once agreed. With `--dry-run`, exits 2 when changes are pending.
+pub fn setup_github(config_path: &Path, options: &Options, app: bool) -> Result<ExitCode> {
     let ui = Ui::new(options);
+    let (_, root) = Config::load(config_path)?;
+    layout::required_origin_repo(&root, "the repository holding perseid.toml")?;
     let (token, source) = auth::token(&ui)?;
     let api = GitHub::new(Some(token));
-    let login = auth::whoami(&api, source)?;
+    let login = auth::whoami(&api, source, true)?;
     ui.ok(&format!("Signed in to GitHub as {login} ({source})"));
     let cx = plan::Session {
         api: &api,
         login: &login,
+        app,
         collisions: true,
     };
-    let plan = plan::plan(&cx, config_path)?;
+    let mut plan = plan::plan(&cx, config_path)?;
     println!("\n{}\n", plan.diagram);
     plan.print();
     let pending = plan.pending();
     if pending == 0 {
         println!();
-        ui.ok("In sync: nothing to change");
-        if plan.awaits_spec {
-            connect_hint(&plan);
-        }
+        ui.ok("In sync on GitHub: nothing to change");
+        next_steps(&plan, &[], &ui)?;
         return Ok(ExitCode::SUCCESS);
     }
     if options.dry_run {
         return Ok(ExitCode::from(2));
     }
     let question = match pending {
-        1 => "Apply this change?".to_owned(),
-        n => format!("Apply these {n} changes?"),
+        1 => "Apply this change on GitHub?".to_owned(),
+        n => format!("Apply these {n} changes on GitHub?"),
     };
     if !ui.confirm(&question, true)? {
-        bail!("nothing changed");
+        println!();
+        ui.say("Nothing changed on GitHub. To do it yourself:");
+        for manual in plan.manual() {
+            ui.info(&manual);
+        }
+        return Ok(ExitCode::SUCCESS);
     }
     println!();
-    let mut plan = plan;
     let pulls = plan::apply(&api, &mut plan, &ui)?;
     println!("\n✓ {}", plan.diagram);
-    checklist(&plan, &pulls, &ui)?;
+    next_steps(&plan, &pulls, &ui)?;
     Ok(ExitCode::SUCCESS)
 }
 
@@ -204,25 +213,30 @@ fn credentials(api: &GitHub, app: &app::App, hub: &str, repos: &[String], ui: &U
     Ok(())
 }
 
-/// The GitHub App token of a workflow: the account and repositories it covers.
-pub struct AppToken<'a> {
-    /// Another account than the workflow repository's.
-    pub owner: Option<&'a str>,
-    pub repositories: &'a [String],
-}
-
 /// sdks.yml, regenerating the SDKs when the spec changes on `branch`.
 pub struct Workflow<'a> {
     pub branch: &'a str,
     pub paths: &'a [String],
-    /// The App's token, or the default token when every SDK lives in the workflow's repository.
-    pub app: Option<AppToken<'a>>,
     /// perseid.toml's directory.
     pub dir: &'a str,
     /// Also runs daily, at a minute derived from this, for specs fetched from a URL.
     pub daily: Option<&'a str>,
     /// Skips generating until this file exists.
     pub requires: Option<&'a str>,
+}
+
+/// `meteroid-oss/perseid`, or its `action` folder, at the tag of this binary's release line:
+/// `v0.6` for 0.6.x, since minor releases may break before 1.0, then `v1` for 1.x.
+pub fn uses(action: &str) -> String {
+    let tag = match env!("CARGO_PKG_VERSION").split('.').collect::<Vec<_>>()[..] {
+        ["0", minor, ..] => format!("v0.{minor}"),
+        [major, ..] => format!("v{major}"),
+        [] => "v0".to_owned(),
+    };
+    match action {
+        "" => format!("meteroid-oss/perseid@{tag}"),
+        action => format!("meteroid-oss/perseid/{action}@{tag}"),
+    }
 }
 
 pub fn workflow(w: &Workflow) -> String {
@@ -234,49 +248,19 @@ pub fn workflow(w: &Workflow) -> String {
         }
         None => String::new(),
     };
-    let mut with = String::new();
-    if w.app.is_some() {
-        with += "          token: ${{ steps.app.outputs.token }}\n";
-    }
-    if !w.dir.is_empty() {
-        with += &format!("          working-directory: {}\n", w.dir);
-    }
-    let condition = match w.requires {
-        Some(file) => format!(
-            "      - if: hashFiles('{file}') != ''\n        uses: meteroid-oss/perseid@v0\n"
-        ),
-        None => "      - uses: meteroid-oss/perseid@v0\n".to_owned(),
+    let action = uses("");
+    let step = match w.requires {
+        Some(file) => format!("      - if: hashFiles('{file}') != ''\n        uses: {action}\n"),
+        None => format!("      - uses: {action}\n"),
     };
-    let perseid = match with.is_empty() {
-        true => condition,
-        false => format!("{condition}        with:\n{with}"),
-    };
-    let (header, permissions, app) = match &w.app {
-        Some(app) => (
-            "opens\n# their pull requests with a token of the GitHub App set as SDK_APP_ID and SDK_APP_PRIVATE_KEY.",
-            "contents: read",
-            format!(
-                r#"      # App installation tokens expire after an hour, so they are minted on each run.
-      - id: app
-        uses: actions/create-github-app-token@v2
-        with:
-          app-id: ${{{{ vars.SDK_APP_ID }}}}
-          private-key: ${{{{ secrets.SDK_APP_PRIVATE_KEY }}}}
-          owner: {}
-          repositories: {}
-"#,
-                app.owner.unwrap_or("${{ github.repository_owner }}"),
-                app.repositories.join(","),
-            ),
-        ),
-        None => (
-            "opens\n# their pull requests in this repository with the default token.",
-            "contents: write\n  pull-requests: write",
-            String::new(),
-        ),
+    let dir = match w.dir {
+        "" => String::new(),
+        dir => format!("          working-directory: {dir}\n"),
     };
     format!(
-        r#"# Written by `perseid setup`: regenerates the SDKs when the spec changes and {header}
+        r#"# Written by `perseid init`: regenerates the SDKs when the spec changes and opens their pull
+# requests, with a token of the GitHub App set as SDK_APP_ID and SDK_APP_PRIVATE_KEY, or else the
+# default token.
 name: SDKs
 
 on:
@@ -286,18 +270,20 @@ on:
 {schedule}  workflow_dispatch:
 
 permissions:
-  {permissions}
+  contents: write
+  pull-requests: write
 
-concurrency:
-  group: sdks
-  cancel-in-progress: false
+concurrency: sdks
 
 jobs:
   sdks:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v5
-{app}{perseid}"#,
+{step}        with:
+          app-id: ${{{{ vars.SDK_APP_ID }}}}
+          app-private-key: ${{{{ secrets.SDK_APP_PRIVATE_KEY }}}}
+{dir}"#,
         branch = w.branch,
     )
 }
@@ -342,75 +328,7 @@ fn join(dir: &str, path: &str) -> String {
     }
 }
 
-/// The new files of this checkout a setup commits: spec, release files, SDKs generated here.
-fn local_files(top: &Path, dir: &str, config: &Config, sdks: &[Sdk]) -> Result<Vec<String>> {
-    let mut specs = Vec::new();
-    if config.release != Some(false) && sdks.iter().any(|s| s.repo.is_none()) {
-        specs.extend(
-            [
-                "release-please-config.json",
-                ".release-please-manifest.json",
-                crate::scaffold::RELEASE_WORKFLOW,
-            ]
-            .map(str::to_owned),
-        );
-    }
-    if let Source::File(file) = config.source() {
-        specs.push(join(dir, file));
-    }
-    specs.extend(
-        sdks.iter()
-            .filter(|s| s.repo.is_none())
-            .map(|s| join(dir, &s.path)),
-    );
-    let mut args = vec![
-        "status",
-        "--porcelain=v1",
-        "-z",
-        "--untracked-files=all",
-        "--",
-    ];
-    args.extend(specs.iter().map(String::as_str));
-    let status = git(top, &args)?;
-    let mut files = Vec::new();
-    for entry in status.split(|b| *b == 0).filter(|e| e.len() > 3) {
-        if entry.starts_with(b"??") || entry.starts_with(b"A") {
-            files.push(String::from_utf8_lossy(&entry[3..]).into_owned());
-        }
-    }
-    files.sort();
-    files.dedup();
-    Ok(files)
-}
-
-fn executable(path: &Path) -> bool {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::metadata(path).is_ok_and(|m| m.permissions().mode() & 0o111 != 0)
-    }
-    #[cfg(not(unix))]
-    {
-        path.file_name().is_some_and(|n| n == "gradlew")
-    }
-}
-
-/// Stages the committed local files, so pulling the merged commit doesn't trip over them.
-fn stage(top: &Path, paths: &[String]) -> Result<()> {
-    let mut args = vec!["add", "--"];
-    args.extend(paths.iter().map(String::as_str));
-    git(top, &args)?;
-    Ok(())
-}
-
-fn connect_hint(plan: &plan::Plan) {
-    println!(
-        "\nNext: in the repository that holds your OpenAPI spec, run `npx perseid connect {}`",
-        plan.hub
-    );
-}
-
-fn checklist(plan: &plan::Plan, pulls: &[String], ui: &Ui) -> Result<()> {
+fn next_steps(plan: &plan::Plan, pulls: &[String], ui: &Ui) -> Result<()> {
     let (config, hub) = (plan.config(), plan.hub.as_str());
     println!("\nNext steps");
     let mut step = 0;
@@ -418,18 +336,16 @@ fn checklist(plan: &plan::Plan, pulls: &[String], ui: &Ui) -> Result<()> {
         step += 1;
         ui.info(&format!("{step}. {text}"));
     };
-    match pulls {
-        [] => {}
-        [one] => item(format!(
-            "Merge {one}, then `git pull`: perseid staged the files it adds here"
-        )),
-        [first, rest @ ..] => item(format!(
-            "Merge {first} first, then {}, and `git pull`",
-            rest.join(", ")
-        )),
+    if plan.unpushed {
+        item(format!(
+            "Commit and push the files `perseid init` wrote here: {SDKS_WORKFLOW_NAME} runs once it is on the default branch of {hub}"
+        ));
+    }
+    for pull in pulls {
+        item(format!("Merge {pull}: it adds the release files there"));
     }
     for sdk in config.sdks(&[])? {
-        let repo = sdk.repo.as_deref().unwrap_or(hub);
+        let repo = sdk.remote().unwrap_or(hub);
         let context = config.context(&sdk, Path::new("/nonexistent"));
         let text = |key: &str| context[key].as_str().unwrap_or_default().to_owned();
         let publisher = format!("repository {repo}, workflow sdk-release.yml, environment release");
@@ -479,16 +395,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn workflows_pin_the_release_line_of_this_binary() {
+        let version = env!("CARGO_PKG_VERSION");
+        let line = match version.strip_prefix("0.") {
+            Some(rest) => format!("v0.{}", rest.split('.').next().unwrap()),
+            None => format!("v{}", version.split('.').next().unwrap()),
+        };
+        assert_eq!(uses(""), format!("meteroid-oss/perseid@{line}"));
+        assert_eq!(uses("push"), format!("meteroid-oss/perseid/push@{line}"));
+    }
+
+    #[test]
     fn the_workflow_runs_in_the_config_directory() {
         let paths = ["api/openapi.json".to_owned(), "api/perseid.toml".to_owned()];
-        let repositories = ["api".to_owned(), "acme-node".to_owned()];
         let yaml = workflow(&Workflow {
             branch: "main",
             paths: &paths,
-            app: Some(AppToken {
-                owner: None,
-                repositories: &repositories,
-            }),
             dir: "api",
             daily: None,
             requires: None,
@@ -497,37 +419,50 @@ mod tests {
             yaml.contains("paths: [\"api/openapi.json\",\"api/perseid.toml\"]"),
             "{yaml}"
         );
-        assert!(yaml.contains("repositories: api,acme-node\n"), "{yaml}");
+        assert!(!yaml.contains("schedule"), "{yaml}");
         assert!(
-            yaml.contains("owner: ${{ github.repository_owner }}\n"),
-            "{yaml}"
-        );
-        assert!(
-            yaml.ends_with("          working-directory: api\n"),
+            yaml.ends_with(&format!(
+                "      - uses: {}
+        with:
+          app-id: ${{{{ vars.SDK_APP_ID }}}}
+          app-private-key: ${{{{ secrets.SDK_APP_PRIVATE_KEY }}}}
+          working-directory: api
+",
+                uses("")
+            )),
             "{yaml}"
         );
         assert_eq!(join("", "./openapi.json"), "openapi.json");
     }
 
     #[test]
-    fn url_specs_are_fetched_daily_with_the_default_token() {
+    fn url_specs_are_fetched_daily() {
         let paths = ["perseid.toml".to_owned()];
         let yaml = workflow(&Workflow {
             branch: "main",
             paths: &paths,
-            app: None,
             dir: "",
             daily: Some("acme/api-sdks"),
             requires: Some("openapi.json"),
         });
         assert!(yaml.contains("  schedule:\n    - cron: '"), "{yaml}");
         assert!(
-            yaml.contains("contents: write\n  pull-requests: write\n"),
+            yaml.contains(
+                "permissions:\n  contents: write\n  pull-requests: write\n\nconcurrency: sdks\n"
+            ),
             "{yaml}"
         );
         assert!(
-            yaml.ends_with("      - if: hashFiles('openapi.json') != ''\n        uses: meteroid-oss/perseid@v0\n"),
+            yaml.contains(&format!(
+                "      - if: hashFiles('openapi.json') != ''\n        uses: {}\n        with:\n",
+                uses("")
+            )),
             "{yaml}"
         );
+        assert!(
+            yaml.ends_with("app-private-key: ${{ secrets.SDK_APP_PRIVATE_KEY }}\n"),
+            "{yaml}"
+        );
+        assert!(!yaml.contains("create-github-app-token"), "{yaml}");
     }
 }

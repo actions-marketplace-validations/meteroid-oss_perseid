@@ -1,4 +1,5 @@
-//! `perseid init`: perseid.toml, from the spec found here and the SDKs asked for.
+//! `perseid init`: perseid.toml, from the spec found here and the SDKs asked for, and the
+//! workflows regenerating and releasing the SDKs. Nothing leaves this checkout.
 
 use std::{
     io::IsTerminal,
@@ -11,7 +12,7 @@ use heck::{ToKebabCase, ToUpperCamelCase};
 use serde_json::{Value, json};
 
 use crate::{
-    config::{self, LANGUAGES, Source},
+    config::{self, Config, LANGUAGES, Source},
     fsx,
     scaffold::manifest_text,
     spec,
@@ -25,16 +26,27 @@ pub struct Init {
     pub base_url: Option<String>,
 }
 
-const FLAGS: &str = "--sdks <rust,typescript,python,go,java,csharp> (required), --repo <owner/name-{lang}>, --spec <path|url>, --name <Name>";
+const FLAGS: &str = "--sdks <rust,typescript,python,go,java,csharp> (required), --repo <owner/name-{lang}|owner/name>, --spec <path|url>, --name <Name>, --base-url <url>";
 
 /// Writes perseid.toml, asking what the flags and the spec here don't tell.
 pub fn run(init: Init, root: &Path) -> Result<()> {
     let path = root.join(config::FILE);
-    ensure!(
-        !path.exists(),
-        "{} already exists: edit it (`sdks`, `repo`, `spec`…), then run `perseid generate` or `perseid setup`",
-        config::FILE
-    );
+    if path.exists() {
+        ensure!(
+            init.spec.is_none()
+                && init.name.is_none()
+                && init.sdks.is_empty()
+                && init.repo.is_none(),
+            "{} already exists: edit it (`sdks`, `repo`, `spec`…), then run `perseid init` again",
+            config::FILE
+        );
+        let (config, _) = Config::load(&path)?;
+        if !write_files(&config, root)? {
+            println!("✓ the workflows match {}", config::FILE);
+        }
+        next_steps(&config, root);
+        return Ok(());
+    }
     let interactive = std::io::stdin().is_terminal();
     if !interactive && init.sdks.is_empty() {
         bail!("perseid init asks which SDKs to generate: without a terminal, pass {FLAGS}");
@@ -51,14 +63,21 @@ pub fn run(init: Init, root: &Path) -> Result<()> {
         Source::File(file) => root.join(file).is_file(),
     });
     let doc: Value = match (&spec, readable) {
-        (Some(spec), true) => serde_json::from_str(&spec::read(spec, root)?)?,
+        (Some(spec), true) => match read_spec(spec, root) {
+            Ok(doc) => doc,
+            Err(error) => {
+                println!(
+                    "! {spec} can't be read, so nothing is taken from it: {error:#}. Fix it, then `perseid generate` checks it"
+                );
+                json!({})
+            }
+        },
         _ => json!({}),
     };
     let here = crate::github::origin_repo(root);
-    let name = init
-        .name
-        .clone()
-        .or_else(|| doc["info"]["title"].as_str().map(|_| name_from_title(&doc)))
+    let derived = doc["info"]["title"]
+        .as_str()
+        .map(|_| name_from_title(&doc))
         .unwrap_or_else(|| {
             let fallback = here
                 .as_deref()
@@ -69,6 +88,13 @@ pub fn run(init: Init, root: &Path) -> Result<()> {
             name_from_title(&json!({ "info": { "title": fallback } }))
         })
         .to_upper_camel_case();
+    let name = match (&init.name, interactive) {
+        (Some(name), _) => name.clone(),
+        (None, true) => {
+            crate::prompt::text("Client name, as the SDKs' class names start", &derived)?
+        }
+        (None, false) => derived,
+    };
     let sdks = match init.sdks.is_empty() {
         true => ask_sdks()?,
         false => checked(&init.sdks)?,
@@ -84,12 +110,12 @@ pub fn run(init: Init, root: &Path) -> Result<()> {
             "`--repo {repo}` must read owner/name, or owner/name-{{lang}} for a repository per SDK"
         );
     }
-    let base_url = init.base_url.clone().or_else(|| {
-        doc["servers"][0]["url"]
-            .as_str()
-            .filter(|u| u.starts_with("http"))
-            .map(|u| u.trim_end_matches('/').to_owned())
-    });
+    let base_url = init.base_url.clone().or_else(|| server_url(&doc));
+    if base_url.is_none() && readable {
+        println!(
+            "! the spec has no absolute server URL: the SDKs default to http://localhost until you set `base_url`"
+        );
+    }
     let quote = |v: &str| toml::Value::String(v.to_owned()).to_string();
     let spec_path = spec.clone().unwrap_or_else(|| "openapi.json".into());
     let mut toml = format!(
@@ -107,10 +133,20 @@ pub fn run(init: Init, root: &Path) -> Result<()> {
     }
     let package = metadata(&doc);
     if !package.is_empty() {
-        toml += &format!("\n[package]\n{package}");
+        toml += &format!("\n[metadata]\n{package}");
+    }
+    if let Some(package) = sdks
+        .iter()
+        .any(|s| s == "java")
+        .then(|| java_package(&doc, &name))
+        .flatten()
+    {
+        toml += &format!("\n[java]\npackage = {}\n", quote(&package));
     }
     fsx::write(&path, toml.as_bytes())?;
     println!("+ {}", config::FILE);
+    let (config, _) = Config::load(&path)?;
+    write_files(&config, root)?;
     let where_ = match &repo {
         Some(repo) if repo.contains("{lang}") => sdks
             .iter()
@@ -120,25 +156,81 @@ pub fn run(init: Init, root: &Path) -> Result<()> {
         Some(repo) => format!("{repo} ({})", folders(&sdks)),
         None => format!("{} here", folders(&sdks)),
     };
-    println!("  {name} SDKs: {where_}");
-    match readable {
-        true => {
-            println!("  from {spec_path}");
-            println!(
-                "\nNext: `perseid generate` to preview the SDKs here, `perseid setup` to automate them on GitHub"
-            );
-        }
-        false => {
-            let hub = here.unwrap_or_else(|| "<owner/this-repository>".into());
-            println!(
-                "\nNo OpenAPI spec here yet: perseid reads {spec_path}, which `npx perseid connect {hub}`, run in the repository holding the spec, pushes here."
-            );
-            println!(
-                "Next: `perseid generate --spec <path|url>` to preview the SDKs, `perseid setup` to automate them on GitHub"
-            );
+    println!("\n  {name} SDKs: {where_}");
+    if readable {
+        println!("  from {spec_path}");
+    }
+    println!("  Packages: {}", packages(&config)?);
+    println!(
+        "  (rename one with `package = \"…\"` under its [language] in {}, before its first release)",
+        config::FILE
+    );
+    next_steps(&config, root);
+    Ok(())
+}
+
+/// Writes the workflows `config` calls for, saying which: whether any was written.
+fn write_files(config: &Config, root: &Path) -> Result<bool> {
+    let written = crate::github::write_files(config, root)?;
+    for file in &written {
+        match file {
+            crate::github::Written::Added(path) => println!("+ {path}"),
+            crate::github::Written::Updated(path) => println!("~ {path}"),
+            crate::github::Written::Kept(message) => println!("! {message}"),
         }
     }
-    Ok(())
+    Ok(written
+        .iter()
+        .any(|w| !matches!(w, crate::github::Written::Kept(_))))
+}
+
+/// The package each SDK publishes, as registries will know it.
+fn packages(config: &Config) -> Result<String> {
+    let mut names = Vec::new();
+    for sdk in config.sdks(&[])? {
+        let context = config.context(&sdk, Path::new("/nonexistent"));
+        let text = |key: &str| context[key].as_str().unwrap_or_default().to_owned();
+        names.push(match sdk.language {
+            "typescript" => format!("npm {}", text("npm_package")),
+            "python" => format!("PyPI {}", text("package_name")),
+            "rust" => format!("crates.io {}", text("rust_crate")),
+            "go" => format!("Go {}", text("go_module")),
+            "java" => format!("Maven {}", text("java_package")),
+            _ => format!("NuGet {}", text("package_name")),
+        });
+    }
+    Ok(names.join(", "))
+}
+
+fn next_steps(config: &Config, root: &Path) {
+    let here = crate::github::origin_repo(root);
+    let hub = here.as_deref().unwrap_or("<owner/this-repository>");
+    let spec = match config.source() {
+        Source::File(file) if !root.join(file).exists() => Some(file),
+        _ => None,
+    };
+    if let Some(file) = spec {
+        println!(
+            "\nNo OpenAPI spec here yet: perseid reads {file}, which `npx perseid connect {hub}`, run in the repository holding the spec, pushes here."
+        );
+    }
+    println!("\nNext steps");
+    let mut steps = vec![
+        "Review and commit what perseid wrote, then push: the workflows run from the default branch".to_owned(),
+        match spec {
+            Some(_) => "`perseid generate --spec <path|url>` previews the SDKs meanwhile".to_owned(),
+            None => "`perseid generate` previews the SDKs (`--out <dir>` for those living in other repositories)".to_owned(),
+        },
+        "`perseid setup-github` creates what GitHub needs and files can't hold (SDK repositories, the GitHub App opening the SDK pull requests), once you agree".to_owned(),
+    ];
+    if spec.is_some() {
+        steps.push(format!(
+            "In the repository holding the spec: `npx perseid connect {hub}`. It writes a workflow there and, once you agree, a deploy key letting that repository push its spec here, and nothing else"
+        ));
+    }
+    for (i, step) in steps.iter().enumerate() {
+        println!("  {}. {step}", i + 1);
+    }
 }
 
 fn folders(sdks: &[String]) -> String {
@@ -187,15 +279,21 @@ fn ask_layout(sdks: &[String], name: &str, here: Option<&str>) -> Result<Option<
     let owner = here.and_then(|r| r.split('/').next()).unwrap_or("acme");
     let pattern = format!("{owner}/{}-{{lang}}", name.to_kebab_case());
     let repos: Vec<String> = sdks.iter().map(|s| pattern.replace("{lang}", s)).collect();
+    let shared = format!("{owner}/{}-sdks", name.to_kebab_case());
     let choices = [
         format!("Here, a folder each: {}", folders(sdks)),
         format!("A repository each: {}", repos.join(", ")),
+        format!("One other repository, a folder each: {shared}"),
     ];
     match crate::prompt::pick_one("Where do the SDKs live?", &choices, 0)? {
         0 => Ok(None),
-        _ => Ok(Some(crate::prompt::text(
+        1 => Ok(Some(crate::prompt::text(
             "Repository of each SDK",
             &pattern,
+        )?)),
+        _ => Ok(Some(crate::prompt::text(
+            "Repository of the SDKs",
+            &shared,
         )?)),
     }
 }
@@ -341,6 +439,52 @@ fn metadata(doc: &Value) -> String {
     out
 }
 
+fn read_spec(spec: &str, root: &Path) -> Result<Value> {
+    let doc: Value = serde_json::from_str(&spec::read(spec, root)?)?;
+    ensure!(
+        doc.get("swagger").is_none(),
+        "Swagger 2.0 isn't supported, convert it with `npx swagger2openapi`"
+    );
+    Ok(doc)
+}
+
+/// The first absolute server URL, its `{variables}` set to their defaults.
+fn server_url(doc: &Value) -> Option<String> {
+    let server = &doc["servers"][0];
+    let mut url = server["url"].as_str()?.to_owned();
+    if let Some(variables) = server["variables"].as_object() {
+        for (name, variable) in variables {
+            if let Some(default) = variable["default"].as_str() {
+                url = url.replace(&format!("{{{name}}}"), default);
+            }
+        }
+    }
+    (url.starts_with("http") && !url.contains('{')).then(|| url.trim_end_matches('/').to_owned())
+}
+
+/// A Java package Maven Central can verify: the reversed domain of the API's homepage, then the
+/// client name, as `com.acme.petstore` for `https://www.acme.com`.
+fn java_package(doc: &Value, name: &str) -> Option<String> {
+    let url = doc["info"]["contact"]["url"]
+        .as_str()
+        .or(doc["externalDocs"]["url"].as_str())?;
+    let host = url.split("://").nth(1)?.split(['/', ':']).next()?;
+    let labels: Vec<&str> = host
+        .split('.')
+        .filter(|l| !l.is_empty())
+        .skip_while(|l| matches!(*l, "www" | "api" | "docs" | "developer" | "developers"))
+        .collect();
+    if labels.len() < 2 || labels.iter().any(|l| l.parse::<u8>().is_ok()) {
+        return None;
+    }
+    let mut parts: Vec<String> = labels.iter().rev().map(|l| l.replace('-', "_")).collect();
+    parts.push(
+        name.to_lowercase()
+            .replace(|c: char| !c.is_ascii_alphanumeric(), ""),
+    );
+    Some(parts.join("."))
+}
+
 /// The SPDX identifier of a license name such as `Apache 2.0`.
 fn spdx(name: &str) -> Option<String> {
     let known = [
@@ -427,6 +571,33 @@ mod tests {
         );
         assert_eq!(url("http://proxy@127.0.0.1:8080/git/acme/sdk"), None);
         assert_eq!(url("/tmp/origin.git"), None);
+    }
+
+    #[test]
+    fn server_variables_take_their_defaults() {
+        let doc = serde_json::json!({ "servers": [{
+            "url": "https://{region}.acme.com/{version}/",
+            "variables": { "region": { "default": "eu" }, "version": { "default": "v2" } }
+        }]});
+        assert_eq!(server_url(&doc).as_deref(), Some("https://eu.acme.com/v2"));
+        let relative = serde_json::json!({ "servers": [{ "url": "/v1" }] });
+        assert_eq!(server_url(&relative), None);
+    }
+
+    #[test]
+    fn java_packages_follow_the_homepage_domain() {
+        let doc = |url: &str| serde_json::json!({ "info": { "contact": { "url": url } } });
+        let package = |url: &str| java_package(&doc(url), "PetStore");
+        assert_eq!(
+            package("https://www.acme.com/about").as_deref(),
+            Some("com.acme.petstore")
+        );
+        assert_eq!(
+            package("https://api.pets.co.uk").as_deref(),
+            Some("uk.co.pets.petstore")
+        );
+        assert_eq!(package("http://localhost:8080"), None);
+        assert_eq!(package("http://127.0.0.1"), None);
     }
 
     #[test]

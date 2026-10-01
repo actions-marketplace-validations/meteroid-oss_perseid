@@ -4,13 +4,18 @@ use std::{
     process::Command,
 };
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 
 pub const BRANCH: &str = "perseid/update";
+
+/// Marks pull requests whose release PR the scaffolded sdk-release.yml auto-merges.
+pub const AUTO_RELEASE: &str = "perseid:auto-release";
 
 /// Semver bump requested from release tooling through the conventional-commit type of the PR.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, clap::ValueEnum)]
 pub enum Bump {
+    /// Sized by oasdiff, comparing the spec with its previous version.
+    Auto,
     Patch,
     Minor,
     Major,
@@ -20,7 +25,7 @@ impl Bump {
     pub fn title(self, subject: &str) -> String {
         let kind = match self {
             Bump::Patch => "fix(api)",
-            Bump::Minor => "feat(api)",
+            Bump::Minor | Bump::Auto => "feat(api)",
             Bump::Major => "feat(api)!",
         };
         format!("{kind}: {subject}")
@@ -90,8 +95,40 @@ pub fn origin(config: &crate::config::Config, root: &Path, spec: &str) -> Option
 /// Where `perseid connect`'s workflow records the commit it pushed the spec of.
 pub const SOURCE: &str = ".perseid/source.json";
 
+/// Where a checkout keeps the tree perseid last generated in it.
+const GENERATED: &str = ".git/perseid-generated";
+
+/// The tree of the files in the worktree of `dir`, untracked ones included, its index untouched.
+fn worktree_tree(dir: &Path) -> Result<String> {
+    let index = dir.join(".git/perseid-index");
+    let git = |args: &[&str]| -> Result<String> {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_INDEX_FILE", &index)
+            .output()?;
+        ensure!(
+            output.status.success(),
+            "`git {}` failed in {}:\n{}",
+            args.join(" "),
+            dir.display(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+    };
+    let tree = git(&["add", "--all"]).and_then(|_| git(&["write-tree"]));
+    let _ = std::fs::remove_file(&index);
+    tree
+}
+
+/// Records what perseid generated in the checkout at `dir`, which the next run may then reset.
+pub fn record(dir: &Path) -> Result<()> {
+    crate::fsx::write(&dir.join(GENERATED), worktree_tree(dir)?.as_bytes())
+}
+
 /// A fresh checkout of the default branch of `repo`, in a disposable directory under `.perseid/`.
-pub fn checkout(repo: &str, root: &Path) -> Result<PathBuf> {
+/// Changes there that perseid didn't generate stop it, unless `discard`.
+pub fn checkout(repo: &str, root: &Path, discard: bool) -> Result<PathBuf> {
     let url = if repo.contains(':') {
         repo.to_owned()
     } else {
@@ -106,6 +143,17 @@ pub fn checkout(repo: &str, root: &Path) -> Result<PathBuf> {
     crate::fsx::write(&repos.join(".gitignore"), b"*\n")?;
     let dir = repos.join(segments[segments.len().saturating_sub(2)..].join("/"));
     if dir.join(".git").is_dir() {
+        let pristine = || -> Result<bool> {
+            let tree = worktree_tree(&dir)?;
+            let generated = std::fs::read_to_string(dir.join(GENERATED)).unwrap_or_default();
+            Ok(tree == generated || tree == git(&dir, &["rev-parse", "HEAD^{tree}"])?)
+        };
+        ensure!(
+            discard || pristine()?,
+            "{} has local changes, which `perseid generate` would discard: commit and push them, \
+             or delete that directory (`--pr` discards them)",
+            dir.display()
+        );
         git(
             &dir,
             &["fetch", "--quiet", "--depth", "1", "origin", "HEAD"],
@@ -116,8 +164,21 @@ pub fn checkout(repo: &str, root: &Path) -> Result<PathBuf> {
         )?;
         git(&dir, &["clean", "--quiet", "-fd"])?;
     } else {
-        std::fs::create_dir_all(&dir)?;
-        git(&dir, &["clone", "--quiet", "--depth", "1", &url, "."])?;
+        let parent = dir.parent().unwrap_or(&repos);
+        std::fs::create_dir_all(parent)?;
+        let target = dir.to_string_lossy();
+        if let Err(error) = git(&repos, &["clone", "--quiet", "--depth", "1", &url, &target]) {
+            let _ = std::fs::remove_dir_all(&dir);
+            let _ = std::fs::remove_dir(parent);
+            let message = format!("{error:#}").to_lowercase();
+            let missing = ["not found", "does not appear to be a git repository"];
+            ensure!(
+                !missing.iter().any(|m| message.contains(m)),
+                "{repo} doesn't exist yet: `perseid setup-github` creates it; preview with \
+                 `perseid generate --out <dir>`"
+            );
+            return Err(error);
+        }
     }
     Ok(dir)
 }
@@ -293,9 +354,72 @@ pub fn open(
     run(dir, "gh", &create).map(Some)
 }
 
+/// `owner/name` of a GitHub pull request URL.
+fn repo_of(url: &str) -> Option<String> {
+    let path: Vec<&str> = url.strip_prefix("https://")?.split('/').collect();
+    match path[..] {
+        [_, owner, name, "pull", _] => Some(format!("{owner}/{name}")),
+        _ => None,
+    }
+}
+
+/// `gh` in `dir`, for the repository of the pull request at `url`.
+fn gh_for(dir: &Path, url: &str, args: &[&str]) -> Result<String> {
+    let repo = repo_of(url);
+    let mut args = args.to_vec();
+    if let Some(repo) = &repo {
+        args.extend(["--repo", repo]);
+    }
+    run(dir, "gh", &args)
+}
+
+/// Enables auto-merge (squash) on the pull request at `url`, labelled so its release PR follows.
+pub fn auto_merge(dir: &Path, url: &str) -> Result<()> {
+    let description = "Auto-merge the release PR this change leads to";
+    let label = [
+        "label",
+        "create",
+        AUTO_RELEASE,
+        "--force",
+        "--color",
+        "6f42c1",
+    ];
+    gh_for(
+        dir,
+        url,
+        &[&label[..], &["--description", description]].concat(),
+    )?;
+    run(dir, "gh", &["pr", "edit", url, "--add-label", AUTO_RELEASE])?;
+    run(dir, "gh", &["pr", "merge", url, "--auto", "--squash"])?;
+    Ok(())
+}
+
+/// Runs `workflows` on the update branch of the pull request at `url`: pushes made with the
+/// default `GITHUB_TOKEN` start none.
+pub fn dispatch(dir: &Path, url: &str, workflows: &[String]) -> Result<()> {
+    for workflow in workflows {
+        gh_for(dir, url, &["workflow", "run", workflow, "--ref", BRANCH])?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{Bump, SOURCE, origin};
+    use super::{AUTO_RELEASE, Bump, SOURCE, origin, repo_of};
+
+    #[test]
+    fn the_release_workflow_reads_the_auto_release_label() {
+        let workflow = include_str!("../scaffold/release/.github/workflows/sdk-release.yml");
+        assert!(
+            workflow.contains(&format!(" {AUTO_RELEASE} ")),
+            "{workflow}"
+        );
+        assert_eq!(
+            repo_of("https://github.com/acme/api-go/pull/12").as_deref(),
+            Some("acme/api-go")
+        );
+        assert_eq!(repo_of("https://pr/2"), None);
+    }
 
     #[test]
     fn pull_requests_name_where_the_spec_comes_from() {

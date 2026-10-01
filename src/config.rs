@@ -37,10 +37,10 @@ pub struct Config {
     /// language: `typescript`, `python`…), `owner/name` holds them all in folders named after
     /// their language. Without it, the SDKs live next to perseid.toml.
     pub repo: Option<String>,
-    /// `false` leaves out the release-please files and the release workflow `perseid setup` adds.
+    /// `false` leaves out the release-please files and the release workflow `perseid init` writes.
     pub release: Option<bool>,
     /// Package metadata written into the manifests `perseid generate` creates.
-    #[serde(default)]
+    #[serde(default, rename = "metadata")]
     pub package: Package,
     /// API base URL the clients default to.
     pub base_url: Option<String>,
@@ -56,7 +56,7 @@ pub struct Config {
     /// How unions decode objects that no rule tells apart.
     pub untagged_unions: Option<UntaggedUnions>,
     /// Method names by operation id, over the resource-style names.
-    #[serde(default)]
+    #[serde(default, rename = "methods")]
     pub names: BTreeMap<String, String>,
     /// Also generates the operations marked `x-internal: true`.
     #[serde(default)]
@@ -119,6 +119,20 @@ impl Home {
             url: crate::init::git_remote(root),
             dir: prefix.trim_end_matches('/').to_owned(),
         }
+    }
+
+    /// The home of perseid.toml at `path` in the GitHub repository `repo`.
+    pub fn github(repo: &str, path: &str) -> Self {
+        let dir = Path::new(path).parent().unwrap_or(Path::new(""));
+        Home {
+            url: Some(format!("https://github.com/{repo}")),
+            dir: dir.to_string_lossy().into_owned(),
+        }
+    }
+
+    /// `owner/name` of the origin, when on github.com.
+    pub fn repo(&self) -> Option<&str> {
+        self.url.as_deref()?.strip_prefix("https://github.com/")
     }
 }
 
@@ -208,8 +222,8 @@ macro_rules! language {
             timeout: Option<u64>,
             /// How unions decode objects that no rule tells apart, over the top-level setting.
             untagged_unions: Option<UntaggedUnions>,
-            /// Method names by operation id, over the top-level `[names]`.
-            #[serde(default)]
+            /// Method names by operation id, over the top-level `[methods]`.
+            #[serde(default, rename = "methods")]
             names: BTreeMap<String, String>,
             /// Operation ids left out of this SDK only, on top of the top-level `exclude`.
             #[serde(default)]
@@ -376,9 +390,30 @@ pub fn json_schema() -> String {
 
 pub struct Sdk<'a> {
     pub language: &'static str,
+    /// The repository `repo` names, even when it's the one holding perseid.toml.
     pub repo: Option<String>,
     pub path: String,
+    /// Lives in the repository holding perseid.toml: no `repo`, or that one.
+    pub local: bool,
     target: &'a Target,
+}
+
+impl Sdk<'_> {
+    /// The repository the SDK lives in, unless that's the one holding perseid.toml.
+    pub fn remote(&self) -> Option<&str> {
+        self.repo.as_deref().filter(|_| !self.local)
+    }
+}
+
+/// Whether two `owner/name` repositories (or URLs ending with one) are the same, ignoring case.
+pub fn same_repo(a: &str, b: &str) -> bool {
+    let slug = |r: &str| {
+        let r = r.trim_end_matches('/').trim_end_matches(".git");
+        let mut parts = r.rsplit(['/', ':']);
+        let name = parts.next().unwrap_or_default();
+        format!("{}/{name}", parts.next().unwrap_or_default()).to_lowercase()
+    };
+    slug(a) == slug(b)
 }
 
 /// Where the spec is read from, as `spec` says.
@@ -401,16 +436,42 @@ static DEFAULT_TARGET: std::sync::LazyLock<Target> = std::sync::LazyLock::new(Ta
 
 impl Config {
     pub fn load(path: &Path) -> Result<(Self, PathBuf)> {
-        let text = std::fs::read_to_string(path).with_context(|| {
-            format!(
-                "reading {} (run `perseid init` to create one)",
-                path.display()
-            )
-        })?;
+        if !path.exists() {
+            anyhow::bail!(
+                "no {} in {} or its parents: run `perseid init` to create one",
+                path.file_name().unwrap_or_default().to_string_lossy(),
+                std::path::absolute(path)?
+                    .parent()
+                    .map_or_else(String::new, |p| p.display().to_string())
+            );
+        }
+        let text =
+            std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
         let mut config = Self::parse(&text, &path.display().to_string())?;
         let root = std::path::absolute(path)?.parent().unwrap().to_owned();
         config.home = Home::of(&root);
         Ok((config, root))
+    }
+
+    /// `path` when it exists, else the closest file of the same name in a parent directory, up to
+    /// the repository root: commands run from an SDK folder find perseid.toml.
+    pub fn locate(path: &Path) -> PathBuf {
+        if path.exists() || path.components().count() != 1 {
+            return path.to_owned();
+        }
+        let Ok(start) = std::env::current_dir() else {
+            return path.to_owned();
+        };
+        for dir in start.ancestors() {
+            let candidate = dir.join(path);
+            if candidate.exists() {
+                return candidate;
+            }
+            if dir.join(".git").exists() {
+                break;
+            }
+        }
+        path.to_owned()
     }
 
     /// perseid.toml's `text`, read from `origin`.
@@ -524,20 +585,24 @@ impl Config {
                     let repo = self.repo.as_deref()?;
                     Some(repo.replace("{lang}", language))
                 });
-                (language, target, repo)
+                let local = repo
+                    .as_deref()
+                    .is_none_or(|r| self.home.repo().is_some_and(|home| same_repo(r, home)));
+                (language, target, repo, local)
             })
             .collect();
         let shared = |repo: &str| all.iter().filter(|a| a.2.as_deref() == Some(repo)).count() > 1;
         let sdks = all
             .iter()
             .filter(|(language, ..)| selected.is_empty() || selected.iter().any(|s| s == language))
-            .map(|(language, target, repo)| Sdk {
+            .map(|(language, target, repo, local)| Sdk {
                 language,
                 path: target.path.clone().unwrap_or_else(|| match repo {
-                    Some(repo) if !shared(repo) => ".".into(),
+                    Some(repo) if !local && !shared(repo) => ".".into(),
                     _ => (*language).into(),
                 }),
                 repo: repo.clone(),
+                local: *local,
                 target,
             })
             .collect::<Vec<_>>();
@@ -555,7 +620,7 @@ impl Config {
 
     /// The web URL of the repository `sdk` lives in, and its folder there (`.` at the top).
     pub fn repository(&self, sdk: &Sdk) -> Option<(String, String)> {
-        if let Some(repo) = &sdk.repo {
+        if let Some(repo) = sdk.remote() {
             return Some((format!("https://github.com/{repo}"), sdk.path.clone()));
         }
         let url = self.package.repository.clone().or(self.home.url.clone())?;
@@ -646,10 +711,12 @@ impl Config {
 const CONNECT: &str = "was removed: the repository holding the spec pushes it with `npx perseid connect <owner/sdks-repository>`, which writes its workflow";
 
 /// Keys of earlier versions, and what replaces them.
-const OUTDATED: [(&str, &str); 20] = [
+const OUTDATED: [(&str, &str); 22] = [
+    ("package", "was renamed: name the table `[metadata]`"),
+    ("names", "was renamed `methods`"),
     (
         "method_names",
-        "was removed (methods are named after their resource; `[names]` renames one): delete it",
+        "was removed (methods are named after their resource; `[methods]` renames one): delete it",
     ),
     (
         "typed_unions",
@@ -681,11 +748,11 @@ const OUTDATED: [(&str, &str); 20] = [
         "include",
         "was removed: `internal = true` also generates x-internal operations, `only = [...]` lists the operations to generate",
     ),
-    ("description", "moved to the [package] table"),
-    ("license", "moved to the [package] table"),
-    ("homepage", "moved to the [package] table"),
-    ("repository", "moved to the [package] table"),
-    ("authors", "moved to the [package] table"),
+    ("description", "moved to the [metadata] table"),
+    ("license", "moved to the [metadata] table"),
+    ("homepage", "moved to the [metadata] table"),
+    ("repository", "moved to the [metadata] table"),
+    ("authors", "moved to the [metadata] table"),
     ("int64", "is only supported in [typescript]"),
     ("flat_unions", "is only supported in [python]"),
 ];
@@ -701,7 +768,7 @@ fn removed_keys(table: &toml::Table) -> Result<()> {
             let own = matches!(
                 (language, key),
                 ("typescript", "int64") | ("python", "flat_unions")
-            ) || !language.is_empty() && why == CONNECT;
+            ) || !language.is_empty() && (why == CONNECT || key == "package");
             if table.contains_key(key) && !own {
                 let at = match language {
                     "" => String::new(),
@@ -754,7 +821,7 @@ pub(crate) fn manifest_version(dir: &Path) -> Option<String> {
     read("version.txt").map(|v| v.trim().to_owned())
 }
 
-/// `<Version>` of the first `.csproj` in `dir` or one level below, as `perseid init csharp` lays out.
+/// `<Version>` of the first `.csproj` in `dir` or one level below, as `perseid generate` lays out C# SDKs.
 fn csproj_version(dir: &Path) -> Option<String> {
     let entries = |dir: &Path| {
         let mut paths: Vec<_> = std::fs::read_dir(dir)
@@ -969,7 +1036,7 @@ mod tests {
 
     #[test]
     fn timeout_and_package_metadata_reach_templates() {
-        let toml = "spec = \"s\"\nname = \"Acme\"\nsdks = [\"rust\", \"go\"]\ntimeout = 15\n[package]\nlicense = \"MIT\"\n\
+        let toml = "spec = \"s\"\nname = \"Acme\"\nsdks = [\"rust\", \"go\"]\ntimeout = 15\n[metadata]\nlicense = \"MIT\"\n\
                     authors = [\"A <a@x.dev>\"]\n[go]\ntimeout = 30\n[rust]\n";
         let go = context(toml, "go");
         assert_eq!(
@@ -1066,6 +1133,29 @@ mod tests {
     }
 
     #[test]
+    fn sdks_in_the_repository_holding_perseid_toml_are_local() {
+        let toml = "name = \"Acme\"\nsdks = [\"go\", \"rust\"]\n[go]\nrepo = \"Acme/SDKs\"\n\
+                    [rust]\nrepo = \"acme/rust\"\n";
+        let mut config: Config = toml::from_str(toml).unwrap();
+        config.home.url = Some("https://github.com/acme/sdks".into());
+        let sdks = config.sdks(&[]).unwrap();
+        assert_eq!(
+            sdks.iter()
+                .map(|s| (s.language, s.remote(), s.path.clone()))
+                .collect::<Vec<_>>(),
+            [
+                ("rust", Some("acme/rust"), ".".into()),
+                ("go", None, "go".into())
+            ]
+        );
+        let go = config.context(&sdks[1], Path::new("/nonexistent"));
+        assert_eq!(go["go_module"], "github.com/acme/sdks/go");
+        assert_eq!(go["repository"], "https://github.com/acme/sdks");
+        assert!(same_repo("https://github.com/acme/sdks.git", "ACME/sdks"));
+        assert!(!same_repo("acme/sdks", "other/sdks"));
+    }
+
+    #[test]
     fn specs_are_read_from_a_file_or_a_url() {
         assert_eq!(
             Source::parse("api/openapi.yaml"),
@@ -1102,7 +1192,7 @@ mod tests {
     #[test]
     fn name_overrides_are_per_language() {
         let toml = "name = \"Acme\"\nsdks = [\"rust\", \"go\"]\n\
-                    [names]\na = \"x\"\n[go]\nnames = { a = \"y\" }\n";
+                    [methods]\na = \"x\"\n[go]\nmethods = { a = \"y\" }\n";
         let config: Config = toml::from_str(toml).unwrap();
         let sdks = config.sdks(&[]).unwrap();
         assert_eq!(config.filters_for(&sdks[0]).names["a"], "x");
@@ -1123,6 +1213,11 @@ mod tests {
             "{java}"
         );
         assert!(removed_keys(&"[go]\nmodule = \"m\"".parse().unwrap()).is_ok());
+        assert!(error("[package]\nlicense = \"MIT\"").contains("`[metadata]`"));
+        assert!(
+            error("[go]\nnames = { a = \"b\" }").contains("[go] `names` was renamed `methods`")
+        );
+        assert!(removed_keys(&"[typescript]\npackage = \"@acme/sdk\"".parse().unwrap()).is_ok());
         for key in ["push_spec", "push_on", "generate"] {
             let error = error(&format!("{key} = \"x\""));
             assert_eq!(error, format!("`{key}` {CONNECT}"));
@@ -1130,7 +1225,7 @@ mod tests {
         assert!(error("[push]\nto = \"acme/sdks\"").starts_with("`push` was removed"));
         assert_eq!(
             error("repository = \"https://github.com/acme/api\""),
-            "`repository` moved to the [package] table"
+            "`repository` moved to the [metadata] table"
         );
         assert!(error("include = \"public-and-internal\"").contains("`internal = true`"));
         assert!(error("[rust]\nversion = \"1.0.0\"").starts_with("[rust] `version` was removed"));
