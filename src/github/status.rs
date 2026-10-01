@@ -18,7 +18,7 @@ use super::{
     plan::{self, Mark, PUSH_WORKFLOW},
     secrets, toplevel,
 };
-use crate::config::{self, Config, Source};
+use crate::config::{self, Config, PushOn, Source};
 
 struct Report {
     ui: Ui,
@@ -96,10 +96,13 @@ pub fn status(config_path: &Path) -> Result<ExitCode> {
     let plan = match planned {
         Some(Ok(plan)) => plan,
         Some(Err(error)) => {
-            report.fail(
-                &format!("{error:#}"),
-                "fix what it says, then run `perseid setup`",
-            );
+            match error.downcast_ref::<config::PushMismatch>() {
+                Some(mismatch) => report.fail(&mismatch.summary(), &mismatch.fix()),
+                None => report.fail(
+                    &format!("{error:#}"),
+                    "fix what it says, then run `perseid setup`",
+                ),
+            }
             return Ok(exit(&report));
         }
         None => return Ok(exit(&report)),
@@ -136,7 +139,7 @@ fn exit(report: &Report) -> ExitCode {
 fn local_diagram(config: &Config, here: &str) -> Result<String> {
     let sdks = config.sdks(&[])?;
     let targets = layout::targets(&sdks, here);
-    Ok(match (config.source(), &config.push_spec) {
+    Ok(match (config.source(), &config.push.to) {
         (_, Some(sdks_repo)) => layout::diagram(Some(here), sdks_repo, &[]),
         (Source::GitHub { repo, .. }, _) => layout::diagram(Some(&repo), here, &targets),
         (Source::Url(url), _) => layout::diagram(Some(url), here, &targets),
@@ -147,7 +150,7 @@ fn local_diagram(config: &Config, here: &str) -> Result<String> {
 /// What this checkout tells without GitHub: the spec, the workflow, the last sync.
 fn local(report: &mut Report, config: &Config, root: &Path) {
     let top = toplevel(root).unwrap_or_else(|_| root.to_owned());
-    let workflow = match config.push_spec {
+    let workflow = match config.push.to {
         Some(_) => PUSH_WORKFLOW,
         None => layout::SDKS_WORKFLOW,
     };
@@ -159,7 +162,7 @@ fn local(report: &mut Report, config: &Config, root: &Path) {
         ),
     }
     match config.source() {
-        Source::File(file) if !root.join(file).exists() && config.generate.is_none() => report
+        Source::File(file) if !root.join(file).exists() && config.push.generate.is_none() => report
             .fail(
                 &format!("the spec {file} is missing"),
                 "point `spec` of perseid.toml to it",
@@ -190,11 +193,14 @@ fn synced(report: &mut Report, source: &link::Source, when: Option<i64>) {
         return;
     };
     let age = when.map_or_else(String::new, |t| format!(", {}", ago(t)));
-    report.ui.ok(&format!(
-        "Last synced {}@{}{age}",
-        source.repo,
-        sha.get(..7).unwrap_or(sha)
-    ));
+    let short = sha.get(..7).unwrap_or(sha);
+    let at = match &source.tag {
+        Some(tag) => format!("{tag} ({short})"),
+        None => short.to_owned(),
+    };
+    report
+        .ui
+        .ok(&format!("Last synced {}@{at}{age}", source.repo));
 }
 
 fn now() -> i64 {
@@ -248,7 +254,8 @@ fn health(report: &mut Report, api: &GitHub, plan: &plan::Plan) -> Result<()> {
                 .as_str()
                 .and_then(timestamp);
             synced(report, &source, when);
-            behind(report, api, &source)?;
+            let on = plan.link.as_ref().map(|l| l.on).unwrap_or_default();
+            behind(report, api, &source, on)?;
         }
     }
     let mut repos = BTreeSet::new();
@@ -283,7 +290,7 @@ fn health(report: &mut Report, api: &GitHub, plan: &plan::Plan) -> Result<()> {
 }
 
 /// Warns when the API repository changed its spec after the commit last synced.
-fn behind(report: &mut Report, api: &GitHub, source: &link::Source) -> Result<()> {
+fn behind(report: &mut Report, api: &GitHub, source: &link::Source, on: PushOn) -> Result<()> {
     let Some(sha) = &source.sha else {
         return Ok(());
     };
@@ -302,14 +309,23 @@ fn behind(report: &mut Report, api: &GitHub, source: &link::Source) -> Result<()
     }
     let compare = api.find(&format!("/repos/{}/compare/{sha}...{latest}", source.repo))?;
     if compare.is_some_and(|c| c["status"] == "ahead") {
-        report.fail(
-            &format!(
-                "{}@{} changed the spec after the last sync",
-                source.repo,
-                latest.get(..7).unwrap_or(latest)
-            ),
-            &format!("check the perseid-push.yml runs of {}", source.repo),
+        let changed = format!(
+            "{}@{} changed the spec after the last sync",
+            source.repo,
+            latest.get(..7).unwrap_or(latest)
         );
+        match on {
+            PushOn::Change => report.fail(
+                &changed,
+                &format!("check the perseid-push.yml runs of {}", source.repo),
+            ),
+            PushOn::Release => report
+                .ui
+                .info(&format!("{changed}: the next release pushes it")),
+            PushOn::Tag => report
+                .ui
+                .info(&format!("{changed}: the next tag pushes it")),
+        }
     }
     Ok(())
 }

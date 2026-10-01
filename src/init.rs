@@ -99,13 +99,19 @@ pub fn draft(init: &Init, root: &Path) -> Result<(String, bool)> {
                 .filter(|u| u.starts_with("http"))
                 .map(|u| u.trim_end_matches('/').to_owned())
         });
-        let mut toml = format!("spec = {spec:?}\nname = {:?}\n", name.to_upper_camel_case());
+        let mut toml = format!(
+            "#:schema {}\nspec = {spec:?}\nname = {:?}\n",
+            config::SCHEMA_URL,
+            name.to_upper_camel_case()
+        );
         if let Some(url) = base_url {
             toml += &format!("base_url = {url:?}\n");
         }
-        toml += "method_names = \"resource\"\n";
-        toml += &metadata(&doc, root);
         toml += &layouts(&source, &name.to_kebab_case(), root);
+        let package = metadata(&doc, root);
+        if !package.is_empty() {
+            toml += &format!("\n[package]\n{package}");
+        }
         toml
     };
     let existing: toml::Table = toml.parse()?;
@@ -120,18 +126,6 @@ pub fn draft(init: &Init, root: &Path) -> Result<(String, bool)> {
         .filter(|l| !existing.contains_key(l.as_str()))
     {
         toml += &format!("\n[{language}]\n");
-        if language == "go" {
-            toml += "initialisms = true\npatch_nullable = true\ntyped_unions = true\n";
-        }
-        if language == "csharp" {
-            toml += "patch_nullable = true\ntyped_unions = true\n";
-        }
-        if ["rust", "typescript", "python"].contains(&language.as_str()) {
-            toml += "typed_unions = true\n";
-        }
-        if language == "java" {
-            toml += "edition = 2\n";
-        }
         added = true;
     }
     Ok((toml, added || !config_path.exists()))
@@ -159,13 +153,28 @@ fn layouts(source: &Source, name: &str, root: &Path) -> String {
             "one repository holding every SDK, a folder each".to_owned(),
         ),
     ];
-    if let Source::File(_) = source {
-        lines.push((
-            format!("push_spec = \"{owner}/{name}-sdks\""),
-            "or send the spec to a repository that generates the SDKs itself".to_owned(),
-        ));
+    match source {
+        Source::File(_) => lines.extend([
+            (
+                "[push]".to_owned(),
+                "or send the spec to a repository generating the SDKs itself:".to_owned(),
+            ),
+            (
+                format!("to = \"{owner}/{name}-sdks\""),
+                "that repository".to_owned(),
+            ),
+        ]),
+        Source::GitHub { .. } => lines.push((
+            "[push]".to_owned(),
+            "how the API repository pushes its spec here:".to_owned(),
+        )),
+        Source::Url(_) => {}
     }
     if !matches!(source, Source::Url(_)) {
+        lines.push((
+            "on = \"release\"".to_owned(),
+            "on each GitHub release, instead of each change".to_owned(),
+        ));
         lines.push((
             "generate = \"make openapi.json\"".to_owned(),
             "how the API repository's CI writes the spec, if not committed".to_owned(),
@@ -195,7 +204,7 @@ pub fn hub_files(
     release: bool,
     read: impl Fn(&str) -> Result<Option<String>>,
 ) -> Result<Vec<(String, Vec<u8>)>> {
-    if config.push_spec.is_some() {
+    if config.push.to.is_some() {
         return Ok(vec![]);
     }
     let sdks = config.sdks(&[])?;
@@ -456,11 +465,12 @@ fn package_metadata(config: &Config, context: &mut Value) {
             .filter(|v| !v.is_empty())
             .map_or(Value::Null, Value::from)
     };
-    let license = text(&config.license);
+    let license = text(&config.package.license);
     let project = config
+        .package
         .homepage
         .clone()
-        .or_else(|| config.repository.clone());
+        .or_else(|| config.package.repository.clone());
     context["license_url"] = license
         .as_str()
         .filter(|l| {
@@ -472,12 +482,13 @@ fn package_metadata(config: &Config, context: &mut Value) {
             format!("https://spdx.org/licenses/{l}.html").into()
         });
     context["license"] = license;
-    context["repository"] = text(&config.repository);
-    context["homepage"] = text(&config.homepage);
+    context["repository"] = text(&config.package.repository);
+    context["homepage"] = text(&config.package.homepage);
     context["project_url"] = text(&project);
     context["description"] =
         manifest_text(context["description"].as_str().unwrap_or_default()).into();
     let authors: Vec<(String, Option<String>)> = config
+        .package
         .authors
         .iter()
         .map(|a| author_parts(a))

@@ -14,6 +14,7 @@ use std::{
 
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use crypto_box::{SecretKey, aead::OsRng};
+use perseid::config::SCHEMA_URL;
 use serde_json::{Value, json};
 
 const PEM: &str = include_str!("fixtures/github-app.pem");
@@ -840,14 +841,11 @@ fn setup_without_credentials_says_how_to_get_them() {
     let server = Arc::new(Mutex::new(GitHub::with_spec_repo()));
     let port = serve(server);
     let (dir, bin) = api_checkout(false);
-    let args = ["init", "rust", "--github", "--yes"];
     let env = [("PERSEID_GITHUB_CLIENT_ID", "")];
-    let (code, out) = perseid(dir.path(), bin.path(), port, &args, "", &env);
+    let (code, out) = perseid(dir.path(), bin.path(), port, &["init", "rust"], "", &env);
+    assert_eq!(code, 0, "{out}");
+    let (code, out) = perseid(dir.path(), bin.path(), port, &["setup", "--yes"], "", &env);
     assert_ne!(code, 0);
-    assert!(
-        out.contains("is now `perseid init`, then `perseid setup`"),
-        "{out}"
-    );
     assert!(
         out.contains("set GH_TOKEN") && out.contains("gh auth login"),
         "{out}"
@@ -900,7 +898,8 @@ fn setup_sends_the_spec_to_an_sdks_repository_holding_every_sdk() {
         &[],
     );
     assert_eq!(code, 0, "{out}");
-    uncomment(dir.path(), "push_spec");
+    uncomment(dir.path(), "[push]");
+    uncomment(dir.path(), "to =");
 
     let before = server.lock().unwrap().calls.len();
     let (code, out) = perseid(
@@ -946,14 +945,21 @@ fn setup_sends_the_spec_to_an_sdks_repository_holding_every_sdk() {
     let files = github.files("acme/petstore-sdks", "main");
     let config = &files["perseid.toml"];
     assert!(
-        config.starts_with("spec = \"github:acme/petstore/openapi.yaml\"\n"),
+        config.starts_with(&format!(
+            "#:schema {SCHEMA_URL}\nspec = \"github:acme/petstore/openapi.yaml\"\n"
+        )),
+        "{config}"
+    );
+    let table: toml::Table = config.parse().unwrap();
+    assert_eq!(
+        table["package"]["repository"].as_str(),
+        Some("https://github.com/acme/petstore-sdks"),
         "{config}"
     );
     assert!(
-        config.contains("repository = \"https://github.com/acme/petstore-sdks\""),
+        !config.contains("[push]") && !config.contains("to = "),
         "{config}"
     );
-    assert!(!config.contains("\npush_spec"), "{config}");
     assert!(
         config.contains("[typescript]") && config.contains("[python]"),
         "{config}"
@@ -1089,7 +1095,8 @@ fn setup_reuses_an_existing_sdks_repository_from_the_api_repository() {
     let args = ["init", "typescript", "--no-release"];
     let (code, out) = perseid(dir.path(), bin.path(), port, &args, "", &[]);
     assert_eq!(code, 0, "{out}");
-    uncomment(dir.path(), "push_spec");
+    uncomment(dir.path(), "[push]");
+    uncomment(dir.path(), "to =");
     let (code, out) = perseid(
         dir.path(),
         bin.path(),
@@ -1127,7 +1134,9 @@ fn setup_sends_the_spec_to_an_sdks_repository_orchestrating_one_per_language() {
     let args = ["init", "typescript", "python", "--no-release"];
     let (code, out) = perseid(dir.path(), bin.path(), port, &args, "", &[]);
     assert_eq!(code, 0, "{out}");
-    uncomment(dir.path(), "push_spec");
+    uncomment(dir.path(), "[push]");
+    uncomment(dir.path(), "to =");
+    uncomment(dir.path(), "on =");
     uncomment(dir.path(), "repo = \"acme/petstore-{lang}\"");
     let (code, out) = perseid(
         dir.path(),
@@ -1160,6 +1169,17 @@ fn setup_sends_the_spec_to_an_sdks_repository_orchestrating_one_per_language() {
     );
     let files = github.files("acme/petstore-sdks", "main");
     assert!(files["perseid.toml"].contains("\nrepo = \"acme/petstore-{lang}\"\n"));
+    assert!(
+        !files["perseid.toml"].contains("[push]"),
+        "the API side owns [push]"
+    );
+    let push =
+        &github.files("acme/petstore", "perseid/setup")[".github/workflows/perseid-push.yml"];
+    keep("perseid-push-release-setup.yml", push);
+    assert!(
+        push.contains("\n  release:\n    types: [published]\n  workflow_dispatch:\n"),
+        "{push}"
+    );
     assert!(!files.contains_key("typescript/package.json"), "{files:?}");
     let workflow = &files[".github/workflows/sdks.yml"];
     keep("sdks-repo-split-sdks.yml", workflow);
@@ -1177,7 +1197,7 @@ fn setup_sends_the_spec_to_an_sdks_repository_orchestrating_one_per_language() {
 
 /// A clone of acme/petstore-sdks, an SDK monorepo generated from a URL until now.
 fn sdks_checkout(fake: &mut GitHub) -> (tempfile::TempDir, tempfile::TempDir) {
-    let config = "spec = \"https://api.example.com/openapi.yaml\"\nname = \"Petstore\"\nmethod_names = \"resource\"\n\n[typescript]\npath = \"ts\"\ntyped_unions = true\n";
+    let config = "spec = \"https://api.example.com/openapi.yaml\"\nname = \"Petstore\"\n\n[typescript]\npath = \"ts\"\n";
     let release = "{\n  \"packages\": {\n    \"docs\": {\n      \"release-type\": \"simple\"\n    }\n  }\n}\n";
     let handwritten = "export const mine = 1;\n";
     let files = [
@@ -1207,7 +1227,7 @@ fn setup_from_an_existing_sdks_repository_links_the_api_repository() {
         t.replace(
             "https://api.example.com/openapi.yaml",
             "github:acme/petstore/openapi.yaml",
-        )
+        ) + "\n[push]\non = \"tag\"\ntags = \"api-v*\"\n"
     });
 
     let (code, out) = perseid(
@@ -1263,6 +1283,9 @@ fn setup_from_an_existing_sdks_repository_links_the_api_repository() {
     let push =
         &github.files("acme/petstore", "perseid/setup")[".github/workflows/perseid-push.yml"];
     assert!(push.contains("SNAPSHOT: openapi.yaml\n"), "{push}");
+    keep("perseid-push-tag-setup.yml", push);
+    assert!(push.contains("\n    tags: [\"api-v*\"]\n"), "{push}");
+
     drop(github);
 
     let before = server.lock().unwrap().calls.len();
@@ -1283,6 +1306,67 @@ fn setup_from_an_existing_sdks_repository_links_the_api_repository() {
 }
 
 #[test]
+fn setup_refuses_push_settings_both_repositories_set_differently() {
+    let mut fake = GitHub::with_spec_repo();
+    let api_config = "spec = \"openapi.yaml\"\nname = \"Petstore\"\n\n[push]\nto = \"acme/petstore-sdks\"\non = \"release\"\n";
+    fake.add_repo(
+        "acme/petstore",
+        &[
+            ("README.md", "# Petstore\n"),
+            ("openapi.yaml", SPEC),
+            ("perseid.toml", api_config),
+        ],
+    );
+    let (dir, bin) = sdks_checkout(&mut fake);
+    let server = Arc::new(Mutex::new(fake));
+    let port = serve(server.clone());
+    let received = |t: String| {
+        t.replace(
+            "https://api.example.com/openapi.yaml",
+            "github:acme/petstore/openapi.yaml",
+        )
+    };
+    edit(dir.path(), |t| received(t) + "\n[push]\non = \"tag\"\n");
+
+    let before = server.lock().unwrap().calls.len();
+    let (code, out) = perseid(
+        dir.path(),
+        bin.path(),
+        port,
+        &["setup", "--yes"],
+        "",
+        &TOKEN,
+    );
+    assert_ne!(code, 0, "{out}");
+    let differs = "[push] differs: `on` is \"tag\" in acme/petstore-sdks/perseid.toml but \"release\" in acme/petstore/perseid.toml";
+    let fix = "set `on` in one of the two perseid.toml only, or to the same value in both";
+    assert!(out.contains(&format!("{differs}: {fix}")), "{out}");
+    assert_eq!(server.lock().unwrap().writes(before), Vec::<&String>::new());
+
+    let (code, out) = perseid(dir.path(), bin.path(), port, &["status"], "", &TOKEN);
+    assert_eq!(code, 1, "{out}");
+    assert!(out.contains(&format!("✗ {differs}\n→ {fix}\n")), "{out}");
+
+    edit(dir.path(), |t| t.replace("\n[push]\non = \"tag\"\n", ""));
+    let (code, out) = perseid(
+        dir.path(),
+        bin.path(),
+        port,
+        &["setup", "--yes"],
+        "",
+        &TOKEN,
+    );
+    assert_eq!(code, 0, "{out}");
+    let github = server.lock().unwrap();
+    let push =
+        &github.files("acme/petstore", "perseid/setup")[".github/workflows/perseid-push.yml"];
+    assert!(
+        push.contains("\n  release:\n    types: [published]\n"),
+        "the API side's `on` holds: {push}"
+    );
+}
+
+#[test]
 fn setup_from_a_new_sdks_repository_seeds_its_spec_from_the_api_repository() {
     let mut fake = GitHub::with_spec_repo();
     fake.add_repo("acme/petstore-sdks", &[("README.md", "# SDKs\n")]);
@@ -1299,10 +1383,12 @@ fn setup_from_a_new_sdks_repository_seeds_its_spec_from_the_api_repository() {
     assert_eq!(code, 0, "{out}");
     let config = fs::read_to_string(dir.path().join("perseid.toml")).unwrap();
     assert!(
-        config.starts_with("spec = \"github:acme/petstore/openapi.yaml\"\nname = \"Petstore\"\n"),
+        config.starts_with(&format!(
+            "#:schema {SCHEMA_URL}\nspec = \"github:acme/petstore/openapi.yaml\"\nname = \"Petstore\"\n"
+        )),
         "{config}"
     );
-    assert!(!config.contains("# push_spec"), "{config}");
+    assert!(!config.contains("# to ="), "{config}");
 
     let (code, out) = perseid(dir.path(), bin.path(), port, &["setup"], "\n", &TOKEN);
     assert_eq!(code, 0, "{out}");

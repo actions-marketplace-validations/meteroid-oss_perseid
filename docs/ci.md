@@ -45,13 +45,22 @@ acme/api ──spec──▶ acme/api-sdks ──PRs──▶ acme/api-node, acm
 ```toml
 # acme/api: perseid.toml
 spec = "openapi.json"
-push_spec = "acme/api-sdks"
+
+[push]
+to = "acme/api-sdks"
+on = "release"                 # optional: on each GitHub release instead of each change
 generate = "npm run openapi"   # only when the spec isn't committed: how CI writes it
 
 # acme/api-sdks: perseid.toml, which `perseid setup` writes when it creates the repository
 spec = "github:acme/api/openapi.json"   # kept here as openapi.json, with .perseid/source.json
 repo = "acme/api-{lang}"                # only for one repository per language
+
+[push]                                  # or here, without `to`, when set up from this side
+on = "release"
 ```
+
+`on`, `tags` and `generate` may be set on either side: `perseid setup` and `perseid status` read
+both `perseid.toml` and refuse settings that both set differently.
 
 `perseid setup` works from either side: in the API repository it creates or completes the SDKs
 repository from the SDK tables of its own `perseid.toml`; in the SDKs repository it sets up the
@@ -62,7 +71,8 @@ side. `sdks.yml` fetches it every day (and on demand), and opens pull requests w
 their description names the URL and a digest of what it served.
 
 `perseid.toml` with `spec = "github:…"` generates from the snapshot, and its pull requests say
-which commit it comes from: "Generated from acme/api@a1b2c3d".
+which commit it comes from: "Generated from acme/api@a1b2c3d", or "acme/api@v1.4.0 (a1b2c3d)"
+when a release or tag pushed it.
 
 ## GitHub Action
 
@@ -124,7 +134,7 @@ files perseid didn't write. Once confirmed, it:
 
 Running it again changes nothing once in sync. `--dry-run` prints the plan and exits with 2 when
 changes are pending (0 otherwise), `--yes` applies without asking, and `--no-browser` prints URLs
-instead of opening them. `perseid init --github` still works: it runs `init`, then `setup`.
+instead of opening them.
 
 `perseid status`, from the API repository or an SDKs repository, runs the same comparison
 without changing anything, then checks how the automation fares: the last spec synced (commit and
@@ -134,21 +144,38 @@ it exits with 1 when something needs you. Without GitHub credentials it checks t
 
 ### Spec pushes
 
-`perseid-push.yml` runs on the API repository's default branch when the spec changes (on every
-push with `generate`, after running it). It clones the SDKs repository over SSH, pinned to
-GitHub's published host keys, and commits the spec as `spec: acme/api@a1b2c3d` with
-`.perseid/source.json` naming the commit, unless:
+`perseid-push.yml` runs when `[push] on` says, set in the `perseid.toml` of either side (or both,
+alike):
+
+- `"change"` (the default): on the API repository's default branch when the spec changes (on
+  every push with `generate`, after running it);
+- `"release"`: when a GitHub release is published;
+- `"tag"`: when a tag matching `[push] tags` (`"v*"` by default) is pushed.
+
+It can also be run by hand, from the default branch or a tag. It takes the spec of the commit that
+triggered it, clones the SDKs repository over SSH, pinned to GitHub's published host keys, and
+commits the spec as `spec: acme/api@a1b2c3d` (`spec: acme/api@v1.4.0 (a1b2c3d)` for a release or
+tag) with `.perseid/source.json` naming the commit, and the tag as `ref`, unless:
 
 - the SDKs repository has no `.perseid/source.json` yet: its setup pull request isn't merged,
   run the workflow again once it is;
 - the synced commit isn't an ancestor of the pushed one: an older or diverged commit never
-  overwrites a newer spec (to resync after rewriting history, remove `sha` from
-  `.perseid/source.json`);
+  overwrites a newer spec, so releases and tags must be cut from the default branch's history
+  (to resync after rewriting history, remove `sha` from `.perseid/source.json`);
 - the spec didn't change.
 
 Runs share the `perseid-push` concurrency group without cancelling each other, so pushes happen
 one at a time and in order. The deploy key reaches the SDKs repository only, and nothing on the SDKs
-side can read or write the API repository. The rest of this page is the setup by hand.
+side can read or write the API repository.
+
+**Push the spec on release.** To ship SDKs for what you released rather than for every merged
+change, set `on = "release"` in `[push]` and run `perseid setup` again: it rewrites `perseid-push.yml` to
+run on `release: published`. Each release pushes its spec, the SDKs repository opens its
+`perseid/update` pull request naming the release ("Generated from acme/api@v1.4.0 (a1b2c3d)"),
+and `perseid status` reports spec changes made since as waiting for the next release instead of
+as a failure. With `on = "tag"`, any matching tag does the same, release or not.
+
+The rest of this page is the setup by hand.
 
 ## Tokens
 

@@ -5,6 +5,7 @@ use std::{
 
 use anyhow::{Context, Result, ensure};
 use heck::{ToKebabCase, ToSnakeCase, ToUpperCamelCase};
+use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -12,111 +13,371 @@ use crate::spec::{Filters, IncludeMode};
 
 pub const FILE: &str = "perseid.toml";
 pub const LANGUAGES: [&str; 6] = ["rust", "typescript", "python", "go", "java", "csharp"];
+pub const SCHEMA_URL: &str =
+    "https://raw.githubusercontent.com/meteroid-oss/perseid/main/perseid.schema.json";
 
-#[derive(Deserialize)]
+/// perseid.toml: where the OpenAPI spec comes from, and the SDKs generated from it.
+#[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+#[schemars(title = "perseid.toml")]
 pub struct Config {
-    /// Path (relative to perseid.toml), http(s) URL, or `github:owner/repo/path` of a spec another
-    /// repository pushes here.
+    /// The OpenAPI document (3.0 or 3.1, JSON or YAML): a path relative to perseid.toml, an
+    /// http(s) URL, or `github:owner/repo/path` for a spec another repository pushes here.
     pub spec: String,
-    /// Default repository of every SDK: `owner/name-{lang}` gives each its own, `owner/name` holds
-    /// them all in folders named after their language.
-    pub repo: Option<String>,
-    /// `owner/name` of a repository receiving the spec, which generates the SDKs itself.
-    pub push_spec: Option<String>,
-    /// Command producing the spec in the API repository's CI, when it isn't committed.
-    pub generate: Option<String>,
-    /// Client name: `Acme` gives the `Acme` client and the `acme` package.
+    /// Client name, in any form (`Acme`, `acme-api`, `Acme API`): the `AcmeApi` client, the
+    /// `acme_api` and `acme-api` packages.
+    #[serde(deserialize_with = "client_name")]
+    #[schemars(with = "String")]
     pub name: String,
+    /// Default repository of every SDK: `owner/name-{lang}` gives each its own (`{lang}` is
+    /// `rust`, `node`, `python`, `go`, `java` or `dotnet`), `owner/name` holds them all in folders
+    /// named after their language. Without it, the SDKs live next to perseid.toml.
+    pub repo: Option<String>,
+    /// How the spec gets from the API repository to a separate repository generating the SDKs.
+    #[serde(default)]
+    pub push: Push,
+    /// Package metadata written into the manifests `perseid init` creates.
+    #[serde(default)]
+    pub package: Package,
+    /// API base URL the clients default to.
     pub base_url: Option<String>,
-    pub version: Option<String>,
+    /// Prefix of the SDK's own headers, such as `{prefix}-idempotency-key`: the kebab-case
+    /// `name` by default.
     pub header_prefix: Option<String>,
+    /// Prefix of the `User-Agent` header: the kebab-case `name` by default.
     pub user_agent: Option<String>,
-    pub patch_nullable: Option<bool>,
     /// Installs the Standard Webhooks signature verifier in every SDK.
     pub webhooks: Option<bool>,
-    pub method_names: Option<MethodNames>,
-    /// Method names by operation id, over the naming strategy.
+    /// Default request timeout, in seconds: 60 by default.
+    pub timeout: Option<u64>,
+    /// How unions decode objects that no rule tells apart.
+    pub untagged_unions: Option<UntaggedUnions>,
+    /// Method names by operation id, over the resource-style names.
     #[serde(default)]
     pub names: BTreeMap<String, String>,
-    /// Default request timeout, in seconds.
-    pub timeout: Option<u64>,
-    /// Primitive-or-object unions as typed values rather than untyped JSON.
-    pub typed_unions: Option<bool>,
-    /// How typed unions decode objects that no rule tells apart.
-    pub untagged_unions: Option<UntaggedUnions>,
-    /// SPDX license expression of the packages.
-    pub license: Option<String>,
-    pub repository: Option<String>,
-    pub homepage: Option<String>,
-    pub description: Option<String>,
+    /// Also generates the operations marked `x-internal: true`.
     #[serde(default)]
-    pub authors: Vec<String>,
-    #[serde(default)]
-    pub context: BTreeMap<String, Value>,
-    /// Directory mirroring `templates/<lang>/…` and `runtime/<lang>/…` to override built-ins.
-    /// Defaults to `.perseid`.
-    pub overrides: Option<String>,
-    #[serde(default)]
-    pub include: IncludeMode,
-    #[serde(default)]
-    pub exclude: Vec<String>,
+    pub internal: bool,
+    /// Operation ids to generate, leaving out every other operation.
     #[serde(default)]
     pub only: Vec<String>,
+    /// Operation ids left out of every SDK.
+    #[serde(default)]
+    pub exclude: Vec<String>,
     /// Paginated list operations, detected from their query parameter and response shape.
     #[serde(default, deserialize_with = "one_or_many")]
+    #[schemars(with = "OneOrMany")]
     pub pagination: Vec<Pagination>,
+    /// Directory mirroring `templates/<lang>/…` and `runtime/<lang>/…` to override built-ins:
+    /// `.perseid` by default.
+    pub overrides: Option<String>,
+    /// Values exposed to templates as `sdk.*`.
+    #[serde(default)]
+    pub context: BTreeMap<String, Value>,
+    /// The Rust SDK, a crate.
+    #[serde(default, deserialize_with = "target::<Rust, _>")]
+    #[schemars(with = "Option<Rust>")]
     pub rust: Option<Target>,
+    /// The TypeScript SDK, an npm package.
+    #[serde(default, deserialize_with = "target::<TypeScript, _>")]
+    #[schemars(with = "Option<TypeScript>")]
     pub typescript: Option<Target>,
+    /// The Python SDK, a PyPI package.
+    #[serde(default, deserialize_with = "target::<Python, _>")]
+    #[schemars(with = "Option<Python>")]
     pub python: Option<Target>,
+    /// The Go SDK, a module.
+    #[serde(default, deserialize_with = "target::<Go, _>")]
+    #[schemars(with = "Option<Go>")]
     pub go: Option<Target>,
+    /// The Java SDK, a Maven package.
+    #[serde(default, deserialize_with = "target::<Java, _>")]
+    #[schemars(with = "Option<Java>")]
     pub java: Option<Target>,
+    /// The C# SDK, a NuGet package.
+    #[serde(default, deserialize_with = "target::<CSharp, _>")]
+    #[schemars(with = "Option<CSharp>")]
     pub csharp: Option<Target>,
 }
 
-#[derive(Deserialize, Default)]
+/// Package metadata written into the manifests `perseid init` creates.
+#[derive(Default, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-pub struct Target {
-    /// Output directory, relative to the repository the SDK lives in.
-    pub path: Option<String>,
-    /// `owner/name` of a GitHub repository to generate into instead of this one.
-    pub repo: Option<String>,
-    /// Crate, npm, PyPI or Go package name, Java package or C# root namespace.
-    pub package: Option<String>,
-    /// Go module path.
-    pub module: Option<String>,
-    /// TypeScript modules re-exported from the entry point.
+pub struct Package {
+    /// One-line summary: `{name} API client` by default.
+    pub description: Option<String>,
+    /// SPDX license expression.
+    pub license: Option<String>,
+    /// Project website.
+    pub homepage: Option<String>,
+    /// URL of the source repository.
+    pub repository: Option<String>,
+    /// `Name <email>` of each author.
     #[serde(default)]
-    pub exports: Vec<String>,
-    pub base_url: Option<String>,
-    pub version: Option<String>,
-    pub header_prefix: Option<String>,
-    pub user_agent: Option<String>,
-    pub patch_nullable: Option<bool>,
-    pub webhooks: Option<bool>,
-    /// TypeScript type of int64 values: `number` (the default), `bigint` or `string`.
-    pub int64: Option<String>,
-    /// Go: spell initialisms the Go way (`CustomerID`, not `CustomerId`).
-    pub initialisms: Option<bool>,
-    /// Java: 2 for unchecked exceptions, typed unions and plumbing in an `internal` package.
-    pub edition: Option<u32>,
-    pub method_names: Option<MethodNames>,
-    /// Method names by operation id, over the top-level `[names]`.
-    #[serde(default)]
-    pub names: BTreeMap<String, String>,
-    pub timeout: Option<u64>,
-    pub typed_unions: Option<bool>,
-    pub untagged_unions: Option<UntaggedUnions>,
-    /// Operation ids left out of this SDK only, on top of the top-level `exclude`.
-    #[serde(default)]
-    pub exclude: Vec<String>,
-    #[serde(default)]
-    pub context: BTreeMap<String, Value>,
+    pub authors: Vec<String>,
 }
 
-/// How a typed union decodes an object when several variants are objects that neither a
+/// How the spec gets from the API repository to a separate repository generating the SDKs. When
+/// both have a perseid.toml, either may set `on`, `tags` and `generate`, and both must agree.
+#[derive(Clone, Debug, Default, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct Push {
+    /// `owner/name` of the repository this one sends its spec to, which generates the SDKs from
+    /// its own perseid.toml: on the API side only.
+    pub to: Option<String>,
+    /// When the spec is pushed: `change` by default.
+    pub on: Option<PushOn>,
+    /// Tags pushing the spec with `on = "tag"`, as a GitHub Actions glob: `v*` by default.
+    pub tags: Option<String>,
+    /// Command writing the spec in the API repository's CI when it isn't committed, run from its
+    /// root before pushing the spec.
+    pub generate: Option<String>,
+}
+
+impl Push {
+    /// The `[push]` table of another repository's perseid.toml, whatever else it holds.
+    pub fn of(text: &str) -> Result<Self> {
+        let table: toml::Table = text.parse()?;
+        match table.get("push") {
+            Some(push) => Ok(push.clone().try_into()?),
+            None => Ok(Self::default()),
+        }
+    }
+
+    /// The tags pushing the spec with `on = "tag"`.
+    pub fn tags(&self) -> &str {
+        self.tags.as_deref().unwrap_or("v*")
+    }
+
+    /// These settings, completed by `other`'s: each may be set on either side, but not differ.
+    pub fn agree(&self, here: &str, other: &Self, there: &str) -> Result<Self, PushMismatch> {
+        let quote = |value: Option<&str>| value.map(|v| format!("{v:?}"));
+        let pairs = [
+            (
+                "on",
+                quote(self.on.map(PushOn::name)),
+                quote(other.on.map(PushOn::name)),
+            ),
+            (
+                "tags",
+                quote(self.tags.as_deref()),
+                quote(other.tags.as_deref()),
+            ),
+            (
+                "generate",
+                quote(self.generate.as_deref()),
+                quote(other.generate.as_deref()),
+            ),
+        ];
+        let differences: Vec<_> = pairs
+            .into_iter()
+            .filter_map(|(key, a, b)| match (a, b) {
+                (Some(a), Some(b)) if a != b => Some((key, a, b)),
+                _ => None,
+            })
+            .collect();
+        if !differences.is_empty() {
+            return Err(PushMismatch {
+                here: here.to_owned(),
+                there: there.to_owned(),
+                differences,
+            });
+        }
+        Ok(Self {
+            to: self.to.clone(),
+            on: self.on.or(other.on),
+            tags: self.tags.clone().or_else(|| other.tags.clone()),
+            generate: self.generate.clone().or_else(|| other.generate.clone()),
+        })
+    }
+}
+
+/// The two perseid.toml of a spec push setting `[push]` differently.
+#[derive(Debug)]
+pub struct PushMismatch {
+    pub here: String,
+    pub there: String,
+    /// Each key set differently, with its value here and there.
+    pub differences: Vec<(&'static str, String, String)>,
+}
+
+impl PushMismatch {
+    pub fn summary(&self) -> String {
+        let keys: Vec<_> = self
+            .differences
+            .iter()
+            .map(|(key, a, b)| format!("`{key}` is {a} in {} but {b} in {}", self.here, self.there))
+            .collect();
+        format!("[push] differs: {}", keys.join(", "))
+    }
+
+    pub fn fix(&self) -> String {
+        let keys: Vec<_> = self
+            .differences
+            .iter()
+            .map(|(key, ..)| format!("`{key}`"))
+            .collect();
+        format!(
+            "set {} in one of the two perseid.toml only, or to the same value in both",
+            keys.join(", ")
+        )
+    }
+}
+
+impl std::fmt::Display for PushMismatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.summary(), self.fix())
+    }
+}
+
+impl std::error::Error for PushMismatch {}
+
+/// When the API repository pushes its spec.
+#[derive(Clone, Copy, Debug, Default, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum PushOn {
+    /// Every push to the default branch changing the spec.
+    #[default]
+    Change,
+    /// Every published GitHub release, with the spec of its tag.
+    Release,
+    /// Every tag matching `tags`.
+    Tag,
+}
+
+impl PushOn {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Change => "change",
+            Self::Release => "release",
+            Self::Tag => "tag",
+        }
+    }
+}
+
+/// One SDK, as its language table sets it up; the shared settings default to the top-level ones.
+#[derive(Default)]
+pub struct Target {
+    pub path: Option<String>,
+    pub repo: Option<String>,
+    pub package: Option<String>,
+    pub base_url: Option<String>,
+    pub header_prefix: Option<String>,
+    pub user_agent: Option<String>,
+    pub webhooks: Option<bool>,
+    pub timeout: Option<u64>,
+    pub untagged_unions: Option<UntaggedUnions>,
+    pub names: BTreeMap<String, String>,
+    pub exclude: Vec<String>,
+    pub context: BTreeMap<String, Value>,
+    pub module: Option<String>,
+    pub exports: Vec<String>,
+    pub int64: Option<Int64>,
+    pub flat_unions: bool,
+}
+
+/// A language table: the settings every SDK takes, then the language's own.
+macro_rules! language {
+    ($name:ident, $package:literal { $($(#[$doc:meta])* $field:ident: $ty:ty),* $(,)? }) => {
+        #[derive(Deserialize, JsonSchema)]
+        #[serde(deny_unknown_fields)]
+        pub struct $name {
+            /// Output directory, relative to the repository the SDK lives in: the language's
+            /// name, or the root of a repository of its own.
+            path: Option<String>,
+            /// `owner/name` of a GitHub repository to generate into, over the top-level `repo`.
+            repo: Option<String>,
+            #[doc = $package]
+            package: Option<String>,
+            /// API base URL this client defaults to, over the top-level one.
+            base_url: Option<String>,
+            /// Prefix of this SDK's own headers, over the top-level one.
+            header_prefix: Option<String>,
+            /// Prefix of this SDK's `User-Agent` header, over the top-level one.
+            user_agent: Option<String>,
+            /// Installs the Standard Webhooks signature verifier, over the top-level setting.
+            webhooks: Option<bool>,
+            /// Default request timeout in seconds, over the top-level one.
+            timeout: Option<u64>,
+            /// How unions decode objects that no rule tells apart, over the top-level setting.
+            untagged_unions: Option<UntaggedUnions>,
+            /// Method names by operation id, over the top-level `[names]`.
+            #[serde(default)]
+            names: BTreeMap<String, String>,
+            /// Operation ids left out of this SDK only, on top of the top-level `exclude`.
+            #[serde(default)]
+            exclude: Vec<String>,
+            /// Values exposed to templates as `sdk.*`, over the top-level `[context]`.
+            #[serde(default)]
+            context: BTreeMap<String, Value>,
+            $($(#[$doc])* #[serde(default)] $field: $ty,)*
+        }
+
+        impl From<$name> for Target {
+            fn from(t: $name) -> Self {
+                Target {
+                    path: t.path,
+                    repo: t.repo,
+                    package: t.package,
+                    base_url: t.base_url,
+                    header_prefix: t.header_prefix,
+                    user_agent: t.user_agent,
+                    webhooks: t.webhooks,
+                    timeout: t.timeout,
+                    untagged_unions: t.untagged_unions,
+                    names: t.names,
+                    exclude: t.exclude,
+                    context: t.context,
+                    $($field: t.$field.into(),)*
+                    ..Target::default()
+                }
+            }
+        }
+    };
+}
+
+language!(Rust, "Crate name: the snake_case `name` by default." {});
+language!(TypeScript, "npm package name: the kebab-case `name` by default." {
+    /// Modules re-exported from the entry point.
+    exports: Vec<String>,
+    /// Type of int64 values.
+    int64: Option<Int64>,
+});
+language!(Python, "Python package name: the snake_case `name` by default." {
+    /// Types a union as `Circle | Square` instead of a wrapper model.
+    flat_unions: bool,
+});
+language!(Go, "Go package name: the snake_case `name` by default." {
+    /// Module path: `github.com/{repo}/{path}` of the repository the SDK lives in by default.
+    module: Option<String>,
+});
+language!(Java, "Java package: `com.{name}` by default." {});
+language!(CSharp, "Root namespace and NuGet package: `name` by default." {});
+
+fn target<'de, T, D>(d: D) -> Result<Option<Target>, D::Error>
+where
+    T: Deserialize<'de> + Into<Target>,
+    D: serde::Deserializer<'de>,
+{
+    Ok(Some(T::deserialize(d)?.into()))
+}
+
+/// TypeScript type of int64 values.
+#[derive(Clone, Copy, Debug, Default, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum Int64 {
+    /// `number`, exact up to 2^53.
+    #[default]
+    Number,
+    /// `bigint`.
+    Bigint,
+    /// `string`.
+    String,
+}
+
+/// How a union decodes an object when several variants are objects that neither a
 /// discriminator nor the constants and required properties they declare tell apart.
-#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum UntaggedUnions {
     /// Untyped JSON.
@@ -127,25 +388,17 @@ pub enum UntaggedUnions {
     BestMatch,
 }
 
-/// How operations are named in code.
-#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum MethodNames {
-    /// After the operation id: `customers.getCustomers`.
-    #[default]
-    OperationId,
-    /// After the HTTP method and the path within the resource: `customers.list`.
-    Resource,
-}
-
 /// How a list operation pages, as `x-pagination` on an operation or `[pagination]` in perseid.toml.
 /// Exactly one of `cursor`, `page` or `offset` names the query parameter selecting the page;
 /// response values are dotted paths of JSON property names.
-#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Default, Deserialize, JsonSchema, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct Pagination {
+    /// Query parameter taking the cursor of the page.
     pub cursor: Option<String>,
+    /// Query parameter taking the page number.
     pub page: Option<String>,
+    /// Query parameter taking the index of the first item.
     pub offset: Option<String>,
     /// The array of items, `data` by default.
     pub items: Option<String>,
@@ -155,6 +408,7 @@ pub struct Pagination {
     pub item_cursor: Option<String>,
     /// Boolean telling whether more pages follow.
     pub has_more: Option<String>,
+    /// Number of pages.
     pub total_pages: Option<String>,
     /// Total number of items, for offset pagination.
     pub total: Option<String>,
@@ -163,6 +417,15 @@ pub struct Pagination {
     /// perseid.toml only: operations this rule must apply to, instead of every matching one.
     #[serde(default)]
     pub operations: Vec<String>,
+}
+
+/// One pagination rule, or several.
+#[derive(JsonSchema)]
+#[serde(untagged)]
+#[allow(dead_code)]
+enum OneOrMany {
+    One(Box<Pagination>),
+    Many(Vec<Pagination>),
 }
 
 fn one_or_many<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<Pagination>, D::Error> {
@@ -174,6 +437,34 @@ fn one_or_many<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<Pagination>
             .collect(),
         one => Ok(vec![one.try_into().map_err(D::Error::custom)?]),
     }
+}
+
+/// `name` as the UpperCamelCase identifier the client is named after, kept as written when it
+/// already is one (`AcmeAPI`).
+fn client_name<'de, D: serde::Deserializer<'de>>(d: D) -> Result<String, D::Error> {
+    let name = String::deserialize(d)?;
+    let camel = match name.chars().all(|c| c.is_ascii_alphanumeric()) {
+        true if name.starts_with(|c: char| c.is_ascii_uppercase()) => name.clone(),
+        _ => name.to_upper_camel_case(),
+    };
+    match camel.starts_with(|c: char| c.is_ascii_alphabetic())
+        && camel.chars().all(|c| c.is_ascii_alphanumeric())
+    {
+        true => Ok(camel),
+        false => Err(serde::de::Error::custom(format!(
+            "`name = {name:?}` must start with a letter and hold ASCII letters, digits, spaces, `-` or `_`"
+        ))),
+    }
+}
+
+/// The JSON Schema of perseid.toml, for editors.
+pub fn json_schema() -> String {
+    let settings = schemars::r#gen::SchemaSettings::draft07().with(|s| {
+        s.option_nullable = false;
+        s.option_add_null_type = false;
+    });
+    let schema = settings.into_generator().into_root_schema_for::<Config>();
+    serde_json::to_string_pretty(&schema).unwrap_or_default() + "\n"
 }
 
 pub struct Sdk<'a> {
@@ -247,52 +538,46 @@ impl Config {
                 path.display()
             )
         })?;
-        let config: Self =
-            toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
-        ensure!(
-            config.name == config.name.to_upper_camel_case(),
-            "`name` must be UpperCamelCase, e.g. \"{}\"",
-            config.name.to_upper_camel_case()
-        );
-        let others = [&config.rust, &config.python, &config.go, &config.java];
-        ensure!(
-            others
-                .iter()
-                .all(|t| t.as_ref().is_none_or(|t| t.int64.is_none())),
-            "`int64` is only supported in [typescript]"
-        );
-        let not_java = [
-            &config.rust,
-            &config.typescript,
-            &config.python,
-            &config.go,
-            &config.csharp,
-        ];
-        ensure!(
-            not_java
-                .iter()
-                .all(|t| t.as_ref().is_none_or(|t| t.edition.is_none())),
-            "`edition` is only supported in [java]"
-        );
-        if let Some(edition) = config.java.as_ref().and_then(|t| t.edition) {
-            ensure!(
-                (1..=2).contains(&edition),
-                "[java] `edition` must be 1 or 2"
-            );
-        }
-        if let Some(int64) = config.typescript.as_ref().and_then(|t| t.int64.as_deref()) {
-            ensure!(
-                ["number", "bigint", "string"].contains(&int64),
-                "`int64` must be \"number\", \"bigint\" or \"string\", not {int64:?}"
-            );
-        }
-        let source = Source::parse(&config.spec)?;
-        ensure!(
-            config.push_spec.is_none() || matches!(source, Source::File(_)),
-            "`push_spec` sends a spec file of this repository: `spec` must be its path"
-        );
+        let config = Self::parse(&text, &path.display().to_string())?;
         let root = std::path::absolute(path)?.parent().unwrap().to_owned();
         Ok((config, root))
+    }
+
+    /// perseid.toml's `text`, read from `origin`.
+    pub fn parse(text: &str, origin: &str) -> Result<Self> {
+        let table: toml::Table =
+            toml::from_str(text).with_context(|| format!("parsing {origin}"))?;
+        removed_keys(&table).with_context(|| format!("in {origin}"))?;
+        let config: Self = toml::from_str(text).with_context(|| format!("parsing {origin}"))?;
+        config.validate().with_context(|| format!("in {origin}"))?;
+        Ok(config)
+    }
+
+    fn validate(&self) -> Result<()> {
+        let source = Source::parse(&self.spec)?;
+        let push = &self.push;
+        ensure!(
+            push.to.is_none() || matches!(source, Source::File(_)),
+            "[push] `to` names the repository the spec is sent to, from a file of this one: delete it here, the `github:` spec says where the spec comes from"
+        );
+        ensure!(
+            *push == Push::default() || self.pushed(),
+            "[push] says how the spec is pushed: set its `to`, or a `github:` spec"
+        );
+        ensure!(
+            push.tags.is_none() || push.on == Some(PushOn::Tag),
+            "[push] `tags` needs `on = \"tag\"`"
+        );
+        ensure!(
+            !self.internal || self.only.is_empty(),
+            "`only` lists every operation generated: `internal` can't add any, delete it"
+        );
+        Ok(())
+    }
+
+    /// Whether another repository than this one's receives or sends the spec.
+    fn pushed(&self) -> bool {
+        self.push.to.is_some() || matches!(self.source(), Source::GitHub { .. })
     }
 
     pub fn overrides_dir(&self, root: &Path) -> PathBuf {
@@ -304,27 +589,21 @@ impl Config {
         let mut filters = self.filters();
         filters.excluded.extend(sdk.target.exclude.iter().cloned());
         filters.reserved = reserved_type_names(sdk.language, &self.name);
-        filters.method_names = sdk
-            .target
-            .method_names
-            .or(self.method_names)
-            .unwrap_or_default();
         filters.names.extend(sdk.target.names.clone());
         filters
     }
 
     pub fn filters(&self) -> Filters {
         Filters {
-            include_mode: if self.only.is_empty() {
-                self.include
-            } else {
-                IncludeMode::OnlySpecified
+            include_mode: match (self.only.is_empty(), self.internal) {
+                (false, _) => IncludeMode::OnlySpecified,
+                (true, true) => IncludeMode::PublicAndInternal,
+                (true, false) => IncludeMode::OnlyPublic,
             },
             excluded: self.exclude.iter().cloned().collect(),
             specified: self.only.iter().cloned().collect(),
             pagination: self.pagination.clone(),
             reserved: BTreeSet::new(),
-            method_names: self.method_names.unwrap_or_default(),
             names: self.names.clone(),
         }
     }
@@ -384,7 +663,7 @@ impl Config {
     /// The Go module path of the repository and folder the SDK lives in.
     fn go_module(&self, sdk: &Sdk) -> String {
         let repo = sdk.repo.clone().or_else(|| {
-            let url = self.repository.as_deref()?;
+            let url = self.package.repository.as_deref()?;
             Some(url.strip_prefix("https://github.com/")?.to_owned())
         });
         match (repo, sdk.path.as_str()) {
@@ -408,10 +687,7 @@ impl Config {
             "csharp" => self.name.clone(),
             _ => snake.clone(),
         });
-        let version = target.version.clone().or_else(|| self.version.clone());
-        let version = version
-            .or_else(|| manifest_version(dir))
-            .unwrap_or_else(|| "0.1.0".into());
+        let version = manifest_version(dir).unwrap_or_else(|| "0.1.0".into());
         let pick = |own: &Option<String>, shared: &Option<String>, default: &str| {
             own.clone()
                 .or_else(|| shared.clone())
@@ -427,41 +703,34 @@ impl Config {
             "default_base_url": pick(&target.base_url, &self.base_url, "http://localhost"),
             "user_agent_prefix": pick(&target.user_agent, &self.user_agent, &kebab),
             "header_prefix": pick(&target.header_prefix, &self.header_prefix, &kebab),
-            "patch_nullable": target.patch_nullable.or(self.patch_nullable).unwrap_or(false),
             "webhooks": target.webhooks.or(self.webhooks).unwrap_or(false),
-            "int64": target.int64.as_deref().unwrap_or("number"),
-            "go_initialisms": target.initialisms.unwrap_or(false),
+            "int64": match target.int64.unwrap_or_default() {
+                Int64::Number => "number",
+                Int64::Bigint => "bigint",
+                Int64::String => "string",
+            },
             "version": version,
             "extra_exports": target.exports,
             "timeout": target.timeout.or(self.timeout).unwrap_or(60),
-            "typed_unions": target.typed_unions.or(self.typed_unions).unwrap_or(false),
             "untagged_unions": match target.untagged_unions.or(self.untagged_unions).unwrap_or_default() {
                 UntaggedUnions::Json => "json",
                 UntaggedUnions::BestMatch => "best-match",
             },
-            "license": self.license,
-            "repository": self.repository,
-            "homepage": self.homepage,
-            "description": self.description.clone().unwrap_or_else(|| format!("{} API client", self.name)),
-            "authors": self.authors,
+            "license": self.package.license,
+            "repository": self.package.repository,
+            "homepage": self.package.homepage,
+            "description": self.package.description.clone().unwrap_or_else(|| format!("{} API client", self.name)),
+            "authors": self.package.authors,
         });
         let map = context.as_object_mut().unwrap();
-        if language == "java" {
-            let edition = target.edition.unwrap_or(1);
-            let (internal_package, internal_dir) = if edition >= 2 {
-                (format!("{package}.internal"), "internal")
-            } else {
-                (package.clone(), ".")
-            };
-            map.insert("edition".into(), edition.into());
-            map.insert("typed_unions".into(), (edition >= 2).into());
-            map.insert("java_internal_package".into(), internal_package.into());
-            map.insert("java_internal_dir".into(), internal_dir.into());
+        if language == "python" {
+            map.insert("flat_unions".into(), target.flat_unions.into());
         }
-        if language == "rust" {
-            map.insert("chrono".into(), rust_depends_on(dir, "chrono").into());
-            let futures = rust_depends_on(dir, "futures-core");
-            map.insert("futures_core".into(), futures.into());
+        if language == "java" {
+            map.insert(
+                "java_internal_package".into(),
+                format!("{package}.internal").into(),
+            );
         }
         map.extend(self.context.clone());
         map.extend(target.context.clone());
@@ -469,16 +738,72 @@ impl Config {
     }
 }
 
-/// Rust dates are `chrono` types when the crate depends on it (or has no manifest yet), so
-/// SDKs predating it keep their string dates.
-fn rust_depends_on(dir: &Path, dependency: &str) -> bool {
-    let Ok(text) = std::fs::read_to_string(dir.join("Cargo.toml")) else {
-        return true;
-    };
-    toml::from_str::<toml::Value>(&text)
-        .ok()
-        .and_then(|manifest| manifest.get("dependencies")?.get(dependency).cloned())
-        .is_some()
+/// Keys of earlier versions, and what replaces them.
+const OUTDATED: [(&str, &str); 19] = [
+    (
+        "method_names",
+        "was removed (methods are named after their resource; `[names]` renames one): delete it",
+    ),
+    (
+        "typed_unions",
+        "was removed (unions are always typed): delete it",
+    ),
+    (
+        "patch_nullable",
+        "was removed (nullable optional PATCH fields can always be cleared): delete it",
+    ),
+    (
+        "initialisms",
+        "was removed (Go names always spell initialisms the Go way): delete it",
+    ),
+    (
+        "edition",
+        "was removed (Java SDKs always have edition 2's API): delete it",
+    ),
+    (
+        "version",
+        "was removed (each SDK's package manifest owns its version, which release-please bumps): delete it",
+    ),
+    ("push_spec", "moved to [push] as `to`"),
+    ("sdks_repo", "moved to [push] as `to`"),
+    ("push_on", "moved to [push] as `on`"),
+    ("push_tags", "moved to [push] as `tags`"),
+    ("generate", "moved to [push] as `generate`"),
+    (
+        "include",
+        "was removed: `internal = true` also generates x-internal operations, `only = [...]` lists the operations to generate",
+    ),
+    ("description", "moved to the [package] table"),
+    ("license", "moved to the [package] table"),
+    ("homepage", "moved to the [package] table"),
+    ("repository", "moved to the [package] table"),
+    ("authors", "moved to the [package] table"),
+    ("int64", "is only supported in [typescript]"),
+    ("flat_unions", "is only supported in [python]"),
+];
+
+fn removed_keys(table: &toml::Table) -> Result<()> {
+    let tables = std::iter::once(("", table)).chain(
+        LANGUAGES
+            .into_iter()
+            .filter_map(|l| Some((l, table.get(l)?.as_table()?))),
+    );
+    for (language, table) in tables {
+        for (key, why) in OUTDATED {
+            let own = matches!(
+                (language, key),
+                ("typescript", "int64") | ("python", "flat_unions")
+            ) || !language.is_empty() && why.contains("[push]");
+            if table.contains_key(key) && !own {
+                let at = match language {
+                    "" => String::new(),
+                    language => format!("[{language}] "),
+                };
+                anyhow::bail!("{at}`{key}` {why}");
+            }
+        }
+    }
+    Ok(())
 }
 
 /// The SDK's own package manifest owns its version, so release tooling keeps working.
@@ -736,7 +1061,7 @@ mod tests {
 
     #[test]
     fn timeout_and_package_metadata_reach_templates() {
-        let toml = "spec = \"s\"\nname = \"Acme\"\ntimeout = 15\nlicense = \"MIT\"\n\
+        let toml = "spec = \"s\"\nname = \"Acme\"\ntimeout = 15\n[package]\nlicense = \"MIT\"\n\
                     authors = [\"A <a@x.dev>\"]\n[go]\ntimeout = 30\n[rust]\n";
         let go = context(toml, "go");
         assert_eq!(
@@ -822,20 +1147,177 @@ mod tests {
     }
 
     #[test]
-    fn method_names_and_overrides_are_per_language() {
-        let toml = "spec = \"s\"\nname = \"Acme\"\nmethod_names = \"resource\"\n\
-                    [names]\na = \"x\"\n[go]\nmethod_names = \"operation_id\"\nnames = { a = \"y\" }\n[rust]\n";
+    fn name_overrides_are_per_language() {
+        let toml = "spec = \"s\"\nname = \"Acme\"\n\
+                    [names]\na = \"x\"\n[go]\nnames = { a = \"y\" }\n[rust]\n";
         let config: Config = toml::from_str(toml).unwrap();
         let sdks = config.sdks(&[]).unwrap();
-        let rust = config.filters_for(&sdks[0]);
-        let go = config.filters_for(&sdks[1]);
+        assert_eq!(config.filters_for(&sdks[0]).names["a"], "x");
+        assert_eq!(config.filters_for(&sdks[1]).names["a"], "y");
+    }
+
+    #[test]
+    fn removed_keys_say_what_to_do() {
+        let error = |toml: &str| {
+            removed_keys(&toml.parse().unwrap())
+                .unwrap_err()
+                .to_string()
+        };
+        assert!(error("method_names = \"resource\"").contains("`method_names` was removed"));
+        let java = error("[java]\nedition = 2");
+        assert!(
+            java.contains("[java] `edition`") && java.contains("delete it"),
+            "{java}"
+        );
+        assert!(removed_keys(&"[go]\nmodule = \"m\"".parse().unwrap()).is_ok());
         assert_eq!(
-            (rust.method_names, rust.names["a"].as_str()),
-            (MethodNames::Resource, "x")
+            error("push_spec = \"acme/sdks\""),
+            "`push_spec` moved to [push] as `to`"
         );
         assert_eq!(
-            (go.method_names, go.names["a"].as_str()),
-            (MethodNames::OperationId, "y")
+            error("sdks_repo = \"acme/sdks\""),
+            "`sdks_repo` moved to [push] as `to`"
         );
+        assert_eq!(
+            error("push_on = \"release\""),
+            "`push_on` moved to [push] as `on`"
+        );
+        assert_eq!(
+            error("push_tags = \"v*\""),
+            "`push_tags` moved to [push] as `tags`"
+        );
+        assert_eq!(
+            error("generate = \"make\""),
+            "`generate` moved to [push] as `generate`"
+        );
+        assert_eq!(
+            error("repository = \"https://github.com/acme/api\""),
+            "`repository` moved to the [package] table"
+        );
+        assert!(error("include = \"public-and-internal\"").contains("`internal = true`"));
+        assert!(error("[rust]\nversion = \"1.0.0\"").starts_with("[rust] `version` was removed"));
+        assert!(error("[go]\nflat_unions = true").contains("only supported in [python]"));
+        let own = "[python]\nflat_unions = true\n[typescript]\nint64 = \"bigint\"\n";
+        assert!(removed_keys(&own.parse().unwrap()).is_ok());
+    }
+
+    fn load(toml: &str) -> Result<Config> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join(FILE);
+        std::fs::write(&path, toml)?;
+        Ok(Config::load(&path)?.0)
+    }
+
+    #[test]
+    fn names_in_any_case_are_upper_camel_case() {
+        for (name, client) in [
+            ("acme-api", "AcmeApi"),
+            ("acme_api", "AcmeApi"),
+            ("Acme API", "AcmeApi"),
+            ("AcmeAPI", "AcmeAPI"),
+            ("Meteroid", "Meteroid"),
+        ] {
+            let config = load(&format!("spec = \"s\"\nname = \"{name}\"\n")).unwrap();
+            assert_eq!(config.name, client);
+        }
+        let toml = "spec = \"s\"\nname = \"acme api\"\n[typescript]\n[python]\n";
+        let typescript = context(toml, "typescript");
+        assert_eq!(typescript["npm_package"], "acme-api");
+        assert_eq!(context(toml, "python")["package_name"], "acme_api");
+        let error = load("spec = \"s\"\nname = \"3d API\"\n").err().unwrap();
+        assert!(
+            format!("{error:#}").contains("must start with a letter"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn spec_pushes_need_another_repository() {
+        let pushed = "spec = \"openapi.json\"\nname = \"A\"\n[push]\nto = \"a/sdks\"\n";
+        assert_eq!(load(pushed).unwrap().push.on, None);
+        let tags = format!("{pushed}on = \"tag\"\ntags = \"api-v*\"\n");
+        assert_eq!(load(&tags).unwrap().push.tags(), "api-v*");
+        let received = "spec = \"github:a/api/openapi.json\"\nname = \"A\"\n[push]\n";
+        let release = format!("{received}on = \"release\"\n");
+        assert_eq!(load(&release).unwrap().push.on, Some(PushOn::Release));
+        let error = |toml: &str| format!("{:#}", load(toml).err().unwrap());
+        assert!(
+            error("spec = \"openapi.json\"\nname = \"A\"\n[push]\non = \"release\"\n")
+                .contains("set its `to`")
+        );
+        assert!(error(&format!("{received}to = \"a/sdks\"\n")).contains("[push] `to` names"));
+        assert!(error(&format!("{pushed}tags = \"v*\"\n")).contains("needs `on = \"tag\"`"));
+        assert!(error(&format!("{pushed}on = \"merge\"\n")).contains("unknown variant"));
+    }
+
+    #[test]
+    fn both_sides_of_a_push_agree() {
+        let api =
+            Push::of("spec = \"a.json\"\n[push]\nto = \"a/sdks\"\non = \"release\"\n").unwrap();
+        let sdks = Push::of("spec = \"github:a/api/a.json\"\n").unwrap();
+        let both = api.agree("a/api", &sdks, "a/sdks").unwrap();
+        assert_eq!(both.on, Some(PushOn::Release));
+        let sdks = Push::of("[push]\ngenerate = \"make\"\n").unwrap();
+        let both = sdks.agree("a/sdks", &api, "a/api").unwrap();
+        assert_eq!(
+            (both.on, both.generate.as_deref()),
+            (Some(PushOn::Release), Some("make"))
+        );
+        let sdks = Push::of("[push]\non = \"change\"\n").unwrap();
+        let error = api.agree("a/api", &sdks, "a/sdks").unwrap_err().to_string();
+        assert_eq!(
+            error,
+            "[push] differs: `on` is \"release\" in a/api but \"change\" in a/sdks: set `on` in one of the two perseid.toml only, or to the same value in both"
+        );
+    }
+
+    #[test]
+    fn filters_keep_public_operations_unless_told_otherwise() {
+        let filters = |toml: &str| {
+            let config = load(&format!("spec = \"s\"\nname = \"A\"\n{toml}")).unwrap();
+            config.filters().include_mode
+        };
+        assert!(matches!(filters(""), IncludeMode::OnlyPublic));
+        assert!(matches!(
+            filters("internal = true"),
+            IncludeMode::PublicAndInternal
+        ));
+        assert!(matches!(
+            filters("only = [\"a\"]"),
+            IncludeMode::OnlySpecified
+        ));
+        let error = load("spec = \"s\"\nname = \"A\"\ninternal = true\nonly = [\"a\"]\n");
+        assert!(format!("{:#}", error.err().unwrap()).contains("`internal` can't add any"));
+    }
+
+    #[test]
+    fn language_keys_belong_to_their_table() {
+        let toml = "spec = \"s\"\nname = \"A\"\n[python]\nflat_unions = true\n\
+                    [typescript]\nint64 = \"bigint\"\n";
+        assert_eq!(context(toml, "python")["flat_unions"], true);
+        assert_eq!(context(toml, "typescript")["int64"], "bigint");
+        assert!(load("spec = \"s\"\nname = \"A\"\n[typescript]\nint64 = \"long\"\n").is_err());
+        assert!(load("spec = \"s\"\nname = \"A\"\n[java]\nmodule = \"m\"\n").is_err());
+    }
+
+    #[test]
+    fn the_committed_json_schema_is_current() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("perseid.schema.json");
+        let schema = json_schema();
+        if std::env::var_os("PERSEID_WRITE_SCHEMA").is_some() {
+            std::fs::write(&path, &schema).unwrap();
+        }
+        let committed = std::fs::read_to_string(&path).unwrap_or_default();
+        assert!(
+            committed == schema,
+            "perseid.schema.json is stale: run `cargo run -- schema > perseid.schema.json`"
+        );
+        let schema: Value = serde_json::from_str(&schema).unwrap();
+        assert_eq!(schema["$schema"], "http://json-schema.org/draft-07/schema#");
+        assert_eq!(schema["additionalProperties"], false);
+        let typescript = &schema["definitions"]["TypeScript"];
+        assert_eq!(typescript["additionalProperties"], false);
+        assert!(typescript["properties"]["int64"].is_object());
+        assert!(schema["definitions"]["Rust"]["properties"]["int64"].is_null());
     }
 }
