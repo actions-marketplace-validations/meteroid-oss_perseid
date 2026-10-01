@@ -77,7 +77,7 @@ See [repository layouts](ci.md#repository-layouts) for the trade-offs.
 | Key | |
 |---|---|
 | `repo` | Default repository of every SDK: `"acme/api-{lang}"` gives each its own (`{lang}` is the language, as `sdks` names it), `"acme/api-sdks"` holds them all, each in a folder named after its language. Without it, SDKs live next to `perseid.toml` |
-| `release` | `false` leaves out the release-please files and the `sdk-release.yml` workflow `perseid init` and `perseid setup-github` add to each repository holding SDKs |
+| `release` | `false` leaves out the release-please files and the `sdk-release.yml` workflow `perseid init` writes, and SDK pull requests carry, to each repository holding SDKs |
 
 ## SDK defaults
 
@@ -172,7 +172,12 @@ would share falls back to the operation id. `[methods]` and `x-perseid-name` ren
 
 ## Unions of objects
 
-A `oneOf`/`anyOf` of several objects without a `discriminator` (Stripe's
+A `oneOf` whose object variants all require one property allowing a single string, distinct
+across them (`kind: {enum: [pat]}`, as serde's tagged enums are written), is a tagged union on
+that property as if it declared it as `discriminator`. An `allOf` of such a union and objects
+gives every variant the objects' fields, and a `oneOf` of one untagged object is that object.
+
+Otherwise a `oneOf`/`anyOf` of several objects without a `discriminator` (Stripe's
 `Charge.customer: string | Customer | DeletedCustomer`) is typed when the
 object variants can be told apart from their schemas: perseid looks for the fewest `const` or
 single-value `enum` properties (`deleted: true`) and required properties only one variant
@@ -230,3 +235,4 @@ The model also carries, for templates to use:
   the SDK already uses (`Upload`, `Options`...) get a `Model` suffix.
 - A variant missing from the discriminator `mapping` is tagged with the `const` or `enum` of its
   discriminator property, falling back to its schema name.
+- Tags become ASCII identifiers: `Petite Requête` is the `petite_requete` resource.

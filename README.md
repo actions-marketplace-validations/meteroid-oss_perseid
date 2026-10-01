@@ -15,7 +15,7 @@ One static binary, running in your CI: an open-source and headless alternative t
 npx perseid init          # perseid.toml and the workflows, written here for you to commit
 npx perseid generate --out preview  # optional local preview, in preview/<lang>
 git add -A && git commit -m "ci: generate the SDKs with perseid" && git push
-npx perseid setup-github  # what files can't hold: SDK repositories, the App, once you agree
+gh secret set PERSEID_TOKEN  # a fine-grained token opening the SDK pull requests (or `npx perseid app`)
 
 # spec in another repository (even private)? run there:
 npx perseid connect acme/acme-sdks   # pushes the spec on each release or change
@@ -25,7 +25,7 @@ npx perseid connect acme/acme-sdks   # pushes the spec on each release or change
 |---|---|---|
 | `init` | the SDKs repository | writes `perseid.toml` (the spec found there, the SDKs you pick, where they live) and the workflows regenerating and releasing them, for you to commit; run it again to refresh them. Nothing leaves your clone |
 | `generate` | the SDKs repository | writes the SDKs from `spec` (or `--spec <path\|url>`), starting each from its package skeleton: here, in a checkout of its `repo` under `.perseid/repos`, or all under `--out <dir>` |
-| `setup-github` | the SDKs repository | lists what GitHub needs and files can't hold (SDK repositories and their release files, the GitHub App opening SDK pull requests), then sets it up once you agree; declining prints how to do it yourself |
+| `app` | the SDKs repository | optional: creates or reuses a GitHub App opening the SDK pull requests, instead of the expiring `PERSEID_TOKEN` secret, once you agree; declining prints how to do it yourself |
 | `connect <owner/sdks-repo>` | the repository holding the spec | a deploy key on GitHub, and `perseid-push.yml` for you to commit, pushing the spec to the SDKs repository |
 
 With the spec and the SDKs in one repository, `connect` isn't needed. Once the workflows are on the
@@ -73,8 +73,9 @@ It powers the [Meteroid SDKs](https://github.com/meteroid-oss/meteroid-clients),
 Action, pinned to the release line of the perseid that wrote it (`@v0.6` for 0.6.x), on every spec
 change (pushed by `perseid connect` on each release of your API, or each change), and
 `sdk-release.yml`, at the root of each repository holding SDKs, releases them from its default
-branch. Run `init` again to refresh them, and `perseid status` tells how the automation fares, from
-either repository. The Action is a thin wrapper: `perseid tools install` fetches the pinned
+branch through the `meteroid-oss/perseid/release` and `publish` Actions. Run `init` again to
+refresh them, and `perseid status` tells how the automation fares, from either repository. The
+Action is a thin wrapper: `perseid tools install` fetches the pinned
 formatters and oasdiff, then `perseid generate --pr` sizes the release from the spec diff, opens the
 pull requests and, with `--auto-merge`, queues them for merging, so any CI runs the same. To set it
 up by hand, or on self-hosted runners and other CIs with the `ghcr.io/meteroid-oss/perseid` image,
