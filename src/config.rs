@@ -4,7 +4,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, ensure};
-use heck::{ToKebabCase, ToSnakeCase, ToUpperCamelCase};
+use heck::{ToKebabCase, ToShoutySnakeCase, ToSnakeCase, ToUpperCamelCase};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -194,7 +194,6 @@ pub struct Target {
     pub module: Option<String>,
     pub exports: Vec<String>,
     pub int64: Option<Int64>,
-    pub flat_unions: bool,
 }
 
 /// A language table: the settings every SDK takes, then the language's own.
@@ -264,10 +263,7 @@ language!(TypeScript, "npm package name: the kebab-case `name` by default." {
     /// Type of int64 values.
     int64: Option<Int64>,
 });
-language!(Python, "Python package name: the snake_case `name` by default." {
-    /// Types a union as `Circle | Square` instead of a wrapper model.
-    flat_unions: bool,
-});
+language!(Python, "Python package name: the snake_case `name` by default." {});
 language!(Go, "Go package name: the snake_case `name` by default." {
     /// Module path: that of the repository and folder the SDK lives in by default.
     module: Option<String>,
@@ -655,6 +651,7 @@ impl Config {
             "java" => format!("com.{}", snake.replace('_', "")),
             "typescript" => kebab.clone(),
             "csharp" => self.name.clone(),
+            "go" => snake.replace('_', ""),
             _ => snake.clone(),
         });
         let version = manifest_version(dir).unwrap_or_else(|| "0.1.0".into());
@@ -670,9 +667,11 @@ impl Config {
             "java_package": if language == "java" { package.clone() } else { format!("com.{snake}") },
             "npm_package": if language == "typescript" { &package } else { &kebab },
             "go_module": self.go_module(sdk).unwrap_or_else(|| kebab.clone()),
-            "default_base_url": pick(&target.base_url, &self.base_url, "http://localhost"),
+            "default_base_url": pick(&target.base_url, &self.base_url, ""),
+            "has_default_base_url": target.base_url.is_some() || self.base_url.is_some(),
             "user_agent_prefix": pick(&target.user_agent, &self.user_agent, &kebab),
             "header_prefix": pick(&target.header_prefix, &self.header_prefix, &kebab),
+            "env_prefix": self.name.to_shouty_snake_case(),
             "webhooks": target.webhooks.or(self.webhooks).unwrap_or(false),
             "int64": match target.int64.unwrap_or_default() {
                 Int64::Number => "number",
@@ -693,9 +692,6 @@ impl Config {
             "authors": self.package.authors,
         });
         let map = context.as_object_mut().unwrap();
-        if language == "python" {
-            map.insert("flat_unions".into(), target.flat_unions.into());
-        }
         if language == "java" {
             map.insert(
                 "java_internal_package".into(),
@@ -754,7 +750,10 @@ const OUTDATED: [(&str, &str); 22] = [
     ("repository", "moved to the [metadata] table"),
     ("authors", "moved to the [metadata] table"),
     ("int64", "is only supported in [typescript]"),
-    ("flat_unions", "is only supported in [python]"),
+    (
+        "flat_unions",
+        "was removed: Python unions are the union of their variant models whenever they can be",
+    ),
 ];
 
 fn removed_keys(table: &toml::Table) -> Result<()> {
@@ -765,10 +764,8 @@ fn removed_keys(table: &toml::Table) -> Result<()> {
     );
     for (language, table) in tables {
         for (key, why) in OUTDATED {
-            let own = matches!(
-                (language, key),
-                ("typescript", "int64") | ("python", "flat_unions")
-            ) || !language.is_empty() && (why == CONNECT || key == "package");
+            let own = matches!((language, key), ("typescript", "int64"))
+                || !language.is_empty() && (why == CONNECT || key == "package");
             if table.contains_key(key) && !own {
                 let at = match language {
                     "" => String::new(),
@@ -850,6 +847,30 @@ fn csproj_version(dir: &Path) -> Option<String> {
 fn reserved_type_names(language: &str, client: &str) -> BTreeSet<String> {
     let names: &[&str] = match language {
         "rust" => &["Box", "Option", "Result", "String", "Vec"],
+        "python" => &[
+            "ApiBaseAsync",
+            "ApiBaseSync",
+            "ApiRequest",
+            "AsyncEventStream",
+            "AsyncPage",
+            "AsyncPaginator",
+            "AsyncStream",
+            "BaseModel",
+            "Decimal",
+            "Discriminator",
+            "EventStream",
+            "FileInput",
+            "ObjectUnion",
+            "Paging",
+            "Stream",
+            "SyncPage",
+            "TaggedUnionModel",
+            "Timeout",
+            "UnknownVariant",
+            "Unset",
+            "Upload",
+            "UploadContent",
+        ],
         "typescript" => &[
             "Array",
             "Blob",
@@ -872,24 +893,34 @@ fn reserved_type_names(language: &str, client: &str) -> BTreeSet<String> {
         ],
         // Go declares everything in one directory, where file names count too.
         "go" => &[
+            "ApiError",
+            "AutoPager",
             "BasicAuth",
             "Client",
             "Collections",
+            "DecodeError",
             "Errors",
             "EventStream",
+            "ExtraFields",
             "Middleware",
             "Nullable",
             "Options",
-            "Pager",
+            "Page",
             "Request",
             "RequestAuth",
+            "RequestError",
             "RequestOption",
             "RequestPager",
             "RequestStreaming",
             "RequiredMap",
             "RequiredSlice",
             "RoundTripperFunc",
+            "SdkError",
             "SseEvent",
+            "Stream",
+            "TimeoutError",
+            "TransportError",
+            "UnionError",
             "Upload",
             "Version",
             "Webhooks",
@@ -899,6 +930,9 @@ fn reserved_type_names(language: &str, client: &str) -> BTreeSet<String> {
             "ArrayList",
             "BigDecimal",
             "Boolean",
+            "Builder",
+            "Collections",
+            "CompletableFuture",
             "Double",
             "EventStream",
             "Float",
@@ -907,6 +941,10 @@ fn reserved_type_names(language: &str, client: &str) -> BTreeSet<String> {
             "HttpUrl",
             "IOException",
             "Integer",
+            "JsonAnyGetter",
+            "JsonAnySetter",
+            "JsonNode",
+            "LinkedHashMap",
             "LinkedHashSet",
             "List",
             "Long",
@@ -1229,8 +1267,8 @@ mod tests {
         );
         assert!(error("include = \"public-and-internal\"").contains("`internal = true`"));
         assert!(error("[rust]\nversion = \"1.0.0\"").starts_with("[rust] `version` was removed"));
-        assert!(error("[go]\nflat_unions = true").contains("only supported in [python]"));
-        let own = "[python]\nflat_unions = true\n[typescript]\nint64 = \"bigint\"\n";
+        assert!(error("[python]\nflat_unions = true").contains("`flat_unions` was removed"));
+        let own = "[typescript]\nint64 = \"bigint\"\n";
         assert!(removed_keys(&own.parse().unwrap()).is_ok());
     }
 
@@ -1284,10 +1322,27 @@ mod tests {
     }
 
     #[test]
+    fn env_prefix_is_the_shouty_name_unless_the_context_sets_it() {
+        let toml = "name = \"Real World\"\nsdks = [\"go\"]\n";
+        assert_eq!(context(toml, "go")["env_prefix"], "REAL_WORLD");
+        let toml = format!("{toml}[context]\nenv_prefix = \"RW\"\n");
+        assert_eq!(context(&toml, "go")["env_prefix"], "RW");
+    }
+
+    #[test]
+    fn base_url_is_empty_unless_configured() {
+        let toml = "name = \"A\"\nsdks = [\"go\"]\n";
+        assert_eq!(context(toml, "go")["has_default_base_url"], false);
+        assert_eq!(context(toml, "go")["default_base_url"], "");
+        let toml = format!("base_url = \"https://a.test\"\n{toml}");
+        assert_eq!(context(&toml, "go")["has_default_base_url"], true);
+        assert_eq!(context(&toml, "go")["default_base_url"], "https://a.test");
+    }
+
+    #[test]
     fn language_keys_belong_to_their_table() {
-        let toml = "name = \"A\"\nsdks = [\"typescript\", \"python\"]\n[python]\nflat_unions = true\n\
-                    [typescript]\nint64 = \"bigint\"\n";
-        assert_eq!(context(toml, "python")["flat_unions"], true);
+        let toml =
+            "name = \"A\"\nsdks = [\"typescript\", \"python\"]\n[typescript]\nint64 = \"bigint\"\n";
         assert_eq!(context(toml, "typescript")["int64"], "bigint");
         assert!(
             load("name = \"A\"\nsdks = [\"typescript\"]\n[typescript]\nint64 = \"long\"\n")
