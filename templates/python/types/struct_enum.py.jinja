@@ -1,4 +1,4 @@
-{% from "types/macros.py.jinja" import py_str, docstring, field_decl, field_ident, has_object_union, is_flat_union, model_imports, module_name, py_ident -%}
+{% from "types/macros.py.jinja" import py_str, docstring, field_decl, field_ident, has_object_union, is_flat_union, model_imports, module_name, py_field -%}
 {#- Discriminated unions: the plain union `Circle | Square` of their variant models, or when
     variants share fields or have no model of their own, a model holding the discriminator and
     the variant (`Shape(type="circle", content=Circle(...))`). -#}
@@ -33,13 +33,13 @@ from .{{ module_name(c) }} import {{ c | to_upper_camel_case }}
 {{ docstring((type.description ~ "\n\n" if type.description is defined else "") ~ "Told apart by `" ~ type.discriminator_field ~ "`; a variant this SDK version does not know is an `UnknownVariant`.") }}
 {%- else -%}
 
-{% set discriminator_attr = py_ident(type.discriminator_field) -%}
+{% set discriminator_attr = py_field(type.discriminator_field) -%}
 {% if type.repr == "adjacently_tagged" -%}
-    {% set content_attr = py_ident(type.content_field) -%}
+    {% set content_attr = py_field(type.content_field) -%}
 {% else -%}
     {% set content_attr = "content" -%}
 {% endif -%}
-{% set shared = type.fields | map(attribute="name") | map("ident", "snake", "python") | list -%}
+{% set shared = type.fields | map(attribute="name") | map("ident", "snake", "python_field") | list -%}
 {% if content_attr == discriminator_attr or content_attr in shared or discriminator_attr in shared -%}
     {{ panic("struct enum `" ~ type.name ~ "`: the discriminator, content and shared fields collide") }}
 {%- endif -%}

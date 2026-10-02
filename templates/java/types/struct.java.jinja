@@ -1,7 +1,6 @@
 {% import "types/macros.java.jinja" as m -%}
 // This file is @generated
 {% set class_ty = type.name | to_upper_camel_case -%}
-{{- m.check_name(class_ty) -}}
 {% set owner = "schema `" ~ type.name ~ "`" -%}
 {% set vars = m.member_names(type.fields, owner) | split(" ") | reject("equalto", "") | list -%}
 {% set pascals = m.field_idents(type.fields, "pascal", owner) | split(" ") | reject("equalto", "") | list -%}
@@ -10,6 +9,12 @@
 {% set ns.unions = ns.unions + [m.union_name(field, class_ty, pascals[loop.index0])] -%}
 {% endfor -%}
 {% set unions = ns.unions -%}
+{#- Every model keeps the properties it does not declare; a schema whose `additionalProperties`
+    types them also gets typed accessors for them, of `extra_value`. -#}
+{% set has_extra = type.additional_properties is defined -%}
+{% set extra_field = {"name": "additional_properties", "type": type.additional_properties, "flatten": false} if has_extra else none -%}
+{% set extra_union = m.union_name(extra_field, class_ty, "AdditionalProperties") if has_extra else "" -%}
+{% set extra_value = m.java_type(type.additional_properties.value_type(), extra_union) if has_extra else "" -%}
 {% set defaults = type.discriminator_defaults | default({}) -%}
 package {{ sdk.java_package }}.models;
 
@@ -31,6 +36,7 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.annotation.JsonDeserialize;
 import java.io.IOException;
 import java.math.BigDecimal;
+import java.math.BigInteger;
 import java.net.URI;
 import java.time.OffsetDateTime;
 import java.util.ArrayList;
@@ -62,11 +68,14 @@ Immutable: build one with {@link #builder()}, change a copy with {@link #toBuild
         isGetterVisibility = Visibility.NONE,
         setterVisibility = Visibility.NONE)
 public final class {{ class_ty }} {
-    {{ m.model_members(class_ty, type.fields, vars, pascals, unions, defaults) }}
+    {{ m.model_members(class_ty, type.fields, vars, pascals, unions, defaults, extra_value) }}
 
     {{ m.json_methods(class_ty) }}
 {% for field in type.fields %}{% if unions[loop.index0] %}
 
     {{ m.union_class(field.type, unions[loop.index0]) }}
-{%- endif %}{% endfor %}
+{%- endif %}{% endfor %}{% if extra_union %}
+
+    {{ m.union_class(type.additional_properties, extra_union) }}
+{%- endif %}
 }

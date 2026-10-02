@@ -9,7 +9,9 @@
 
 {# `unknown` for any-JSON values, so callers narrow them before use. -#}
 {% macro js_type(type) -%}
-    {%- if type.is_union() -%}
+    {%- if type.is_nullable() -%}
+        {{ js_type(type.inner_type()) }} | null
+    {%- elif type.is_union() -%}
         {%- for v in type.union_variants() -%}
             {% if not loop.first %} | {% endif %}{% if v.empty %}""{% elif untyped_int64(v) %}number{% else %}{{ js_type(v.type) }}{% endif %}
         {%- endfor -%}
@@ -18,7 +20,7 @@
     {%- elif is_int64(type) -%}
         {{ sdk.int64 }}
     {%- elif type.is_list() or type.is_set() -%}
-        {% if type.inner_type().is_union() %}({{ js_type(type.inner_type()) }})[]{% else %}{{ js_type(type.inner_type()) }}[]{% endif %}
+        {% if type.inner_type().is_union() or type.inner_type().is_nullable() %}({{ js_type(type.inner_type()) }})[]{% else %}{{ js_type(type.inner_type()) }}[]{% endif %}
     {%- elif type.is_map() -%}
         { [key: string]: {{ js_type(type.value_type()) }} }
     {%- else -%}
@@ -60,6 +62,9 @@
         Array.isArray({{ expr }})
     {%- elif json_type == "object" -%}
         isJsonObject({{ expr }})
+    {%- elif json_type == "integer" and sdk.int64 | default("number") == "bigint" -%}
+        {#- `parseJson` reads the integers beyond `Number.MAX_SAFE_INTEGER` as `bigint`. -#}
+        (typeof {{ expr }} === "number" || typeof {{ expr }} === "bigint")
     {%- else -%}
         typeof {{ expr }} === "{{ "number" if json_type == "integer" else json_type }}"
     {%- endif -%}
@@ -67,7 +72,9 @@
 
 {# `yes` when values of `type` need converting from JSON, or to JSON with `outgoing`. -#}
 {% macro converted(type, outgoing=false) -%}
-    {%- if type.is_union() -%}
+    {%- if type.is_nullable() -%}
+        {{ converted(type.inner_type(), outgoing) }}
+    {%- elif type.is_union() -%}
         {%- for v in type.union_variants() if variant_converted(v, outgoing) %}{% if loop.first %}yes{% endif %}{% endfor -%}
     {%- elif type.is_schema_ref() -%}
         yes
@@ -97,14 +104,43 @@
     {%- endif -%}
 {%- endmacro %}
 
+{#- The wire shape of the items of a list variant, as the `UnionShape` literal. -#}
+{% macro shape(items) -%}
+    { type: "{{ items.json_type }}"{% if items["items"] is defined and items["items"] %}, items: {{ shape(items["items"]) }}{% endif %} }
+{%- endmacro %}
+
+{#- The union conversion of `expr` when variants share a JSON type: `unionTry` tries the
+    variants in order, each as its shape, rules or property sets, and conversion. -#}
+{% macro union_try(expr, type, outgoing) -%}
+    {%- macro name(p) -%}{{ p | ident("camel") if outgoing else p }}{%- endmacro -%}
+    {%- set mode = type.union_mode() -%}
+    unionTry({{ expr }}, [
+        {%- for v in type.try_variants() -%}
+        { type: "{{ v.json_type }}"
+            {%- if v["items"] is defined and v["items"] %}, items: {{ shape(v["items"]) }}{% endif -%}
+            {%- if v.empty %}, empty: true{% endif -%}
+            {%- if mode == "rules" and v.json_type == "object" and v.when %}, when: [{% for c in v.when %}[{{ name(c.property) | tojson }}{% if c.value is defined %}, {{ c.value | tojson }}{% endif %}]{% if not loop.last %}, {% endif %}{% endfor %}]{% endif -%}
+            {%- if mode == "best-match" and v.json_type == "object" %}, required: [{% for p in v.required %}{{ name(p) | tojson }}{% if not loop.last %}, {% endif %}{% endfor %}], known: [{% for p in v.properties %}{{ name(p) | tojson }}{% if not loop.last %}, {% endif %}{% endfor %}]{% endif -%}
+            , parse: (part: any) => {% if variant_converted(v, outgoing) %}{{ to_json("part", v.type) if outgoing else from_json("part", v.type) }}{% else %}part{% endif %} }
+            {%- if not loop.last %}, {% endif -%}
+        {%- endfor -%}
+    ], {{ (mode | tojson) if mode in ["rules", "best-match"] else "undefined" }}, {{ "true" if outgoing else "false" }})
+{%- endmacro %}
+
 {#- The union conversion of `expr`, by JSON type, then among objects by `pick_object`. -#}
 {% macro union_json(expr, type, outgoing) -%}
+    {%- if type.union_decode() == "try" -%}
+    {{ union_try(expr, type, outgoing) }}
+    {%- else -%}
     {%- set objects = type.union_mode() != "json" -%}
     ({% if objects %}isJsonObject({{ expr }}) ? {{ pick_object(expr, type, outgoing) }} : {% endif %}{% for v in type.union_variants() if variant_converted(v, outgoing) and not (objects and v.json_type == "object") %}{{ is_variant(expr, v.json_type) }} ? {{ to_json(expr, v.type) if outgoing else from_json(expr, v.type) }} : {% endfor %}{{ expr }})
+    {%- endif -%}
 {%- endmacro %}
 
 {% macro from_json(expr, type) -%}
-    {%- if type.is_union() and converted(type) -%}
+    {%- if type.is_nullable() -%}
+        {%- if converted(type) %}({{ expr }} == null ? null : {{ from_json(expr, type.inner_type()) }}){% else %}{{ expr }}{% endif -%}
+    {%- elif type.is_union() and converted(type) -%}
         {{ union_json(expr, type, false) }}
     {%- elif type.is_datetime() -%}
         parseDateTime({{ expr }})
@@ -123,7 +159,9 @@
 
 {# Dates are left to `JSON.stringify`, which calls `toISOString`. -#}
 {% macro to_json(expr, type) -%}
-    {%- if type.is_union() and converted(type, true) -%}
+    {%- if type.is_nullable() -%}
+        {%- if converted(type, true) %}({{ expr }} == null ? null : {{ to_json(expr, type.inner_type()) }}){% else %}{{ expr }}{% endif -%}
+    {%- elif type.is_union() and converted(type, true) -%}
         {{ union_json(expr, type, true) }}
     {%- elif type.is_schema_ref() -%}
         {{ type.to_js() }}Serializer.serialize({{ expr }})
@@ -134,7 +172,7 @@
     {%- elif type.is_map() -%}
         Object.fromEntries(Object.entries({{ expr }}).map(([key, entry]) => [key, {{ to_json("entry", type.value_type()) }}]))
     {%- else -%}
-        {{ expr }}.map((item) => {{ to_json("item", type.inner_type()) }})
+        {{ expr }}.map((item: any) => {{ to_json("item", type.inner_type()) }})
     {%- endif -%}
 {%- endmacro %}
 
@@ -149,7 +187,12 @@
 {%- endmacro %}
 
 {% macro field_from_json(json, field) -%}
+    {#- `json["__proto__"]` reads the prototype when the JSON has no such own property. -#}
+    {%- if field.name == "__proto__" -%}
+    {%- set expr %}(Object.prototype.hasOwnProperty.call({{ json }}, "__proto__") ? {{ json }}["__proto__"] : undefined){% endset -%}
+    {%- else -%}
     {%- set expr %}{{ json }}[{{ field.name | tojson }}]{% endset -%}
+    {%- endif -%}
     {{ guarded(expr, field, from_json(expr, field.type), false) }}
 {%- endmacro %}
 
@@ -166,9 +209,10 @@
     {%- endfor %}
 {%- endmacro %}
 
+{#- A `__proto__` key is computed: written plainly, it would set the object's prototype. -#}
 {% macro serialize_fields(fields, value, defaults={}) -%}
     {%- for field in fields if not field.flatten %}
-    {{ field.name | tojson }}: {{ field_to_json(value, field) }}{% if field.name in defaults %} ?? {{ defaults[field.name] | tojson }}{% endif %},
+    {% if field.name == "__proto__" %}["__proto__"]{% else %}{{ field.name | tojson }}{% endif %}: {{ field_to_json(value, field) }}{% if field.name in defaults %} ?? {{ defaults[field.name] | tojson }}{% endif %},
     {%- endfor %}
 {%- endmacro %}
 

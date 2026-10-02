@@ -49,6 +49,11 @@ pub fn populate_env(
          language: Option<Cow<'_, str>>,
          owner: Cow<'_, str>| { ident::idents(&names, &case, language.as_deref(), &owner) },
     );
+    env.add_filter("enum_names", |values: Vec<String>| {
+        ident::enum_names(&values)
+    });
+    env.add_filter("go_tag", |s: Cow<'_, str>| ident::go_tag(&s));
+    env.add_test("go_taggable", |s: Cow<'_, str>| ident::go_tag(&s).is_ok());
     env.add_filter("go_name", |s: Cow<'_, str>| go::initialisms(&s));
     // The file a Go model or resource is generated into, without its `.go`.
     env.add_filter("go_file", |s: Cow<'_, str>| {
@@ -170,6 +175,11 @@ pub fn populate_env(
     );
 
     // --- Miscellaneous ---
+    // Whether `text` uses `name` as a whole identifier, so templates import only what they use.
+    env.add_filter(
+        "mentions_ident",
+        |text: Cow<'_, str>, name: Cow<'_, str>| mentions_ident(&text, &name),
+    );
     env.add_filter("strip_trailing_comma", |s: Cow<'_, str>| {
         match s.trim_end().strip_suffix(",") {
             Some(stripped) => stripped.to_string(),
@@ -365,6 +375,18 @@ pub fn populate_env(
     Ok(env)
 }
 
+fn mentions_ident(text: &str, name: &str) -> bool {
+    let is_ident = |c: char| c.is_alphanumeric() || c == '_' || c == '$';
+    !name.is_empty()
+        && text.match_indices(name).any(|(start, _)| {
+            !text[..start].chars().next_back().is_some_and(is_ident)
+                && !text[start + name.len()..]
+                    .chars()
+                    .next()
+                    .is_some_and(is_ident)
+        })
+}
+
 fn contains_required_param(value: Value) -> Result<bool, minijinja::Error> {
     for p in value.try_iter()? {
         if p.get_attr("required")?.is_true() {
@@ -373,4 +395,21 @@ fn contains_required_param(value: Value) -> Result<bool, minijinja::Error> {
     }
 
     Ok(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::mentions_ident;
+
+    #[test]
+    fn mentions_ident_matches_whole_identifiers_only() {
+        let text = "x: ErrorResponse2 | Foo[]; FooSerializer.parse(y)";
+        assert!(mentions_ident(text, "ErrorResponse2"));
+        assert!(!mentions_ident(text, "ErrorResponse"));
+        assert!(mentions_ident(text, "Foo"));
+        assert!(mentions_ident(text, "FooSerializer"));
+        assert!(!mentions_ident(text, "Serializer"));
+        assert!(!mentions_ident("$Foo", "Foo"));
+        assert!(!mentions_ident(text, ""));
+    }
 }

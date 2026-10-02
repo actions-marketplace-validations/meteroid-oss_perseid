@@ -70,6 +70,10 @@ internal sealed class ApiTransport : IDisposable
         _pipeline = new HttpMessageInvoker(handler);
         _auth = auth;
         _credentials = credentials;
+        if (credentials.OAuth is { } oauth)
+        {
+            oauth.Fetch = FetchGrantAsync;
+        }
         _timeout = options.Timeout;
         _retrySchedule = options.RetrySchedule;
         _maxRetries = Math.Max(0, options.MaxRetries);
@@ -77,6 +81,68 @@ internal sealed class ApiTransport : IDisposable
     }
 
     internal static string? NonEmpty(string? value) => string.IsNullOrEmpty(value) ? null : value;
+
+    /// <summary>Requests an access token with the client credentials grant, through the middleware,
+    /// timeouts and retries like any other request.</summary>
+    private async Task<OAuthGrant> FetchGrantAsync(
+        string tokenUrl,
+        string scope,
+        OAuthClient client,
+        CancellationToken cancellationToken
+    )
+    {
+        var request = new ApiRequest(HttpMethod.Post, tokenUrl, "oauth.token") { Security = [] };
+        var form = new List<KeyValuePair<string, string>> { new("grant_type", "client_credentials") };
+        if (scope.Length > 0)
+        {
+            form.Add(new("scope", scope));
+        }
+        if (client.InBody)
+        {
+            form.Add(new("client_id", client.ClientId));
+            form.Add(new("client_secret", client.ClientSecret));
+        }
+        else
+        {
+            request.Headers["Authorization"] = client.BasicAuthorization();
+        }
+        request.SetFormFields(form);
+        var result = await SendWithRetriesAsync(request, null, false, cancellationToken).ConfigureAwait(false);
+        try
+        {
+            using var document = JsonDocument.Parse(result.Body);
+            var root = document.RootElement;
+            if (
+                root.ValueKind != JsonValueKind.Object
+                || !root.TryGetProperty("access_token", out var token)
+                || token.ValueKind != JsonValueKind.String
+                || string.IsNullOrEmpty(token.GetString())
+            )
+            {
+                throw new ApiDecodeException("the token endpoint answered without an access_token", null);
+            }
+            double? expiresIn = null;
+            if (root.TryGetProperty("expires_in", out var life))
+            {
+                if (life.ValueKind == JsonValueKind.Number)
+                {
+                    expiresIn = life.GetDouble();
+                }
+                else if (
+                    life.ValueKind == JsonValueKind.String
+                    && double.TryParse(life.GetString(), NumberStyles.Float, CultureInfo.InvariantCulture, out var parsed)
+                )
+                {
+                    expiresIn = parsed;
+                }
+            }
+            return new OAuthGrant(token.GetString()!, expiresIn);
+        }
+        catch (JsonException e)
+        {
+            throw new ApiDecodeException($"the token endpoint response is not JSON: {e.Message}", e);
+        }
+    }
 
     public async Task<ApiResponse> SendAsync(
         ApiRequest request,
@@ -119,7 +185,7 @@ internal sealed class ApiTransport : IDisposable
     }
 
     /// <summary>Like <see cref="SendJsonAsync"/>, with the default <typeparamref name="TResult"/>
-    /// (<c>null</c>) for an empty body.</summary>
+    /// (<c>null</c>) for an empty body or a JSON <c>null</c>.</summary>
     public async Task<ApiResponse<TResult>> SendJsonOrDefaultAsync<T, TResult>(
         ApiRequest request,
         JsonTypeInfo<T> typeInfo,
@@ -131,8 +197,14 @@ internal sealed class ApiTransport : IDisposable
             .ConfigureAwait(false);
         return new(
             result.Response,
-            result.Body.Length == 0 ? default! : (TResult)(object)Decode(result.Body, typeInfo)!
+            IsNullBody(result.Body) ? default! : (TResult)(object)Decode(result.Body, typeInfo)!
         );
+    }
+
+    private static bool IsNullBody(byte[] body)
+    {
+        var text = System.Text.Encoding.UTF8.GetString(body).Trim();
+        return text.Length == 0 || text == "null";
     }
 
     public async Task<ApiResponse<byte[]>> SendBytesAsync(
@@ -206,9 +278,10 @@ internal sealed class ApiTransport : IDisposable
             ["Accept"] = "application/json, */*;q=0.8",
         };
         var authQuery = new List<KeyValuePair<string, string>>();
-        await _auth
+        var oauthUse = await _auth
             .ApplyAsync(request.Security, _credentials, headers, authQuery, cancellationToken)
             .ConfigureAwait(false);
+        headers.Remove("Cookie", out var authCookie);
         headers["User-Agent"] = _userAgent;
         headers["@@HEADER_PREFIX@@-req-id"] = ((ulong)Random.Shared.NextInt64()).ToString(
             CultureInfo.InvariantCulture
@@ -224,6 +297,20 @@ internal sealed class ApiTransport : IDisposable
         foreach (var (name, value) in options?.Headers ?? new Dictionary<string, string>())
         {
             headers[name] = value;
+        }
+        // Cookie parameters, the API key cookie and a Cookie header of the call share one header.
+        var cookies = new List<string>(request.Cookies);
+        if (authCookie is not null)
+        {
+            cookies.Add(authCookie);
+        }
+        if (headers.Remove("Cookie", out var callCookie))
+        {
+            cookies.Add(callCookie);
+        }
+        if (cookies.Count > 0)
+        {
+            headers["Cookie"] = string.Join("; ", cookies);
         }
         if (request.Method == HttpMethod.Post && !headers.ContainsKey("Idempotency-Key"))
         {
@@ -241,6 +328,8 @@ internal sealed class ApiTransport : IDisposable
         using var activity = s_activities.StartActivity(request.Operation, ActivityKind.Client);
         activity?.SetTag("http.request.method", request.Method.Method);
         activity?.SetTag("url.full", uri.GetLeftPart(UriPartial.Path));
+        // An access token the API rejects is replaced once, without using up a retry.
+        var renewed = false;
         for (var attempt = 0; ; attempt++)
         {
             if (attempt > 0)
@@ -263,6 +352,7 @@ internal sealed class ApiTransport : IDisposable
             }
 
             var last = attempt >= retries;
+            var renew = false;
             TimeSpan? wait = null;
             using (var attemptToken = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken))
             {
@@ -293,7 +383,18 @@ internal sealed class ApiTransport : IDisposable
                     {
                         return new(meta, body, null);
                     }
-                    if (last || !ShouldRetry((int)response.StatusCode))
+                    if (
+                        !renewed
+                        && oauthUse is not null
+                        && response.StatusCode == HttpStatusCode.Unauthorized
+                        && !request.IsOneShot
+                        && headers.TryGetValue("Authorization", out var sent)
+                        && sent == $"Bearer {oauthUse.Token}"
+                    )
+                    {
+                        renew = true;
+                    }
+                    else if (last || !ShouldRetry((int)response.StatusCode))
                     {
                         activity?.SetStatus(ActivityStatusCode.Error);
                         throw ApiExceptionExtensions.ForResponse(
@@ -303,7 +404,10 @@ internal sealed class ApiTransport : IDisposable
                             request.ErrorTypes
                         );
                     }
-                    wait = RetryDelay(attempt, response);
+                    else
+                    {
+                        wait = RetryDelay(attempt, response);
+                    }
                 }
                 catch (Exception e) when (e is HttpRequestException or IOException)
                 {
@@ -328,6 +432,14 @@ internal sealed class ApiTransport : IDisposable
                     }
                 }
             }
+            if (renew)
+            {
+                renewed = true;
+                oauthUse = await _auth.RenewAsync(oauthUse!, _credentials, cancellationToken).ConfigureAwait(false);
+                headers["Authorization"] = $"Bearer {oauthUse.Token}";
+                attempt--;
+                continue;
+            }
             await Task.Delay(wait ?? Backoff(attempt), cancellationToken).ConfigureAwait(false);
         }
     }
@@ -337,7 +449,8 @@ internal sealed class ApiTransport : IDisposable
         || method == HttpMethod.Head
         || method == HttpMethod.Put
         || method == HttpMethod.Delete
-        || method == HttpMethod.Options;
+        || method == HttpMethod.Options
+        || method == HttpMethod.Trace;
 
     private static bool ShouldRetry(int status) => status is 408 or 429 or >= 500;
 
@@ -390,7 +503,11 @@ internal sealed class ApiTransport : IDisposable
         };
     }
 
-    public void Dispose() => _pipeline.Dispose();
+    public void Dispose()
+    {
+        _pipeline.Dispose();
+        _credentials.OAuth?.Dispose();
+    }
 
     /// <summary>Ends the middleware chain with an <see cref="HttpClient"/> or a caller's handler.</summary>
     private sealed class Forwarder(HttpMessageInvoker inner, bool owned) : HttpMessageHandler

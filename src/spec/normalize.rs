@@ -9,6 +9,8 @@ use anyhow::{Context as _, Result, bail};
 use heck::{ToSnakeCase as _, ToUpperCamelCase as _};
 use serde_json::{Map, Value, json};
 
+use super::upgrade;
+
 const METHODS: [&str; 8] = [
     "get", "put", "post", "delete", "options", "head", "patch", "trace",
 ];
@@ -23,12 +25,318 @@ const PROPERTY_ANNOTATIONS: [&str; 5] = [
 ];
 
 pub(super) fn normalize(doc: &mut Value) -> Result<()> {
+    canonicalize_refs(doc);
+    upgrade::type_unions(doc);
     let root = doc.clone();
     inline_operation_refs(doc, &root)?;
+    open_enums(doc);
+    lower_base_discriminators(doc);
     infer_discriminators(doc);
     Promoter::run(doc);
     flatten_all_of(doc);
     Ok(())
+}
+
+/// Whether a schema name needs renaming because `$ref`s cannot spell it as a plain path segment.
+fn is_unsafe_name_char(c: char) -> bool {
+    matches!(c, '/' | '~' | '%' | '#' | '?')
+}
+
+/// Decodes `%XX` escapes of a URI fragment, leaving malformed escapes as they are.
+fn percent_decode(fragment: &str) -> String {
+    let bytes = fragment.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%'
+            && let Some(hex) = fragment.get(i + 1..i + 3)
+            && let Ok(byte) = u8::from_str_radix(hex, 16)
+        {
+            out.push(byte);
+            i += 3;
+            continue;
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// RFC 6901 unescaping of one pointer segment.
+fn unescape_segment(segment: &str) -> String {
+    segment.replace("~1", "/").replace("~0", "~")
+}
+
+/// Makes every local `$ref` plain: fragments are percent-decoded, JSON pointer escapes in schema
+/// names are resolved (schemas whose names cannot be a path segment are renamed), and references
+/// into a schema's nested locations are replaced by the schema found there.
+fn canonicalize_refs(doc: &mut Value) {
+    let renames = sanitize_schema_names(doc);
+    for _ in 0..8 {
+        let root = doc.clone();
+        if !canonicalize_value(doc, &root, &renames) {
+            break;
+        }
+    }
+}
+
+fn sanitize_schema_names(doc: &mut Value) -> BTreeMap<String, String> {
+    let mut renames = BTreeMap::new();
+    let Some(Value::Object(schemas)) = doc.pointer_mut("/components/schemas") else {
+        return renames;
+    };
+    let unsafe_names: Vec<String> = schemas
+        .keys()
+        .filter(|k| k.contains(is_unsafe_name_char))
+        .cloned()
+        .collect();
+    for old in unsafe_names {
+        let mut new: String = old
+            .chars()
+            .map(|c| if is_unsafe_name_char(c) { '_' } else { c })
+            .collect();
+        while schemas.contains_key(&new) {
+            new.push('_');
+        }
+        if let Some(schema) = schemas.remove(&old) {
+            schemas.insert(new.clone(), schema);
+        }
+        renames.insert(old, new);
+    }
+    renames
+}
+
+enum Rewritten {
+    Ref(String),
+    Inline(Value),
+}
+
+fn canonical_ref(
+    reference: &str,
+    root: &Value,
+    renames: &BTreeMap<String, String>,
+) -> Option<Rewritten> {
+    let fragment = reference.strip_prefix('#')?;
+    let decoded = percent_decode(fragment);
+    if !decoded.starts_with('/') {
+        return None;
+    }
+    let segments: Vec<String> = decoded[1..].split('/').map(unescape_segment).collect();
+    if segments.len() >= 3 && segments[0] == "components" && segments[1] == "schemas" {
+        let name = renames.get(&segments[2]).unwrap_or(&segments[2]);
+        if segments.len() == 3 {
+            let new = format!("{SCHEMA_PREFIX}{name}");
+            return (new != reference).then_some(Rewritten::Ref(new));
+        }
+        let mut target = root.pointer("/components/schemas")?.get(name)?;
+        for segment in &segments[3..] {
+            target = match target {
+                Value::Object(map) => map.get(segment)?,
+                Value::Array(items) => items.get(segment.parse::<usize>().ok()?)?,
+                _ => return None,
+            };
+        }
+        return Some(Rewritten::Inline(target.clone()));
+    }
+    (decoded != fragment).then(|| Rewritten::Ref(format!("#{decoded}")))
+}
+
+/// Rewrites the references under `value`, returning whether anything changed.
+fn canonicalize_value(value: &mut Value, root: &Value, renames: &BTreeMap<String, String>) -> bool {
+    let mut changed = false;
+    match value {
+        Value::Array(items) => {
+            for item in items {
+                changed |= canonicalize_value(item, root, renames);
+            }
+        }
+        Value::Object(map) => {
+            let rewritten = map
+                .get("$ref")
+                .and_then(Value::as_str)
+                .and_then(|r| canonical_ref(r, root, renames));
+            match rewritten {
+                Some(Rewritten::Ref(new)) => {
+                    map.insert("$ref".into(), new.into());
+                    changed = true;
+                }
+                Some(Rewritten::Inline(target)) => {
+                    let mut inlined = target;
+                    if let Value::Object(inlined) = &mut inlined {
+                        for (key, sibling) in std::mem::take(map) {
+                            if key != "$ref" {
+                                inlined.insert(key, sibling);
+                            }
+                        }
+                    }
+                    *value = inlined;
+                    return true;
+                }
+                None => {}
+            }
+            let Value::Object(map) = value else {
+                return changed;
+            };
+            for (key, child) in map.iter_mut() {
+                match key.as_str() {
+                    "example" | "examples" | "default" | "enum" | "const" | "$ref" => {}
+                    "mapping" => {
+                        let Value::Object(targets) = child else {
+                            continue;
+                        };
+                        for target in targets.values_mut() {
+                            let Some(reference) = target.as_str() else {
+                                continue;
+                            };
+                            let new = match canonical_ref(reference, root, renames) {
+                                Some(Rewritten::Ref(new)) => Some(new),
+                                Some(Rewritten::Inline(_)) => None,
+                                None => renames.get(reference).cloned(),
+                            };
+                            if let Some(new) = new {
+                                *target = new.into();
+                                changed = true;
+                            }
+                        }
+                    }
+                    _ => changed |= canonicalize_value(child, root, renames),
+                }
+            }
+        }
+        _ => {}
+    }
+    changed
+}
+
+/// Models a discriminator declared on a base schema as a union of its subtypes. The base's own
+/// fields move to `{Base}Base`, which the subtypes' `allOf` parts reference instead, and the
+/// base itself becomes the `oneOf` of its subtypes: those named by the discriminator mapping or,
+/// for the ones left out of it, those that reference the base in `allOf`.
+fn lower_base_discriminators(doc: &mut Value) {
+    let Some(Value::Object(schemas)) = doc.pointer_mut("/components/schemas") else {
+        return;
+    };
+    let bases: Vec<String> = schemas
+        .iter()
+        .filter(|(_, s)| {
+            s.get("discriminator").is_some_and(Value::is_object)
+                && !["oneOf", "anyOf", "x-perseid-union"]
+                    .iter()
+                    .any(|k| s.get(*k).is_some())
+        })
+        .map(|(name, _)| name.clone())
+        .collect();
+    let mut redirects = Vec::new();
+    for base in bases {
+        let snapshot = schemas.clone();
+        let target = format!("{SCHEMA_PREFIX}{base}");
+        let mut variants: Vec<String> = Vec::new();
+        let mapped = snapshot[&base]
+            .pointer("/discriminator/mapping")
+            .and_then(Value::as_object)
+            .into_iter()
+            .flat_map(|m| m.values().filter_map(Value::as_str));
+        for mapped in mapped {
+            let name = mapped.strip_prefix(SCHEMA_PREFIX).unwrap_or(mapped);
+            if name != base && snapshot.contains_key(name) && !variants.iter().any(|v| v == name) {
+                variants.push(name.to_owned());
+            }
+        }
+        for (name, schema) in &snapshot {
+            let extends = schema
+                .get("allOf")
+                .and_then(Value::as_array)
+                .is_some_and(|parts| {
+                    parts
+                        .iter()
+                        .any(|p| p.get("$ref").and_then(Value::as_str) == Some(target.as_str()))
+                });
+            if extends && *name != base && !variants.contains(name) {
+                variants.push(name.clone());
+            }
+        }
+        if variants.is_empty() {
+            continue;
+        }
+        let mut base_name = format!("{base}Base");
+        while schemas.contains_key(&base_name) {
+            base_name.push('_');
+        }
+        let mut fields = snapshot[&base].clone();
+        let discriminator = fields
+            .as_object_mut()
+            .and_then(|m| m.remove("discriminator"))
+            .unwrap_or_default();
+        let property = discriminator["propertyName"].as_str().unwrap_or_default();
+        let mut mapping = discriminator
+            .get("mapping")
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        for variant in &variants {
+            let is_mapped = mapping
+                .values()
+                .filter_map(Value::as_str)
+                .any(|m| m.rsplit('/').next() == Some(variant.as_str()));
+            if is_mapped {
+                continue;
+            }
+            let values = discriminator_values(&snapshot[variant], property, |t| {
+                snapshot.get(t.strip_prefix(SCHEMA_PREFIX)?)
+            });
+            if values.is_empty() {
+                mapping.insert(variant.clone(), reference(variant)["$ref"].clone());
+            }
+        }
+        let mut union = Map::new();
+        for key in ["title", "description"] {
+            if let Some(value) = fields.get(key) {
+                union.insert(key.into(), value.clone());
+            }
+        }
+        union.insert(
+            "oneOf".into(),
+            variants.iter().map(|v| reference(v)).collect(),
+        );
+        let mut discriminator = discriminator;
+        if !mapping.is_empty() {
+            discriminator["mapping"] = Value::Object(mapping);
+        }
+        union.insert("discriminator".into(), discriminator);
+        schemas.insert(base_name.clone(), fields);
+        schemas.insert(base.clone(), Value::Object(union));
+        redirects.push((target, format!("{SCHEMA_PREFIX}{base_name}")));
+    }
+    for (from, to) in &redirects {
+        redirect_all_of(doc, from, to);
+    }
+}
+
+/// Points the `allOf` parts referencing `from` at `to`.
+fn redirect_all_of(value: &mut Value, from: &str, to: &str) {
+    match value {
+        Value::Array(items) => items.iter_mut().for_each(|v| redirect_all_of(v, from, to)),
+        Value::Object(map) => {
+            if let Some(Value::Array(parts)) = map.get_mut("allOf") {
+                for part in parts {
+                    if part.get("$ref").and_then(Value::as_str) == Some(from)
+                        && let Value::Object(part) = part
+                    {
+                        part.insert("$ref".into(), to.into());
+                    }
+                }
+            }
+            for (key, child) in map.iter_mut() {
+                if !matches!(
+                    key.as_str(),
+                    "example" | "examples" | "default" | "enum" | "const"
+                ) {
+                    redirect_all_of(child, from, to);
+                }
+            }
+        }
+        _ => {}
+    }
 }
 
 fn inline_operation_refs(doc: &mut Value, root: &Value) -> Result<()> {
@@ -110,18 +418,23 @@ fn normalize_operation(
     Ok(())
 }
 
-/// Renames the schemas whose type name the SDK already uses, `Upload` becoming `UploadModel`.
-pub(super) fn rename_reserved_schemas(doc: &mut Value, reserved: &BTreeSet<String>) {
+/// Renames the schemas whose type name is not usable in the SDK: `Upload` becoming `UploadModel`
+/// when the SDK has its own, `3DModel` becoming `N3dModel` as identifiers cannot start with a digit.
+/// Returns the renames made, by schema name.
+pub(super) fn rename_reserved_schemas(
+    doc: &mut Value,
+    reserved: &BTreeSet<String>,
+) -> BTreeMap<String, String> {
     let Some(Value::Object(schemas)) = doc.pointer("/components/schemas") else {
-        return;
+        return BTreeMap::new();
     };
     let mut taken: BTreeSet<String> = schemas.keys().map(|n| n.to_upper_camel_case()).collect();
     let mut renames = BTreeMap::new();
     for name in schemas.keys() {
-        if !reserved.contains(&name.to_upper_camel_case()) {
+        let base = crate::reserved::safe_type_name(name, reserved);
+        if base == name.to_upper_camel_case() {
             continue;
         }
-        let base = format!("{}Model", name.to_upper_camel_case());
         let mut candidate = base.clone();
         for n in 2.. {
             if taken.insert(candidate.clone()) {
@@ -132,7 +445,7 @@ pub(super) fn rename_reserved_schemas(doc: &mut Value, reserved: &BTreeSet<Strin
         renames.insert(name.clone(), candidate);
     }
     if renames.is_empty() {
-        return;
+        return renames;
     }
     if let Some(Value::Object(schemas)) = doc.pointer_mut("/components/schemas") {
         let renamed = std::mem::take(schemas)
@@ -142,6 +455,7 @@ pub(super) fn rename_reserved_schemas(doc: &mut Value, reserved: &BTreeSet<Strin
         *schemas = renamed;
     }
     rename_references(doc, &renames);
+    renames
 }
 
 fn rename_references(value: &mut Value, renames: &BTreeMap<String, String>) {
@@ -436,6 +750,251 @@ fn tags(
     Some(found)
 }
 
+/// The values a schema of strings contributes to an open enum, with their documentation.
+struct Strings {
+    /// Known values, empty for a plain string.
+    values: Vec<(String, Option<String>)>,
+    nullable: bool,
+}
+
+/// What `schema` allows when it only allows strings: a plain string, a string enum, a constant,
+/// or a reference to one of those. `None` for anything else, such as a formatted string.
+fn string_values(schema: &Value, schemas: &Map<String, Value>, depth: usize) -> Option<Strings> {
+    const FOREIGN: [&str; 10] = [
+        "format",
+        "allOf",
+        "oneOf",
+        "anyOf",
+        "not",
+        "properties",
+        "items",
+        "additionalProperties",
+        "patternProperties",
+        "discriminator",
+    ];
+    let map = schema.as_object()?;
+    if let Some(target) = map.get("$ref").and_then(Value::as_str) {
+        let mut rest = map.clone();
+        rest.remove("$ref");
+        if depth > 8 || !is_annotation(&Value::Object(rest)) {
+            return None;
+        }
+        let name = target.strip_prefix(SCHEMA_PREFIX)?;
+        return string_values(schemas.get(name)?, schemas, depth + 1);
+    }
+    if FOREIGN.iter().any(|k| map.contains_key(*k)) {
+        return None;
+    }
+    let mut nullable = false;
+    match map.get("type") {
+        None => {}
+        Some(Value::String(t)) if t == "string" => {}
+        Some(Value::Array(types)) => {
+            for t in types {
+                match t.as_str() {
+                    Some("string") => {}
+                    Some("null") => nullable = true,
+                    _ => return None,
+                }
+            }
+        }
+        Some(_) => return None,
+    }
+    let doc = map
+        .get("description")
+        .and_then(Value::as_str)
+        .filter(|d| !d.is_empty())
+        .map(ToOwned::to_owned);
+    let mut values = Vec::new();
+    if let Some(Value::Array(items)) = map.get("enum") {
+        let docs = map
+            .get("x-enum-descriptions")
+            .and_then(Value::as_array)
+            .filter(|d| d.len() == items.len());
+        for (i, item) in items.iter().enumerate() {
+            match item {
+                Value::Null => nullable = true,
+                Value::String(value) => {
+                    let described = docs
+                        .and_then(|d| d[i].as_str())
+                        .filter(|d| !d.is_empty())
+                        .map(ToOwned::to_owned);
+                    let single = doc.clone().filter(|_| items.len() == 1);
+                    values.push((value.clone(), described.or(single)));
+                }
+                _ => return None,
+            }
+        }
+    } else if let Some(constant) = map.get("const") {
+        values.push((constant.as_str()?.to_owned(), doc));
+    } else if map.get("type").is_none() {
+        return None;
+    }
+    Some(Strings { values, nullable })
+}
+
+/// The `oneOf`/`anyOf` key of a plain union: no discriminator, no properties of its own, and
+/// not opted out with `x-perseid-union: json`.
+fn plain_union_key(map: &Map<String, Value>) -> Option<&'static str> {
+    let key = match (map.contains_key("oneOf"), map.contains_key("anyOf")) {
+        (true, false) => "oneOf",
+        (false, true) => "anyOf",
+        _ => return None,
+    };
+    let blocked = [
+        "discriminator",
+        "properties",
+        "allOf",
+        "enum",
+        "const",
+        "$ref",
+    ];
+    if blocked.iter().any(|k| map.contains_key(*k))
+        || map.get("x-perseid-union").is_some_and(|v| v == "json")
+    {
+        return None;
+    }
+    Some(key)
+}
+
+/// Turns a union whose members are all strings (plain strings, string enums, constants,
+/// references to string enums) into one open string enum: the union of the known values, with
+/// the descriptions of constants as `x-enum-descriptions`. Enums keep values they do not know,
+/// so a plain `string` member needs no type of its own. The schema keeps its name, and a
+/// referenced enum stays a type of its own: the union carries a copy of its values.
+fn open_enum(map: &mut Map<String, Value>, schemas: &Map<String, Value>) -> bool {
+    let Some(key) = plain_union_key(map) else {
+        return false;
+    };
+    if map.get("type").is_some_and(|t| t != "string") {
+        return false;
+    }
+    let Some(Value::Array(variants)) = map.get(key) else {
+        return false;
+    };
+    let mut nullable = false;
+    let mut members = 0;
+    let mut values: Vec<(String, Option<String>)> = Vec::new();
+    for variant in variants {
+        if is_null_schema(variant) {
+            nullable = true;
+            continue;
+        }
+        let Some(strings) = string_values(variant, schemas, 0) else {
+            return false;
+        };
+        members += 1;
+        nullable |= strings.nullable;
+        for (value, doc) in strings.values {
+            match values.iter_mut().find(|(known, _)| *known == value) {
+                Some(known) => {
+                    if known.1.is_none() {
+                        known.1 = doc;
+                    }
+                }
+                None => values.push((value, doc)),
+            }
+        }
+    }
+    // `oneOf: [X, null]` is a nullable `X`, not a union.
+    if members < 2 {
+        return false;
+    }
+    map.remove(key);
+    map.insert(
+        "type".into(),
+        if nullable {
+            json!(["string", "null"])
+        } else {
+            json!("string")
+        },
+    );
+    if !values.is_empty() {
+        map.insert(
+            "enum".into(),
+            Value::Array(values.iter().map(|(v, _)| json!(v)).collect()),
+        );
+    }
+    if values.iter().any(|(_, doc)| doc.is_some()) {
+        map.insert(
+            "x-enum-descriptions".into(),
+            Value::Array(
+                values
+                    .iter()
+                    .map(|(_, doc)| json!(doc.as_deref().unwrap_or_default()))
+                    .collect(),
+            ),
+        );
+    }
+    true
+}
+
+/// A union of `integer` and `number` is the `number`: every integer is one.
+fn collapse_numbers(map: &mut Map<String, Value>) -> bool {
+    let Some(key) = plain_union_key(map) else {
+        return false;
+    };
+    if map.contains_key("type") {
+        return false;
+    }
+    let Some(Value::Array(variants)) = map.get_mut(key) else {
+        return false;
+    };
+    let kind = |v: &Value| -> Option<String> {
+        const FOREIGN: [&str; 8] = [
+            "enum",
+            "const",
+            "$ref",
+            "oneOf",
+            "anyOf",
+            "allOf",
+            "properties",
+            "items",
+        ];
+        let object = v.as_object()?;
+        if FOREIGN.iter().any(|k| object.contains_key(*k)) {
+            return None;
+        }
+        object.get("type")?.as_str().map(ToOwned::to_owned)
+    };
+    let kinds: Vec<Option<String>> = variants.iter().map(kind).collect();
+    let has = |t: &str| kinds.iter().any(|k| k.as_deref() == Some(t));
+    if !(has("integer") && has("number")) {
+        return false;
+    }
+    let mut kinds = kinds.into_iter();
+    variants.retain(|_| kinds.next().flatten().as_deref() != Some("integer"));
+    if variants.len() == 1 {
+        let Value::Object(variant) = variants.remove(0) else {
+            return true;
+        };
+        map.remove(key);
+        for (k, v) in variant {
+            map.entry(k).or_insert(v);
+        }
+    }
+    true
+}
+
+/// Rewrites the unions of strings into open enums and those of `integer` and `number` into
+/// `number`, until no union is left to rewrite (a union can reference another one).
+fn open_enums(doc: &mut Value) {
+    for _ in 0..4 {
+        let schemas = doc
+            .pointer("/components/schemas")
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        let mut changed = false;
+        upgrade::each_schema(doc, &mut |map: &mut Map<String, Value>| {
+            changed |= open_enum(map, &schemas) || collapse_numbers(map);
+        });
+        if !changed {
+            break;
+        }
+    }
+}
+
 fn is_null_schema(schema: &Value) -> bool {
     schema.get("type").and_then(Value::as_str) == Some("null")
 }
@@ -567,7 +1126,7 @@ impl Promoter {
                 "/requestBody/content/{}/schema",
                 media.replace('/', "~1")
             )) {
-                self.body(schema, format!("{id}_request"));
+                self.body(schema, format!("{id}_request"), false);
             }
         }
         let Some(Value::Object(responses)) = op.get_mut("responses") else {
@@ -587,12 +1146,29 @@ impl Promoter {
                 _ => format!("{id}_response_{status}"),
             };
             if let Some(schema) = response.pointer_mut("/content/application~1json/schema") {
-                self.body(schema, name);
+                self.body(schema, name, true);
             }
         }
     }
 
-    fn body(&mut self, schema: &mut Value, name: String) {
+    /// Promotes the schema of a body. A request body drops `null`, which is not a value the SDK
+    /// offers; a response body keeps it as `oneOf: [X, {type: null}]`, which the SDK returns
+    /// as an optional.
+    fn body(&mut self, schema: &mut Value, name: String, keep_null: bool) {
+        let nullable = keep_null
+            && (nullable_wrapper(schema).is_some()
+                || schema
+                    .get("type")
+                    .and_then(Value::as_array)
+                    .is_some_and(|types| types.iter().any(|t| t == "null")));
+        self.body_value(schema, name);
+        if nullable {
+            let inner = schema.take();
+            *schema = json!({ "oneOf": [inner, { "type": "null" }] });
+        }
+    }
+
+    fn body_value(&mut self, schema: &mut Value, name: String) {
         // A body is either sent or not: `null` is not a value the SDK should offer.
         if let Some((key, index)) = nullable_wrapper(schema) {
             *schema = schema[key][index].take();
@@ -866,7 +1442,18 @@ impl Promoter {
 fn discriminator_values<'a>(
     variant: &'a Value,
     property: &str,
-    resolve: impl Fn(&str) -> Option<&'a Value>,
+    resolve: impl Fn(&str) -> Option<&'a Value> + Copy,
+) -> Vec<String> {
+    discriminator_values_at(variant, property, resolve, 8)
+}
+
+/// [discriminator_values], following `$ref` parts of `allOf` (a refined variant) at most `depth`
+/// levels deep.
+fn discriminator_values_at<'a>(
+    variant: &'a Value,
+    property: &str,
+    resolve: impl Fn(&str) -> Option<&'a Value> + Copy,
+    depth: usize,
 ) -> Vec<String> {
     let own = variant.get("properties").and_then(|p| p.get(property));
     let parts = variant.get("allOf").and_then(Value::as_array);
@@ -874,7 +1461,8 @@ fn discriminator_values<'a>(
         .into_iter()
         .flatten()
         .filter_map(|p| p.get("properties")?.get(property));
-    own.into_iter()
+    let values = own
+        .into_iter()
         .chain(inherited)
         .filter_map(|schema| match schema.get("$ref").and_then(Value::as_str) {
             Some(target) => resolve(target),
@@ -889,6 +1477,18 @@ fn discriminator_values<'a>(
                 .collect(),
             _ => vec![],
         })
+        .find(|values| !values.is_empty());
+    if let Some(values) = values {
+        return values;
+    }
+    if depth == 0 {
+        return vec![];
+    }
+    parts
+        .into_iter()
+        .flatten()
+        .filter_map(|p| resolve(p.get("$ref")?.as_str()?))
+        .map(|base| discriminator_values_at(base, property, resolve, depth - 1))
         .find(|values| !values.is_empty())
         .unwrap_or_default()
 }
@@ -1039,6 +1639,7 @@ fn merge_all_of(schema: &Value, schemas: &Map<String, Value>, depth: usize) -> O
             out.insert(key.into(), union[key].clone());
         }
     }
+    merged.resolve_collisions(schemas);
     out.insert("type".into(), "object".into());
     out.insert("properties".into(), Value::Object(merged.properties));
     match merged.required.is_empty() {
@@ -1080,20 +1681,181 @@ impl Merged {
         }
         let properties = part.get("properties").and_then(Value::as_object);
         for (name, value) in properties.into_iter().flatten() {
-            self.properties.insert(name.clone(), value.clone());
+            add_property(&mut self.properties, name, value);
         }
-        for name in part
-            .get("required")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-        {
-            if !self.required.contains(name) {
-                self.required.push(name.clone());
-            }
-        }
+        add_required(&mut self.required, part.get("required"));
         Some(())
     }
+
+    /// Replaces the embedded references by their fields when embedding would repeat a name: a
+    /// property declared by several parts, or one named like an embedded schema (which SDKs
+    /// declare as a field of that name).
+    fn resolve_collisions(&mut self, schemas: &Map<String, Value>) {
+        if self.references.is_empty() {
+            return;
+        }
+        let mut inherited = Vec::new();
+        let mut names = BTreeSet::new();
+        for reference in &self.references {
+            let mut fields = Map::new();
+            let mut required = Vec::new();
+            let mut stack = Vec::new();
+            if let Some(name) = reference["$ref"]
+                .as_str()
+                .and_then(|r| r.strip_prefix(SCHEMA_PREFIX))
+            {
+                collect_fields(name, schemas, &mut stack, &mut fields, &mut required);
+            }
+            names.extend(stack.iter().map(|n| identifier_key(n)));
+            inherited.push((fields, required));
+        }
+        let mut seen = BTreeSet::new();
+        let mut collides = false;
+        let inherited_names = inherited.iter().flat_map(|(fields, _)| fields.keys());
+        for name in inherited_names.chain(self.properties.keys()) {
+            let key = identifier_key(name);
+            collides |= names.contains(&key) || !seen.insert(key);
+        }
+        if !collides {
+            return;
+        }
+        let own = std::mem::take(&mut self.properties);
+        let own_required = std::mem::take(&mut self.required);
+        for (fields, required) in inherited {
+            for (name, value) in &fields {
+                add_property(&mut self.properties, name, value);
+            }
+            add_required(&mut self.required, Some(&Value::Array(required)));
+        }
+        for (name, value) in &own {
+            add_property(&mut self.properties, name, value);
+        }
+        add_required(&mut self.required, Some(&Value::Array(own_required)));
+        self.references.clear();
+    }
+}
+
+/// A name as identifiers of any casing spell it, to find the names SDKs would declare twice.
+fn identifier_key(name: &str) -> String {
+    name.chars()
+        .filter(|c| c.is_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+fn add_required(required: &mut Vec<Value>, names: Option<&Value>) {
+    for name in names.and_then(Value::as_array).into_iter().flatten() {
+        if !required.contains(name) {
+            required.push(name.clone());
+        }
+    }
+}
+
+fn add_property(properties: &mut Map<String, Value>, name: &str, value: &Value) {
+    let merged = match properties.get(name) {
+        Some(existing) => reconcile(name, existing, value),
+        None => value.clone(),
+    };
+    properties.insert(name.to_owned(), merged);
+}
+
+/// The fields and required names of the schema `name` and of everything it composes, recording
+/// the names visited in `stack`.
+fn collect_fields(
+    name: &str,
+    schemas: &Map<String, Value>,
+    stack: &mut Vec<String>,
+    fields: &mut Map<String, Value>,
+    required: &mut Vec<Value>,
+) {
+    if stack.iter().any(|n| n == name) || stack.len() > 32 {
+        return;
+    }
+    let Some(schema) = schemas.get(name) else {
+        return;
+    };
+    stack.push(name.to_owned());
+    collect_schema_fields(schema, schemas, stack, fields, required);
+}
+
+fn collect_schema_fields(
+    schema: &Value,
+    schemas: &Map<String, Value>,
+    stack: &mut Vec<String>,
+    fields: &mut Map<String, Value>,
+    required: &mut Vec<Value>,
+) {
+    for part in schema
+        .get("allOf")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        match part.get("$ref").and_then(Value::as_str) {
+            Some(target) => {
+                if let Some(name) = target.strip_prefix(SCHEMA_PREFIX) {
+                    collect_fields(name, schemas, stack, fields, required);
+                }
+            }
+            None => collect_schema_fields(part, schemas, stack, fields, required),
+        }
+    }
+    for (name, value) in schema
+        .get("properties")
+        .and_then(Value::as_object)
+        .into_iter()
+        .flatten()
+    {
+        add_property(fields, name, value);
+    }
+    add_required(required, schema.get("required"));
+}
+
+/// Keys that describe a value rather than constrain it.
+const DOCUMENTATION: [&str; 7] = [
+    "description",
+    "title",
+    "example",
+    "examples",
+    "deprecated",
+    "readOnly",
+    "writeOnly",
+];
+
+/// Whether `narrow` accepts only values `wide` accepts, judging by the same type and by
+/// constraints it adds or tightens.
+fn refines(narrow: &Value, wide: &Value) -> bool {
+    let (Some(narrow), Some(wide)) = (narrow.as_object(), wide.as_object()) else {
+        return false;
+    };
+    if narrow.contains_key("$ref") || wide.contains_key("$ref") {
+        return narrow.get("$ref") == wide.get("$ref") && narrow.get("$ref").is_some();
+    }
+    wide.iter()
+        .filter(|(key, _)| !DOCUMENTATION.contains(&key.as_str()))
+        .all(|(key, value)| match (key.as_str(), narrow.get(key)) {
+            (_, None) => false,
+            ("enum", Some(Value::Array(own))) => value
+                .as_array()
+                .is_some_and(|all| own.iter().all(|v| all.contains(v))),
+            (_, Some(own)) => own == value,
+        })
+}
+
+/// The one schema two `allOf` parts declare for the same property: the narrower of them, or an
+/// untyped one when neither refines the other.
+fn reconcile(name: &str, first: &Value, second: &Value) -> Value {
+    if first == second || refines(second, first) {
+        return second.clone();
+    }
+    if refines(first, second) {
+        return first.clone();
+    }
+    tracing::warn!(
+        property = name,
+        "`allOf` parts declare incompatible schemas for a property, so it is typed as an untyped JSON value"
+    );
+    json!({})
 }
 
 /// The discriminated union an `allOf` part is, whose variants then carry the other parts' fields.
@@ -1250,6 +2012,28 @@ mod tests {
         assert_eq!(
             schemas["Event"]["discriminator"]["mapping"]["u"],
             json!("UploadModel2")
+        );
+    }
+
+    #[test]
+    fn schema_names_starting_with_a_digit_get_a_prefix() {
+        let mut doc = json!({
+            "paths": { "/m": { "get": { "operationId": "op", "responses": { "200": {
+                "description": "", "content": { "application/json": {
+                    "schema": { "$ref": "#/components/schemas/3DModel" } } } } } } } },
+            "components": { "schemas": {
+                "3DModel": { "type": "object" },
+                "N3dModel": { "type": "object" },
+                "": { "type": "object" }
+            } }
+        });
+        rename_reserved_schemas(&mut doc, &BTreeSet::new());
+        let schemas = doc["components"]["schemas"].as_object().unwrap();
+        assert!(schemas.contains_key("N3dModel2") && schemas.contains_key("N3dModel"));
+        assert!(schemas.contains_key("Schema") && !schemas.contains_key("3DModel"));
+        assert_eq!(
+            doc.pointer("/paths/~1m/get/responses/200/content/application~1json/schema/$ref"),
+            Some(&json!("#/components/schemas/N3dModel2"))
         );
     }
 
@@ -1434,6 +2218,25 @@ mod tests {
     }
 
     #[test]
+    fn refined_variants_are_mapped_from_the_discriminator_enum_of_their_base() {
+        let doc = normalized(json!({ "components": { "schemas": {
+            "Grader": {
+                "oneOf": [{ "$ref": "#/components/schemas/EvalStringCheck" }],
+                "discriminator": { "propertyName": "type" }
+            },
+            "StringCheck": { "properties": { "type": { "enum": ["string_check"] } } },
+            "EvalStringCheck": { "allOf": [
+                { "$ref": "#/components/schemas/StringCheck" },
+                { "type": "object", "description": "Refined." }
+            ] }
+        } } }));
+        assert_eq!(
+            doc["components"]["schemas"]["Grader"]["discriminator"]["mapping"],
+            json!({ "string_check": "#/components/schemas/EvalStringCheck" })
+        );
+    }
+
+    #[test]
     fn referenced_variants_are_mapped_from_their_discriminator_enum() {
         let doc = normalized(json!({ "components": { "schemas": {
             "Tool": {
@@ -1609,5 +2412,201 @@ mod tests {
             error.contains("GET /x") && error.contains("other.yaml"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn all_of_properties_named_like_an_embedded_schema_are_flattened() {
+        let doc = normalized(json!({ "components": { "schemas": {
+            "Owner": { "type": "object", "properties": { "id": { "type": "string" } } },
+            "Child": { "allOf": [
+                { "$ref": "#/components/schemas/Owner" },
+                { "type": "object", "properties": { "owner": { "type": "string" } } }
+            ] }
+        } } }));
+        let child = &doc["components"]["schemas"]["Child"];
+        assert!(child.get("allOf").is_none());
+        assert_eq!(child["properties"]["id"], json!({ "type": "string" }));
+        assert_eq!(child["properties"]["owner"], json!({ "type": "string" }));
+    }
+
+    #[test]
+    fn all_of_parts_redeclaring_a_property_keep_the_narrower_schema() {
+        let doc = normalized(json!({ "components": { "schemas": {
+            "Base": { "type": "object", "properties": {
+                "kind": { "type": "string" }, "n": { "type": "integer" } } },
+            "Child": { "allOf": [
+                { "$ref": "#/components/schemas/Base" },
+                { "type": "object", "properties": {
+                    "kind": { "type": "string", "enum": ["a"] }, "n": { "type": "string" } } }
+            ] }
+        } } }));
+        let child = &doc["components"]["schemas"]["Child"];
+        assert!(child.get("allOf").is_none());
+        assert_eq!(
+            child["properties"]["kind"],
+            json!({ "type": "string", "enum": ["a"] })
+        );
+        assert_eq!(child["properties"]["n"], json!({}));
+    }
+
+    #[test]
+    fn a_discriminator_on_a_base_makes_it_a_union_of_its_subtypes() {
+        let doc = normalized(json!({ "components": { "schemas": {
+            "Pet": {
+                "type": "object", "required": ["petType"],
+                "properties": { "petType": { "type": "string" } },
+                "discriminator": { "propertyName": "petType",
+                    "mapping": { "cat": "#/components/schemas/Cat" } }
+            },
+            "Cat": { "allOf": [
+                { "$ref": "#/components/schemas/Pet" },
+                { "type": "object", "properties": { "meow": { "type": "boolean" } } }
+            ] },
+            "Dog": { "allOf": [
+                { "$ref": "#/components/schemas/Pet" },
+                { "type": "object", "properties": { "bark": { "type": "boolean" } } }
+            ] }
+        } } }));
+        let s = &doc["components"]["schemas"];
+        assert_eq!(
+            s["Pet"]["oneOf"],
+            json!([{ "$ref": "#/components/schemas/Cat" }, { "$ref": "#/components/schemas/Dog" }])
+        );
+        assert_eq!(
+            s["Pet"]["discriminator"]["mapping"]["cat"],
+            "#/components/schemas/Cat"
+        );
+        assert_eq!(
+            s["Pet"]["discriminator"]["mapping"]["Dog"],
+            "#/components/schemas/Dog"
+        );
+        assert!(s["PetBase"].get("discriminator").is_none());
+        assert_eq!(
+            s["Cat"]["allOf"],
+            json!([{ "$ref": "#/components/schemas/PetBase" }])
+        );
+        assert_eq!(s["Cat"]["properties"]["meow"], json!({ "type": "boolean" }));
+    }
+
+    #[test]
+    fn json_pointer_escapes_and_nested_locations_resolve() {
+        let doc = normalized(json!({ "components": { "schemas": {
+            "a/b": { "type": "object", "properties": { "v": { "type": "string" } } },
+            "Holder": { "type": "object", "properties": {
+                "x": { "$ref": "#/components/schemas/a~1b" },
+                "y": { "$ref": "#/components/schemas/a~1b/properties/v" },
+                "z": { "$ref": "#/components/schemas/Sp%20ace" }
+            } },
+            "Sp ace": { "type": "object", "properties": { "w": { "type": "integer" } } }
+        } } }));
+        let s = &doc["components"]["schemas"];
+        assert!(s.get("a_b").is_some());
+        let holder = &s["Holder"]["properties"];
+        assert_eq!(holder["x"]["$ref"], "#/components/schemas/a_b");
+        assert_eq!(holder["y"], json!({ "type": "string" }));
+        assert_eq!(holder["z"]["$ref"], "#/components/schemas/Sp ace");
+    }
+
+    fn schemas_of(doc: Value) -> Value {
+        normalized(json!({ "paths": {}, "components": { "schemas": doc } }))["components"]
+            ["schemas"]
+            .clone()
+    }
+
+    #[test]
+    fn unions_of_strings_become_one_open_enum() {
+        let s = schemas_of(json!({
+            "Model": { "description": "d", "anyOf": [
+                { "type": "string" },
+                { "type": "string", "enum": ["a", "b"] },
+                { "$ref": "#/components/schemas/Known" },
+                { "type": "null" }
+            ] },
+            "Known": { "type": "string", "enum": ["b", "c"] }
+        }));
+        assert_eq!(
+            s["Model"],
+            json!({ "description": "d", "type": ["string", "null"], "enum": ["a", "b", "c"] })
+        );
+        // The referenced enum stays a type of its own.
+        assert_eq!(s["Known"], json!({ "type": "string", "enum": ["b", "c"] }));
+    }
+
+    #[test]
+    fn unions_of_constants_are_an_enum_with_value_docs() {
+        let s = schemas_of(json!({
+            "Mode": { "oneOf": [
+                { "const": "fast", "description": "Quick" },
+                { "type": "string", "const": "slow" },
+                { "const": "auto", "description": "Picks" }
+            ] }
+        }));
+        assert_eq!(
+            s["Mode"],
+            json!({
+                "type": "string",
+                "enum": ["fast", "slow", "auto"],
+                "x-enum-descriptions": ["Quick", "", "Picks"]
+            })
+        );
+    }
+
+    #[test]
+    fn union_enums_referencing_unions_are_merged_too() {
+        let s = schemas_of(json!({
+            "Outer": { "anyOf": [{ "type": "string" }, { "$ref": "#/components/schemas/Inner" }] },
+            "Inner": { "oneOf": [{ "const": "x" }, { "const": "y" }] }
+        }));
+        assert_eq!(s["Outer"], json!({ "type": "string", "enum": ["x", "y"] }));
+    }
+
+    #[test]
+    fn unions_with_other_members_or_formats_are_kept() {
+        let doc = json!({
+            "Dated": { "anyOf": [{ "type": "string", "format": "date-time" }, { "type": "string" }] },
+            "Mixed": { "anyOf": [{ "type": "string" }, { "type": "integer" }] },
+            "Wrapped": { "anyOf": [{ "type": "string", "enum": ["a", "b"] }, { "type": "null" }] },
+            "Tagged": { "oneOf": [{ "const": "a" }, { "const": "b" }], "x-perseid-union": "json" }
+        });
+        assert_eq!(schemas_of(doc.clone()), doc);
+    }
+
+    #[test]
+    fn integer_and_number_in_a_union_collapse_to_number() {
+        let s = schemas_of(json!({
+            "Both": { "description": "d", "oneOf": [{ "type": "integer" }, { "type": "number" }] },
+            "Nullable": { "anyOf": [{ "type": "integer" }, { "type": "number" }, { "type": "null" }] },
+            "More": { "anyOf": [{ "type": "integer" }, { "type": "number" }, { "type": "string" }] }
+        }));
+        assert_eq!(s["Both"], json!({ "description": "d", "type": "number" }));
+        assert_eq!(
+            s["Nullable"],
+            json!({ "anyOf": [{ "type": "number" }, { "type": "null" }] })
+        );
+        assert_eq!(
+            s["More"],
+            json!({ "anyOf": [{ "type": "number" }, { "type": "string" }] })
+        );
+    }
+
+    #[test]
+    fn open_enums_are_found_in_properties_and_parameters() {
+        let doc = normalized(json!({
+            "paths": { "/x": { "get": {
+                "operationId": "op",
+                "parameters": [{ "name": "m", "in": "query", "schema": {
+                    "anyOf": [{ "type": "string" }, { "const": "a" }, { "const": "b" }]
+                } }],
+                "responses": {}
+            } } },
+            "components": { "schemas": { "Holder": { "type": "object", "properties": {
+                "enum": { "type": "string" },
+                "model": { "anyOf": [{ "type": "string" }, { "enum": ["a", "b"] }] }
+            } } } }
+        }));
+        let model = &doc["components"]["schemas"]["Holder"]["properties"]["model"];
+        assert_eq!(model, &json!({ "type": "string", "enum": ["a", "b"] }));
+        let param = &doc["paths"]["/x"]["get"]["parameters"][0]["schema"];
+        assert_eq!(param, &json!({ "type": "string", "enum": ["a", "b"] }));
     }
 }

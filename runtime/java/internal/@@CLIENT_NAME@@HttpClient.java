@@ -4,6 +4,7 @@ package @@JAVA_INTERNAL_PACKAGE@@;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.JavaType;
+import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import @@JAVA_PACKAGE@@.ApiResponse;
 import @@JAVA_PACKAGE@@.@@CLIENT_NAME@@Options;
@@ -58,7 +59,7 @@ import okhttp3.Response;
 public final class @@CLIENT_NAME@@HttpClient implements AutoCloseable {
     private static final MediaType JSON = MediaType.parse("application/json");
     private static final Set<String> IDEMPOTENT_METHODS =
-            Set.of("GET", "HEAD", "PUT", "DELETE", "OPTIONS");
+            Set.of("GET", "HEAD", "PUT", "DELETE", "OPTIONS", "TRACE");
     private static final Set<String> BODY_METHODS = Set.of("POST", "PUT", "PATCH");
     private static final Duration MAX_RETRY_AFTER = Duration.ofSeconds(60);
     private static final Duration MAX_CONNECT_TIMEOUT = Duration.ofSeconds(10);
@@ -95,6 +96,59 @@ public final class @@CLIENT_NAME@@HttpClient implements AutoCloseable {
                 options.httpClient().isEmpty(),
                 auth,
                 null);
+        if (auth != null) {
+            auth.useTokenFetcher(this::fetchToken);
+        }
+    }
+
+    /**
+     * Requests an access token with the OAuth2 client credentials grant, through this client's
+     * interceptors, timeouts and retries like any other request.
+     */
+    private @@CLIENT_NAME@@Auth.Grant fetchToken(
+            String tokenUrl, String scope, String clientId, String clientSecret, boolean inBody) {
+        HttpUrl url;
+        if (tokenUrl.contains("://")) {
+            url = HttpUrl.parse(tokenUrl);
+            if (url == null) {
+                throw new IllegalArgumentException("Invalid token URL: " + tokenUrl);
+            }
+        } else {
+            url = baseUrl.newBuilder().addPathSegments(tokenUrl.replaceFirst("^/+", "")).build();
+        }
+        FormBody.Builder form = new FormBody.Builder().add("grant_type", "client_credentials");
+        if (!scope.isEmpty()) {
+            form.add("scope", scope);
+        }
+        Headers headers = Headers.of();
+        if (inBody) {
+            form.add("client_id", clientId).add("client_secret", clientSecret);
+        } else {
+            headers = Headers.of("Authorization", @@CLIENT_NAME@@Auth.basicAuthorization(clientId, clientSecret));
+        }
+        JsonNode answer =
+                withSecurity(List.of())
+                        .call("POST", url)
+                        .headers(headers)
+                        .body(form.build())
+                        .returning(JsonNode.class)
+                        .send();
+        String accessToken = answer == null ? "" : answer.path("access_token").asText("");
+        if (accessToken.isEmpty()) {
+            throw new InvalidDataException("the token endpoint answered without an access_token");
+        }
+        JsonNode expires = answer.path("expires_in");
+        double seconds = -1;
+        if (expires.isNumber()) {
+            seconds = Math.max(expires.asDouble(), 0);
+        } else if (expires.isTextual()) {
+            try {
+                seconds = Math.max(Double.parseDouble(expires.asText().trim()), 0);
+            } catch (NumberFormatException ignored) {
+                // Declares no usable lifetime.
+            }
+        }
+        return new @@CLIENT_NAME@@Auth.Grant(accessToken, seconds);
     }
 
     private @@CLIENT_NAME@@HttpClient(
@@ -147,8 +201,51 @@ public final class @@CLIENT_NAME@@HttpClient implements AutoCloseable {
         }
         options.interceptors().forEach(builder::addInterceptor);
         builder.addInterceptor(logger(options.debug() ? System.Logger.Level.INFO : System.Logger.Level.DEBUG));
+        builder.addInterceptor(RESTORE_RETRY_AFTER);
+        builder.addNetworkInterceptor(HIDE_RETRY_AFTER);
         return builder.build();
     }
+
+    /** The header holding the {@code Retry-After} values that {@link #HIDE_RETRY_AFTER} hid. */
+    private static final String HIDDEN_RETRY_AFTER = "x-@@HEADER_PREFIX@@-hidden-retry-after";
+
+    /**
+     * OkHttp silently repeats a request answered 408 without {@code Retry-After}, or 503 with
+     * {@code Retry-After: 0}. To leave every retry to the client's own loop, which honors
+     * {@code maxRetries} and idempotency, the {@code Retry-After} of these responses reads
+     * "never" to OkHttp, its values set aside until {@link #RESTORE_RETRY_AFTER} puts them back.
+     */
+    private static final Interceptor HIDE_RETRY_AFTER =
+            chain -> {
+                Response response = chain.proceed(chain.request());
+                if (response.code() != 408 && response.code() != 503) {
+                    return response;
+                }
+                Headers.Builder headers = response.headers().newBuilder().removeAll("Retry-After");
+                headers.add(HIDDEN_RETRY_AFTER, "-");
+                for (String value : response.headers("Retry-After")) {
+                    headers.add(HIDDEN_RETRY_AFTER, ":" + value);
+                }
+                return response.newBuilder().headers(headers.set("Retry-After", "never").build()).build();
+            };
+
+    /** Puts back the {@code Retry-After} values that {@link #HIDE_RETRY_AFTER} set aside. */
+    private static final Interceptor RESTORE_RETRY_AFTER =
+            chain -> {
+                Response response = chain.proceed(chain.request());
+                List<String> hidden = response.headers(HIDDEN_RETRY_AFTER);
+                if (hidden.isEmpty()) {
+                    return response;
+                }
+                Headers.Builder headers =
+                        response.headers().newBuilder().removeAll(HIDDEN_RETRY_AFTER).removeAll("Retry-After");
+                for (String value : hidden) {
+                    if (value.startsWith(":")) {
+                        headers.add("Retry-After", value.substring(1));
+                    }
+                }
+                return response.newBuilder().headers(headers.build()).build();
+            };
 
     private static Interceptor logger(System.Logger.Level level) {
         return chain -> {
@@ -331,7 +428,7 @@ public final class @@CLIENT_NAME@@HttpClient implements AutoCloseable {
          * @return the exchange
          */
         public <T> Exchange<T> returning(JavaType type) {
-            return new Exchange<>(this, false, response -> readJson(response, type));
+            return new Exchange<>(this, false, response -> readJson(response, type, true));
         }
 
         /**
@@ -357,7 +454,7 @@ public final class @@CLIENT_NAME@@HttpClient implements AutoCloseable {
         }
 
         private <T> Exchange<Optional<T>> returningOptional(JavaType type) {
-            return new Exchange<>(this, false, response -> Optional.ofNullable(readJson(response, type)));
+            return new Exchange<>(this, false, response -> Optional.ofNullable(readJson(response, type, false)));
         }
 
         /**
@@ -380,6 +477,16 @@ public final class @@CLIENT_NAME@@HttpClient implements AutoCloseable {
         }
 
         /**
+         * Expects a text body, read in the charset the response declares, UTF-8 by default.
+         *
+         * @return the exchange
+         */
+        public Exchange<String> returningText() {
+            return new Exchange<>(
+                    this, false, response -> response.body() == null ? "" : response.body().string());
+        }
+
+        /**
          * Expects a {@code text/event-stream} body, yielding its raw events.
          *
          * @return the exchange
@@ -396,6 +503,20 @@ public final class @@CLIENT_NAME@@HttpClient implements AutoCloseable {
          * @return the exchange
          */
         public <T> Exchange<EventStream<T>> returningEvents(Class<T> type) {
+            JavaType eventType = objectMapper.getTypeFactory().constructType(type);
+            return new Exchange<>(
+                    this, true, response -> EventStream.typed(response, event -> decodeEvent(event, eventType)));
+        }
+
+        /**
+         * Expects a {@code text/event-stream} body whose events carry {@code type} as JSON, for
+         * event types a class cannot name, such as unions or lists.
+         *
+         * @param <T> the event type
+         * @param type the event type
+         * @return the exchange
+         */
+        public <T> Exchange<EventStream<T>> returningEvents(TypeReference<T> type) {
             JavaType eventType = objectMapper.getTypeFactory().constructType(type);
             return new Exchange<>(
                     this, true, response -> EventStream.typed(response, event -> decodeEvent(event, eventType)));
@@ -422,13 +543,18 @@ public final class @@CLIENT_NAME@@HttpClient implements AutoCloseable {
                 auth.apply(request, url, security);
             }
             if (headers != null) {
-                headers.forEach(pair -> request.header(pair.getFirst(), pair.getSecond()));
+                headers.forEach(pair -> setHeader(request, pair.getFirst(), pair.getSecond()));
             }
             if (streaming) {
                 request.header("Accept", "text/event-stream");
             }
-            options.headers().forEach(request::header);
+            options.headers().forEach((name, value) -> setHeader(request, name, value));
             options.idempotencyKey().ifPresent(key -> request.header("idempotency-key", key));
+            // Cookie parameters, the API key cookie and a Cookie header of the call share one header.
+            List<String> cookies = request.build().headers("Cookie");
+            if (cookies.size() > 1) {
+                request.header("Cookie", String.join("; ", cookies));
+            }
             String idempotencyKey = request.build().header("idempotency-key");
             if ((idempotencyKey == null || idempotencyKey.isEmpty()) && verb.equals("POST")) {
                 request.header("idempotency-key", "auto_" + UUID.randomUUID());
@@ -584,12 +710,19 @@ public final class @@CLIENT_NAME@@HttpClient implements AutoCloseable {
         }
     }
 
-    private <T> T readJson(Response response, JavaType type) throws IOException {
-        if (response.code() == 204 || response.body() == null) {
+    private <T> T readJson(Response response, JavaType type, boolean required) throws IOException {
+        if (response.code() == 204 || response.code() == 205) {
             return null;
         }
-        String text = response.body().string();
-        return text.isEmpty() ? null : objectMapper.readValue(text, type);
+        String text = response.body() == null ? "" : response.body().string();
+        if (text.isBlank()) {
+            if (required) {
+                throw new InvalidDataException(
+                        "the " + response.code() + " response has an empty body, but a JSON body was expected");
+            }
+            return null;
+        }
+        return objectMapper.readValue(text, type);
     }
 
     private <T> T decodeEvent(SseEvent event, JavaType type) {
@@ -694,6 +827,15 @@ public final class @@CLIENT_NAME@@HttpClient implements AutoCloseable {
         }
     }
 
+    /** Sets a header; {@code Cookie} values add up, the others replace. */
+    private static void setHeader(Request.Builder request, String name, String value) {
+        if (name.equalsIgnoreCase("Cookie")) {
+            request.addHeader(name, value);
+        } else {
+            request.header(name, value);
+        }
+    }
+
     private static boolean retryable(Request request) {
         RequestBody body = request.body();
         return (IDEMPOTENT_METHODS.contains(request.method())
@@ -715,6 +857,8 @@ public final class @@CLIENT_NAME@@HttpClient implements AutoCloseable {
      */
     private Response execute(Request request, OkHttpClient http, int retries) throws IOException {
         boolean retryable = retryable(request);
+        // An access token the API rejects is replaced once, without using up a retry.
+        boolean renewed = false;
         for (int attempt = 0; ; attempt++) {
             boolean lastAttempt = !retryable || attempt >= retries;
             Response response;
@@ -727,6 +871,13 @@ public final class @@CLIENT_NAME@@HttpClient implements AutoCloseable {
                 sleep(backoff(attempt));
                 continue;
             }
+            if (!renewed && rejectedToken(request, response)) {
+                renewed = true;
+                response.close();
+                request = auth.renew(request);
+                attempt--;
+                continue;
+            }
             Duration delay = lastAttempt ? null : retryDelay(response, attempt);
             if (delay == null) {
                 return response;
@@ -736,9 +887,18 @@ public final class @@CLIENT_NAME@@HttpClient implements AutoCloseable {
         }
     }
 
+    /** Whether {@code response} rejects the OAuth2 access token {@code request} carries. */
+    private boolean rejectedToken(Request request, Response response) {
+        RequestBody body = request.body();
+        return response.code() == 401
+                && auth != null
+                && (body == null || !body.isOneShot())
+                && auth.renewable(request);
+    }
+
     private CompletableFuture<Response> executeAsync(Request request, OkHttpClient http, int retries) {
         CompletableFuture<Response> result = new CompletableFuture<>();
-        executeAsync(request, http, retryable(request) ? retries : 0, 0, result);
+        executeAsync(request, http, retryable(request) ? retries : 0, 0, false, result);
         return result;
     }
 
@@ -747,6 +907,7 @@ public final class @@CLIENT_NAME@@HttpClient implements AutoCloseable {
             OkHttpClient http,
             int retries,
             int attempt,
+            boolean renewed,
             CompletableFuture<Response> result) {
         if (result.isDone()) {
             return;
@@ -768,12 +929,25 @@ public final class @@CLIENT_NAME@@HttpClient implements AutoCloseable {
                         } else {
                             later(
                                     backoff(attempt),
-                                    () -> executeAsync(request, http, retries, attempt + 1, result));
+                                    () -> executeAsync(request, http, retries, attempt + 1, renewed, result));
                         }
                     }
 
                     @Override
                     public void onResponse(okhttp3.Call call, Response response) {
+                        if (!renewed && rejectedToken(request, response)) {
+                            response.close();
+                            // Fetching a token blocks, so it does not run on the dispatcher's thread.
+                            CompletableFuture.runAsync(
+                                    () -> {
+                                        try {
+                                            executeAsync(auth.renew(request), http, retries, attempt, true, result);
+                                        } catch (RuntimeException e) {
+                                            result.completeExceptionally(e);
+                                        }
+                                    });
+                            return;
+                        }
                         Duration delay = lastAttempt ? null : retryDelay(response, attempt);
                         if (delay == null) {
                             if (!result.complete(response)) {
@@ -782,7 +956,7 @@ public final class @@CLIENT_NAME@@HttpClient implements AutoCloseable {
                             return;
                         }
                         response.close();
-                        later(delay, () -> executeAsync(request, http, retries, attempt + 1, result));
+                        later(delay, () -> executeAsync(request, http, retries, attempt + 1, renewed, result));
                     }
                 });
     }

@@ -30,9 +30,13 @@ pub(crate) struct SecurityScheme {
     pub(crate) param: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) description: Option<String>,
-    /// OAuth2 client credentials token endpoint, when the spec declares one.
+    /// OAuth2 client credentials token endpoint, when the spec declares one: absolute, or relative
+    /// to the server URL.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) token_url: Option<String>,
+    /// The space-separated scopes the operations require of an OAuth2 scheme, asked for with the
+    /// token. Empty when no requirement names one.
+    pub(crate) scope: String,
 }
 
 pub(crate) struct Security {
@@ -45,10 +49,17 @@ pub(crate) struct Security {
 impl Security {
     pub(crate) fn from_spec(spec: &Value) -> Self {
         let declared = spec["components"]["securitySchemes"].as_object();
-        let schemes: Vec<_> = match declared {
+        let mut skipped: Vec<(String, String)> = Vec::new();
+        let mut schemes: Vec<_> = match declared {
             Some(declared) if !declared.is_empty() => declared
                 .iter()
-                .filter_map(|(name, scheme)| parse_scheme(name, scheme))
+                .filter_map(|(name, scheme)| match parse_scheme(name, scheme) {
+                    Ok(scheme) => Some(scheme),
+                    Err(reason) => {
+                        skipped.push((name.clone(), reason));
+                        None
+                    }
+                })
                 .collect(),
             _ => vec![SecurityScheme {
                 name: IMPLICIT_BEARER.to_owned(),
@@ -57,6 +68,7 @@ impl Security {
                 param: None,
                 description: None,
                 token_url: None,
+                scope: String::new(),
             }],
         };
         let global = match spec.get("security") {
@@ -87,6 +99,25 @@ impl Security {
             }
             effective.insert(id.to_owned(), req);
         }
+        for (name, reason) in &skipped {
+            let affected: Vec<&str> = effective
+                .iter()
+                .filter(|(_, req)| req.iter().flatten().any(|n| n == name))
+                .map(|(id, _)| id.as_str())
+                .collect();
+            let used = match affected.as_slice() {
+                [] => "no operation uses it".to_owned(),
+                ops => format!("it is ignored for {}", operation_list(ops)),
+            };
+            tracing::warn!(
+                "security scheme `{name}` {reason}, so perseid sends no credentials for it ({used}); \
+                 use `bearer`, `basic`, an `apiKey` or `oauth2` scheme, or pass the header \
+                 yourself with the client's extra headers"
+            );
+        }
+        for scheme in schemes.iter_mut().filter(|s| s.token_url.is_some()) {
+            scheme.scope = required_scopes(spec, &scheme.name);
+        }
         let default = if spec.get("security").is_some() {
             global
         } else {
@@ -112,6 +143,29 @@ impl Security {
     }
 }
 
+/// The scopes the global and operation requirements ask of the scheme `name`, sorted and joined.
+fn required_scopes(spec: &Value, name: &str) -> String {
+    let operations = spec["paths"]
+        .as_object()
+        .into_iter()
+        .flat_map(|paths| paths.values())
+        .filter_map(Value::as_object)
+        .flat_map(|item| item.iter())
+        .filter(|(method, _)| HTTP_METHODS.contains(&method.as_str()))
+        .map(|(_, op)| &op["security"]);
+    let mut scopes: Vec<&str> = std::iter::once(&spec["security"])
+        .chain(operations)
+        .filter_map(Value::as_array)
+        .flatten()
+        .filter_map(|alternative| alternative[name].as_array())
+        .flatten()
+        .filter_map(Value::as_str)
+        .collect();
+    scopes.sort_unstable();
+    scopes.dedup();
+    scopes.join(" ")
+}
+
 const HTTP_METHODS: [&str; 8] = [
     "get", "put", "post", "delete", "options", "head", "patch", "trace",
 ];
@@ -130,41 +184,60 @@ fn requirement(value: &Value) -> Requirement {
     alternatives
 }
 
-fn parse_scheme(name: &str, scheme: &Value) -> Option<SecurityScheme> {
+/// Up to five operation ids, then how many more.
+fn operation_list(ops: &[&str]) -> String {
+    let shown: Vec<String> = ops.iter().take(5).map(|id| format!("`{id}`")).collect();
+    match ops.len().saturating_sub(5) {
+        0 => format!(
+            "operation{} {}",
+            if ops.len() == 1 { "" } else { "s" },
+            shown.join(", ")
+        ),
+        more => format!("operations {} and {more} more", shown.join(", ")),
+    }
+}
+
+/// The scheme, or why perseid does not support it.
+fn parse_scheme(name: &str, scheme: &Value) -> Result<SecurityScheme, String> {
     let text = |key: &str| scheme[key].as_str().map(str::to_owned);
     let (kind, location, param, token_url) = match scheme["type"].as_str() {
-        Some("http") => match text("scheme")?.to_ascii_lowercase().as_str() {
+        Some("http") => match text("scheme")
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+            .as_str()
+        {
             "bearer" => (SchemeKind::Bearer, None, None, None),
             "basic" => (SchemeKind::Basic, None, None, None),
-            other => {
-                tracing::warn!(
-                    name,
-                    scheme = other,
-                    "unsupported http auth scheme, ignored"
-                );
-                return None;
-            }
+            "" => return Err("is `type: http` without a `scheme`".to_owned()),
+            other => return Err(format!("uses the unsupported http auth scheme `{other}`")),
         },
         Some("apiKey") => (SchemeKind::ApiKey, text("in"), text("name"), None),
         Some("oauth2") => {
+            // A relative URL is resolved against the server URL: it always starts with a slash.
             let token_url = scheme["flows"]["clientCredentials"]["tokenUrl"]
                 .as_str()
-                .map(str::to_owned);
+                .filter(|url| !url.is_empty())
+                .map(|url| {
+                    if url.contains("://") || url.starts_with('/') {
+                        url.to_owned()
+                    } else {
+                        format!("/{url}")
+                    }
+                });
             (SchemeKind::Bearer, None, None, token_url)
         }
         Some("openIdConnect") => (SchemeKind::Bearer, None, None, None),
-        other => {
-            tracing::warn!(name, kind = ?other, "unsupported security scheme, ignored");
-            return None;
-        }
+        Some(other) => return Err(format!("has the unsupported type `{other}`")),
+        None => return Err("has no `type`".to_owned()),
     };
-    Some(SecurityScheme {
+    Ok(SecurityScheme {
         name: name.to_owned(),
         kind,
         location,
         param,
         description: text("description"),
         token_url,
+        scope: String::new(),
     })
 }
 
@@ -210,11 +283,40 @@ mod tests {
         );
         let oauth = security.schemes.iter().find(|s| s.name == "oauth").unwrap();
         assert_eq!(oauth.token_url.as_deref(), Some("https://t"));
+        assert_eq!(oauth.scope, "");
         let key = security.schemes.iter().find(|s| s.name == "key").unwrap();
         assert_eq!(
             (key.location.as_deref(), key.param.as_deref()),
             (Some("query"), Some("api_key"))
         );
+    }
+
+    #[test]
+    fn oauth_schemes_ask_for_the_scopes_requirements_name() {
+        let spec = json!({
+            "security": [{"oauth": ["write", "read"]}],
+            "components": {"securitySchemes": {
+                "oauth": {"type": "oauth2", "flows": {"clientCredentials": {"tokenUrl": "/token", "scopes": {"admin": ""}}}},
+                "plain": {"type": "oauth2", "flows": {"authorizationCode": {"authorizationUrl": "/a", "tokenUrl": "/t", "scopes": {}}}},
+            }},
+            "paths": {
+                "/a": {"get": {"operationId": "a", "security": [{"oauth": ["read", "list"]}, {"plain": ["x"]}]}},
+                "/b": {"get": {"operationId": "b"}},
+            }
+        });
+        let security = Security::from_spec(&spec);
+        let oauth = security.schemes.iter().find(|s| s.name == "oauth").unwrap();
+        assert_eq!(oauth.token_url.as_deref(), Some("/token"));
+        assert_eq!(oauth.scope, "list read write");
+        let relative = parse_scheme(
+            "r",
+            &json!({"type": "oauth2", "flows": {"clientCredentials": {"tokenUrl": "oauth/token", "scopes": {}}}}),
+        )
+        .unwrap();
+        assert_eq!(relative.token_url.as_deref(), Some("/oauth/token"));
+        let plain = security.schemes.iter().find(|s| s.name == "plain").unwrap();
+        assert_eq!(plain.token_url, None);
+        assert_eq!(plain.scope, "");
     }
 
     #[test]
@@ -227,5 +329,16 @@ mod tests {
         let security = Security::from_spec(&spec);
         assert_eq!(security.default, vec![vec!["b".to_owned()]]);
         assert_eq!(security.override_for("a"), Some(vec![]));
+    }
+
+    #[test]
+    fn unsupported_schemes_say_what_they_are() {
+        let err = parse_scheme("d", &json!({"type": "http", "scheme": "Digest"})).unwrap_err();
+        assert_eq!(err, "uses the unsupported http auth scheme `digest`");
+        assert_eq!(operation_list(&["a"]), "operation `a`");
+        assert_eq!(
+            operation_list(&["a", "b", "c", "d", "e", "f", "g"]),
+            "operations `a`, `b`, `c`, `d`, `e` and 2 more"
+        );
     }
 }

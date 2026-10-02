@@ -11,14 +11,14 @@ use std::{
 
 use bytes::Bytes;
 use http::{
-    header::{CONTENT_LENGTH, CONTENT_TYPE, RETRY_AFTER, USER_AGENT},
+    header::{AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE, RETRY_AFTER, USER_AGENT},
     HeaderMap, HeaderName, HeaderValue, Method, StatusCode,
 };
-use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS};
+use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS, NON_ALPHANUMERIC};
 use serde::de::DeserializeOwned;
 
 use crate::api::{
-    auth_schemes::Security,
+    auth_schemes::{base64, OAuthUse, Security, SyncFuture},
     middleware::{BoxError, Next, Request as MiddlewareRequest, Response},
     upload::{Multipart, RequestBody},
     Call, EventStream, RequestOptions, SseEvent, Upload,
@@ -105,7 +105,8 @@ fn json_or_none<T: DeserializeOwned>(body: ResponseBody) -> Result<Option<T>, Er
     if bytes.trim_ascii().is_empty() {
         return Ok(None);
     }
-    serde_json::from_slice(&bytes).map(Some).map_err(decode_error)
+    // A `null` body is no value too.
+    serde_json::from_slice::<Option<T>>(&bytes).map_err(decode_error)
 }
 
 fn empty(body: ResponseBody) -> Result<(), Error> {
@@ -177,7 +178,10 @@ pub(crate) struct Request {
     path: &'static str,
     query_params: Vec<(String, String)>,
     path_params: Vec<(&'static str, String)>,
+    /// Path parameters already serialized and percent-encoded by their style.
+    encoded_path_params: Vec<(&'static str, String)>,
     headers: HeaderMap,
+    cookies: Vec<(String, String)>,
     serialized_body: Option<Bytes>,
     body_is_form: bool,
     upload: Option<Upload>,
@@ -198,7 +202,9 @@ impl Request {
             path,
             query_params: Vec::new(),
             path_params: Vec::new(),
+            encoded_path_params: Vec::new(),
             headers: HeaderMap::new(),
+            cookies: Vec::new(),
             serialized_body: None,
             body_is_form: false,
             upload: None,
@@ -317,6 +323,18 @@ impl Request {
         self
     }
 
+    /// Sets the `Authorization` header, below the headers of the call.
+    fn with_authorization(mut self, value: String) -> Self {
+        match HeaderValue::try_from(value) {
+            Ok(mut value) => {
+                value.set_sensitive(true);
+                self.headers.insert(AUTHORIZATION, value);
+            }
+            Err(error) => self.fail(error),
+        }
+        self
+    }
+
     /// Overrides the API-wide security requirement.
     pub fn with_security(mut self, security: Security) -> Self {
         self.security = Some(security);
@@ -333,9 +351,36 @@ impl Request {
         self
     }
 
+    /// A `content: application/json` header, sent as compact JSON text.
+    pub fn with_json_header_param<T: serde::Serialize>(
+        mut self,
+        name: &'static str,
+        value: Option<T>,
+    ) -> Self {
+        match value.map(|value| serde_json::to_string(&value)).transpose() {
+            Ok(Some(json)) => return self.with_header_param(name, &json),
+            Ok(None) => {}
+            Err(error) => self.fail(error),
+        }
+        self
+    }
+
     pub fn with_optional_header_param(self, name: &'static str, value: Option<String>) -> Self {
         match value {
             Some(value) => self.with_header_param(name, &value),
+            None => self,
+        }
+    }
+
+    /// A cookie parameter, sent in the single `Cookie` header with the other cookies.
+    pub fn with_cookie_param(mut self, name: &'static str, value: &str) -> Self {
+        self.cookies.push((name.to_owned(), value.to_owned()));
+        self
+    }
+
+    pub fn with_optional_cookie_param(self, name: &'static str, value: Option<String>) -> Self {
+        match value {
+            Some(value) => self.with_cookie_param(name, &value),
             None => self,
         }
     }
@@ -358,6 +403,44 @@ impl Request {
             Ok(Some(value)) => {
                 encode_param(name, &value, deep_object, explode, &mut self.query_params);
             }
+            Ok(None) => {}
+            Err(error) => self.fail(error),
+        }
+        self
+    }
+
+    /// Sends the items of a list joined by `delimiter` (`pipeDelimited`, `spaceDelimited`).
+    pub fn with_delimited_query_param<T: serde::Serialize>(
+        mut self,
+        name: &'static str,
+        param: Option<T>,
+        delimiter: &str,
+    ) -> Self {
+        match param.map(serde_json::to_value).transpose() {
+            Ok(Some(serde_json::Value::Array(items))) => {
+                let joined = items
+                    .iter()
+                    .filter_map(scalar_text)
+                    .collect::<Vec<_>>()
+                    .join(delimiter);
+                if !joined.is_empty() {
+                    self.query_params.push((name.to_owned(), joined));
+                }
+            }
+            Ok(_) => {}
+            Err(error) => self.fail(error),
+        }
+        self
+    }
+
+    /// Sends a `content: application/json` parameter as compact JSON text.
+    pub fn with_json_query_param<T: serde::Serialize>(
+        mut self,
+        name: &'static str,
+        param: Option<T>,
+    ) -> Self {
+        match param.map(|param| serde_json::to_string(&param)).transpose() {
+            Ok(Some(json)) => self.query_params.push((name.to_owned(), json)),
             Ok(None) => {}
             Err(error) => self.fail(error),
         }
@@ -400,6 +483,24 @@ impl Request {
 
     pub fn with_path_param(mut self, name: &'static str, value: impl fmt::Display) -> Self {
         self.path_params.push((name, value.to_string()));
+        self
+    }
+
+    /// A path parameter in its OpenAPI `style`: `simple`, `label`, `matrix`, or `json` for a
+    /// `content: application/json` value.
+    pub fn with_styled_path_param<T: serde::Serialize>(
+        mut self,
+        name: &'static str,
+        value: T,
+        style: &str,
+        explode: bool,
+    ) -> Self {
+        match serde_json::to_value(value) {
+            Ok(value) => self
+                .encoded_path_params
+                .push((name, encode_path_param(name, &value, style, explode))),
+            Err(error) => self.fail(error),
+        }
         self
     }
 
@@ -459,7 +560,14 @@ impl Request {
             return Err(error);
         }
         let token = conf.bearer_access_token.as_deref().filter(|t| !t.is_empty());
-        let auth = conf.credentials.apply(self.security, token).await?;
+        let mut oauth = match conf.credentials.oauth_scheme(self.security, token) {
+            Some((url, scope)) => Some(oauth_token(conf, url, scope).await?),
+            None => None,
+        };
+        let auth = conf
+            .credentials
+            .apply(self.security, token, oauth.as_ref().map(|used| used.token.as_str()))
+            .await?;
         self.query_params
             .extend(auth.query.into_iter().map(|(name, value)| (name.to_owned(), value)));
         for (name, value) in &conf.headers {
@@ -478,6 +586,23 @@ impl Request {
             let mut value = HeaderValue::try_from(value).map_err(request_error)?;
             value.set_sensitive(true);
             self.headers.insert(name, value);
+        }
+        self.cookies
+            .extend(auth.cookies.into_iter().map(|(name, value)| (name.to_owned(), value)));
+        let mut cookie = self
+            .cookies
+            .iter()
+            .map(|(name, value)| format!("{name}={}", utf8_percent_encode(value, COOKIE_VALUE)))
+            .collect::<Vec<_>>();
+        // A `Cookie` header of the call is merged with the cookies instead of replacing them.
+        for value in self.overrides.get_all("cookie") {
+            cookie.push(String::from_utf8_lossy(value.as_bytes()).into_owned());
+        }
+        self.overrides.remove("cookie");
+        if !cookie.is_empty() {
+            let mut value = HeaderValue::try_from(cookie.join("; ")).map_err(request_error)?;
+            value.set_sensitive(true);
+            self.headers.insert("cookie", value);
         }
         for name in self.overrides.keys() {
             self.headers.remove(name);
@@ -500,6 +625,8 @@ impl Request {
             && self.multipart.as_ref().is_none_or(Multipart::replayable);
         let max_retries = self.max_retries.unwrap_or(conf.max_retries) as usize;
         let mut retries = 0;
+        // An access token the API rejects is replaced once, without using up a retry.
+        let mut renewed = false;
         loop {
             let attempt = self.attempt(conf, event_stream).await;
             if let Attempt::Done(status, headers, body) = attempt {
@@ -508,6 +635,24 @@ impl Request {
                     headers,
                     body,
                 });
+            }
+            if let (Attempt::Status(StatusCode::UNAUTHORIZED, ..), Some(used), false, true) =
+                (&attempt, &oauth, renewed, replayable)
+            {
+                let sent = self.headers.get(AUTHORIZATION).map(HeaderValue::as_bytes);
+                if sent == Some(format!("Bearer {}", used.token).as_bytes()) {
+                    renewed = true;
+                    if let Some(client) = &conf.credentials.oauth {
+                        client.invalidate(&used.key, &used.token).await;
+                    }
+                    let fresh = oauth_token(conf, used.url, used.scope).await?;
+                    let mut value = HeaderValue::try_from(format!("Bearer {}", fresh.token))
+                        .map_err(request_error)?;
+                    value.set_sensitive(true);
+                    self.headers.insert(AUTHORIZATION, value);
+                    oauth = Some(fresh);
+                    continue;
+                }
             }
             if !(idempotent && replayable && attempt.retryable()) || retries >= max_retries {
                 return Err(attempt.into_error());
@@ -565,10 +710,24 @@ impl Request {
 
         let mut path = self.path.to_owned();
         for (name, value) in &self.path_params {
+            if value == "." || value == ".." {
+                return Err(format!(
+                    "path parameter `{name}` is `{value}`, which the URL would resolve away"
+                )
+                .into());
+            }
             let value = utf8_percent_encode(value, PATH_SEGMENT).to_string();
             path = path.replace(&format!("{{{name}}}"), &value);
         }
-        let mut uri = format!("{}{path}", conf.base_path.trim_end_matches('/'));
+        for (name, value) in &self.encoded_path_params {
+            path = path.replace(&format!("{{{name}}}"), value);
+        }
+        // The token endpoint of an OAuth2 scheme may live elsewhere.
+        let mut uri = if path.contains("://") {
+            path.clone()
+        } else {
+            format!("{}{path}", conf.base_path.trim_end_matches('/'))
+        };
         if !self.query_params.is_empty() {
             let mut query = url::form_urlencoded::Serializer::new(String::new());
             for (name, value) in &self.query_params {
@@ -617,6 +776,93 @@ impl Request {
         Ok(request)
     }
 }
+
+/// The access token of the OAuth2 scheme with token URL `url`: the cached one, else a new one.
+///
+/// Fetching a token sends a request, which may fetch a token: the future is boxed behind a named
+/// type so the compiler proves it `Send` without following that cycle.
+fn oauth_token<'a>(
+    conf: &'a Configuration,
+    url: &'static str,
+    scope: &'static str,
+) -> SyncFuture<'a, Result<OAuthUse, Error>> {
+    SyncFuture::new(async move {
+        let client = conf
+            .credentials
+            .oauth
+            .as_ref()
+            .ok_or_else(|| request_error("no OAuth2 client credentials"))?;
+        let key = if url.contains("://") {
+            url.to_owned()
+        } else {
+            format!("{}{url}", conf.base_path.trim_end_matches('/'))
+        };
+        let fetch = SyncFuture::new(fetch_token(conf, url, scope));
+        let token = client.token(&key, fetch).await?;
+        Ok(OAuthUse {
+            url,
+            scope,
+            key,
+            token,
+        })
+    })
+}
+
+/// Requests an access token with the client credentials grant, through the client's middleware,
+/// timeout and retries like any other request. Gives the token and its lifetime, if declared.
+async fn fetch_token(
+    conf: &Configuration,
+    token_url: &'static str,
+    scope: &str,
+) -> Result<(String, Option<Duration>), Error> {
+    #[derive(serde::Deserialize)]
+    struct Grant {
+        access_token: String,
+        #[serde(default)]
+        expires_in: Option<serde_json::Value>,
+    }
+
+    let client = conf
+        .credentials
+        .oauth
+        .as_ref()
+        .ok_or_else(|| request_error("no OAuth2 client credentials"))?;
+    let mut form = serde_json::Map::new();
+    form.insert("grant_type".to_owned(), "client_credentials".into());
+    if !scope.is_empty() {
+        form.insert("scope".to_owned(), scope.into());
+    }
+    let mut request = Request::new(Method::POST, token_url).with_security(&[]);
+    if client.in_body {
+        form.insert("client_id".to_owned(), client.client_id.clone().into());
+        form.insert("client_secret".to_owned(), client.client_secret.clone().into());
+    } else {
+        // RFC 6749 2.3.1: both are form-encoded before the base64.
+        let encode = |value: &str| url::form_urlencoded::byte_serialize(value.as_bytes()).collect::<String>();
+        let credentials = format!("{}:{}", encode(&client.client_id), encode(&client.client_secret));
+        request = request.with_authorization(format!("Basic {}", base64(credentials.as_bytes())));
+    }
+    request = request.with_form_body_param(serde_json::Value::Object(form), &[], &[]);
+    let received = request.send(conf, false).await?;
+    let grant: Grant = serde_json::from_slice(&received.body.bytes()?).map_err(decode_error)?;
+    if grant.access_token.is_empty() {
+        return Err(decode_error("the token endpoint answered without an access_token"));
+    }
+    let seconds = match grant.expires_in {
+        Some(serde_json::Value::Number(number)) => number.as_f64(),
+        Some(serde_json::Value::String(text)) => text.trim().parse::<f64>().ok(),
+        _ => None,
+    };
+    let lifetime = seconds.and_then(|seconds| Duration::try_from_secs_f64(seconds.max(0.0)).ok());
+    Ok((grant.access_token, lifetime))
+}
+
+/// Everything but the unreserved characters, which keeps a cookie value RFC 6265 safe.
+const COOKIE_VALUE: &AsciiSet = &NON_ALPHANUMERIC
+    .remove(b'-')
+    .remove(b'.')
+    .remove(b'_')
+    .remove(b'~');
 
 fn header(name: &str, value: &str) -> Result<(HeaderName, HeaderValue), BoxError> {
     Ok((HeaderName::from_bytes(name.as_bytes())?, HeaderValue::try_from(value)?))
@@ -668,11 +914,12 @@ pub(crate) fn random() -> u64 {
 fn httpdate(value: &str) -> Option<SystemTime> {
     let mut parts = value.split_whitespace().skip(1);
     let day: u64 = parts.next()?.parse().ok()?;
+    let month = parts.next()?;
     let month = [
         "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
     ]
     .iter()
-    .position(|m| Some(*m) == parts.next())? as u64
+    .position(|m| *m == month)? as u64
         + 1;
     let year: u64 = parts.next()?.parse().ok()?;
     let mut time = parts.next()?.split(':').map(|n| n.parse::<u64>().ok());
@@ -739,6 +986,79 @@ fn flatten_param(prefix: String, value: &serde_json::Value, out: &mut Vec<(Strin
             }
         }
         value => out.extend(scalar_text(value).map(|text| (prefix, text))),
+    }
+}
+
+/// A path parameter serialized by its OpenAPI `style` (`simple`, `label`, `matrix`; `json` for
+/// `content`), each part percent-encoded.
+fn encode_path_param(
+    name: &str,
+    value: &serde_json::Value,
+    style: &str,
+    explode: bool,
+) -> String {
+    const UNRESERVED: &AsciiSet = &percent_encoding::NON_ALPHANUMERIC
+        .remove(b'-')
+        .remove(b'.')
+        .remove(b'_')
+        .remove(b'~');
+    let encode = |text: &str| utf8_percent_encode(text, UNRESERVED).to_string();
+    let text = |value: &serde_json::Value| match value {
+        serde_json::Value::Null => String::new(),
+        serde_json::Value::Array(_) | serde_json::Value::Object(_) => value.to_string(),
+        value => scalar_text(value).unwrap_or_default(),
+    };
+    if style == "json" {
+        return encode(&value.to_string());
+    }
+    let name = encode(name);
+    let (head, separator) = match style {
+        "label" => (".", "."),
+        "matrix" => (";", ";"),
+        _ => ("", ","),
+    };
+    match value {
+        serde_json::Value::Array(items) => {
+            let values: Vec<String> = items.iter().map(|item| encode(&text(item))).collect();
+            match (style, explode) {
+                ("matrix", true) => values.iter().map(|v| format!(";{name}={v}")).collect(),
+                ("matrix", false) => format!(";{name}={}", values.join(",")),
+                (_, explode) => {
+                    format!("{head}{}", values.join(if explode { separator } else { "," }))
+                }
+            }
+        }
+        serde_json::Value::Object(fields) => {
+            let pairs: Vec<(String, String)> = fields
+                .iter()
+                .map(|(key, value)| (encode(key), encode(&text(value))))
+                .collect();
+            let flat = || {
+                let flat: Vec<&str> = pairs
+                    .iter()
+                    .flat_map(|(k, v)| [k.as_str(), v.as_str()])
+                    .collect();
+                flat.join(",")
+            };
+            match (style, explode) {
+                ("matrix", true) => pairs.iter().map(|(k, v)| format!(";{k}={v}")).collect(),
+                ("matrix", false) => format!(";{name}={}", flat()),
+                (_, true) => {
+                    let pairs: Vec<String> = pairs.iter().map(|(k, v)| format!("{k}={v}")).collect();
+                    format!("{head}{}", pairs.join(separator))
+                }
+                (_, false) => format!("{head}{}", flat()),
+            }
+        }
+        scalar => {
+            let value = encode(&text(scalar));
+            match style {
+                "label" => format!(".{value}"),
+                "matrix" if value.is_empty() => format!(";{name}"),
+                "matrix" => format!(";{name}={value}"),
+                _ => value,
+            }
+        }
     }
 }
 

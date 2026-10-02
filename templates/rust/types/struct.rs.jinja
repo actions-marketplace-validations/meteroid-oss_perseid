@@ -1,4 +1,4 @@
-{% from "types/macros.rs.jinja" import default_trait, extra_field, extra_name, struct_fields, struct_new, union_enums, union_imports -%}
+{% from "types/macros.rs.jinja" import default_trait, extra_field, extra_name, rust_type, struct_fields, struct_new, union_enums, union_imports, union_name -%}
 use serde::{Deserialize, Serialize};
 
 {% if referenced_components -%}
@@ -12,6 +12,13 @@ use super::{
 
 {% set recursive = recursive_refs | map("to_upper_camel_case") | list -%}
 {% set type_name = type.name | to_upper_camel_case -%}
+{#- The properties beyond the declared ones land in the flattened `extra` map, typed by the
+    `additionalProperties` schema when it declares one. -#}
+{% set typed_extra = type.additional_properties is defined -%}
+{% set extra_union = union_name(type_name, "additional_properties", type.additional_properties) if typed_extra else "" -%}
+{% set extra_value = (rust_type(type.additional_properties.value_type(), extra_union) | trim) if typed_extra else "serde_json::Value" -%}
+{% set extra_type = "" if extra_value == "serde_json::Value" else "std::collections::HashMap<String, " ~ extra_value ~ ">" -%}
+{% set extra_unions = [{"name": "additional_properties", "type": type.additional_properties}] if typed_extra else [] -%}
 {% set defaults = type.discriminator_defaults | default({}) -%}
 {% set required = type.fields | selectattr("required") | rejectattr("nullable") | list -%}
 {% set defaulted = required | selectattr("name", "in", defaults) | map(attribute="name") | list -%}
@@ -24,11 +31,11 @@ use super::{
 {% set extra = extra_name(type.fields) -%}
 pub struct {{ type_name }} {
     {{ struct_fields(type.fields, recursive, patch_body, owner=type_name) }}
-    {{- extra_field(extra) }}
+    {{- extra_field(extra, extra_type) }}
 }
 
 impl {{ type_name }} {
-    {{ struct_new(type.fields, recursive, owner=type_name, defaults=defaults, extra=extra) }}
+    {{ struct_new(type.fields, recursive, owner=type_name, defaults=defaults, extra=extra, extra_type=extra_type) }}
 }
 {% if has_default and defaulted %}
 
@@ -46,9 +53,9 @@ impl {{ default_trait() }} for {{ type_name }} {
             {{ field.name | to_rust_ident }}: {{ default_trait() }}::default(),
             {% endif -%}
             {% endfor -%}
-            {% if extra %}{{ extra }}: serde_json::Map::new(),{% endif %}
+            {% if extra %}{{ extra }}: {% if extra_type %}std::collections::HashMap::new(){% else %}serde_json::Map::new(){% endif %},{% endif %}
         }
     }
 }
 {% endif %}
-{{ union_enums(type_name, type.fields) }}
+{{ union_enums(type_name, type.fields + extra_unions) }}

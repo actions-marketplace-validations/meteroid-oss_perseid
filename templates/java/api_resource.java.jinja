@@ -15,6 +15,26 @@
 {% set UPLOAD = root ~ "streaming.Upload" if "Upload" in models else "Upload" -%}
 {% set MULTIPART = root ~ "streaming.Multipart" if "Multipart" in models else "Multipart" -%}
 {% set http_client_type = sdk.client_name ~ "HttpClient" -%}
+{#- The unions of request and response bodies, declared once in the blocking class: their name and type. -#}
+{% set bu = namespace(names=[], decls=[]) -%}
+{% for op in resource.operations -%}
+    {#- Body unions may be named after a schema, as the spec spells it. -#}
+    {% if op.request_body_union is defined and op.request_body_json_type is defined and op.request_body_union | to_upper_camel_case not in bu.names -%}
+        {% set bu.names = bu.names + [op.request_body_union | to_upper_camel_case] -%}
+        {% set bu.decls = bu.decls + [[op.request_body_json_type, op.request_body_union | to_upper_camel_case]] -%}
+    {% endif -%}
+    {% if op.response_body_union is defined and op.response_body_json_type is defined and op.response_body_union | to_upper_camel_case not in bu.names -%}
+        {% set bu.names = bu.names + [op.response_body_union | to_upper_camel_case] -%}
+        {% set bu.decls = bu.decls + [[op.response_body_json_type, op.response_body_union | to_upper_camel_case]] -%}
+    {% endif -%}
+    {#- An event schema that is an alias of a union: the union, named after the alias. -#}
+    {% if op.event_json_type is defined and m.has_union(op.event_json_type) and op.event_schema_name | to_upper_camel_case not in bu.names -%}
+        {% set bu.names = bu.names + [op.event_schema_name | to_upper_camel_case] -%}
+        {% set bu.decls = bu.decls + [[op.event_json_type, op.event_schema_name | to_upper_camel_case]] -%}
+    {% endif -%}
+{% endfor -%}
+{#- Aliases have no model class: their target is imported instead. -#}
+{% set alias_events = resource.operations | selectattr("event_json_type", "defined") | map(attribute="event_schema_name") | list -%}
 {#- Everything both resource classes need of each operation. -#}
 {% set ops = namespace(list=[]) -%}
 {% for op in resource.operations -%}
@@ -24,7 +44,11 @@
     {% set returns = "returningNothing()" -%}
     {% set res_type = "Void" -%}
     {% if op.response_is_event_stream -%}
-        {% if op.event_schema_name is defined -%}
+        {% if op.event_json_type is defined -%}
+            {% set event_ty = m.java_type(op.event_json_type, resource_type_name ~ "." ~ (op.event_schema_name | to_upper_camel_case)) -%}
+            {% set res_type = STREAM ~ "<" ~ event_ty ~ ">" -%}
+            {% set returns = "returningEvents(new TypeReference<" ~ event_ty ~ ">() {})" -%}
+        {% elif op.event_schema_name is defined -%}
             {% set event_ty = op.event_schema_name | to_upper_camel_case -%}
             {% set res_type = STREAM ~ "<" ~ event_ty ~ ">" -%}
             {% set returns = "returningEvents(" ~ event_ty ~ ".class)" -%}
@@ -35,8 +59,11 @@
     {% elif op.response_is_binary -%}
         {% set res_type = "byte[]" -%}
         {% set returns = "returningBytes()" -%}
+    {% elif op.response_is_text -%}
+        {% set res_type = "String" -%}
+        {% set returns = "returningText()" -%}
     {% elif op.response_body_json_type is defined -%}
-        {% set res_type = op.response_body_json_type.to_java() -%}
+        {% set res_type = m.java_type(op.response_body_json_type, resource_type_name ~ "." ~ (op.response_body_union | to_upper_camel_case)) if op.response_body_union is defined else op.response_body_json_type.to_java() -%}
         {% set returns = "returning(new TypeReference<" ~ res_type ~ ">() {})" -%}
     {% elif op.response_body_schema_name is defined -%}
         {% set res_item = op.response_body_schema_name | to_upper_camel_case -%}
@@ -56,7 +83,8 @@
     {% set has_body = op.request_body_schema_name is defined or op.request_body_json_type is defined -%}
     {#- Positional parameters: path, then required query and header parameters. -#}
     {% set required = (op.query_params + op.header_params) | selectattr("required") | list -%}
-    {% set positional = op.path_params + (required | map(attribute="name") | list) -%}
+    {#- Identifiers come from `ident`, unique among the operation's parameters. -#}
+    {% set positional = op.path_params + (required | map(attribute="ident") | list) -%}
     {% set arg_names = positional | idents("camel", "java", op_owner) -%}
     {% set body_var = "body" -%}
     {% if op.request_body_schema_name is defined -%}
@@ -67,7 +95,7 @@
             {% set body_var = "body" -%}
         {% endif -%}
     {% elif op.request_body_json_type is defined -%}
-        {% set body_type = op.request_body_json_type.to_java() -%}
+        {% set body_type = m.java_type(op.request_body_json_type, resource_type_name ~ "." ~ (op.request_body_union | to_upper_camel_case)) if op.request_body_union is defined else op.request_body_json_type.to_java() -%}
     {% elif op.request_body_kind == "binary" -%}
         {% set body_type = UPLOAD -%}
     {% elif op.request_body_kind == "multipart" -%}
@@ -77,10 +105,15 @@
     {% set pd = namespace(params="", args="", docs=[]) -%}
     {% for p in positional -%}
         {% set is_path = loop.index0 < op.path_params | length -%}
-        {% set ty = "String" if is_path else ((required[loop.index0 - op.path_params | length].type.to_java() if required[loop.index0 - op.path_params | length].type is defined else "String")) -%}
+        {#- Path parameters are strings, unless their style types them (lists, objects, JSON). -#}
+        {% if is_path -%}
+            {% set ty = op.path_styles[p].type.to_java() if p in op.path_styles and op.path_styles[p].type is defined else "String" -%}
+        {% else -%}
+            {% set ty = required[loop.index0 - op.path_params | length].type.to_java() if required[loop.index0 - op.path_params | length].type is defined else "String" -%}
+        {% endif -%}
         {% set pd.params = pd.params ~ "final " ~ ty ~ " " ~ arg_names[loop.index0] ~ ", " -%}
         {% set pd.args = pd.args ~ arg_names[loop.index0] ~ ", " -%}
-        {% set pd.docs = pd.docs + ["@param " ~ arg_names[loop.index0] ~ " the {@code " ~ m.html(p) ~ "} " ~ ("path" if is_path else "required") ~ " parameter"] -%}
+        {% set pd.docs = pd.docs + ["@param " ~ arg_names[loop.index0] ~ " the {@code " ~ m.html(p if is_path else required[loop.index0 - op.path_params | length].name) ~ "} " ~ ("path" if is_path else "required") ~ " parameter"] -%}
     {% endfor -%}
     {% if has_any_body -%}
         {% set pd.params = pd.params ~ "final " ~ body_type ~ " " ~ body_var ~ ", " -%}
@@ -96,22 +129,21 @@
     {% if op.pagination is defined -%}
         {% set pg = op.pagination -%}
         {% set all_params = op.query_params + op.header_params -%}
-        {% set field_names = all_params | map(attribute="name") | list | idents("camel", "java", op_owner) -%}
-        {% set pp = namespace(positional=-1, field="", type="String") -%}
-        {% for p in all_params if p.name == pg.param -%}
-            {% set pp.type = p.type.to_java() -%}
-        {% endfor -%}
+        {% set field_names = all_params | map(attribute="ident") | list | idents("camel", "java", op_owner) -%}
+        {#- The query parameter selecting the page; a header may share its wire name. -#}
+        {% set page_param = op.query_params | selectattr("name", "equalto", pg.param) | first -%}
+        {% set pp = namespace(positional=-1, field="", type=page_param.type.to_java()) -%}
         {% for p in positional -%}
-            {% if loop.index0 >= op.path_params | length and p == pg.param %}{% set pp.positional = loop.index0 %}{% endif -%}
+            {% if loop.index0 >= op.path_params | length and p == page_param.ident %}{% set pp.positional = loop.index0 %}{% endif -%}
         {% endfor -%}
         {% for p in all_params -%}
-            {% if p.name == pg.param -%}
+            {% if p.ident == page_param.ident -%}
                 {% set f = field_names[loop.index0] -%}
                 {% set pp.field = f ~ "_" if f in ["builder", "toBuilder", "hashCode", "toString", "getClass", "build"] else f -%}
             {% endif -%}
         {% endfor -%}
-        {% set zero = "0L" if pp.type == "Long" else "0" -%}
-        {% set first = (pg.first_page ~ "L") if pp.type == "Long" else (pg.first_page | string) -%}
+        {% set zero = "0L" if pp.type == "Long" else "BigInteger.ZERO" if pp.type == "BigInteger" else "0" -%}
+        {% set first = (pg.first_page ~ "L") if pp.type == "Long" else ("BigInteger.valueOf(" ~ pg.first_page ~ ")") if pp.type == "BigInteger" else (pg.first_page | string) -%}
         {% set start = {"cursor": "null", "page": first, "offset": zero}[pg.style] -%}
         {% if pp.positional >= 0 -%}
             {% set current = arg_names[pp.positional] -%}
@@ -306,6 +338,7 @@ import {{ sdk.java_internal_package }}.Utils;
 {% if has_streams and SSE == "SseEvent" %}import {{ sdk.java_package }}.streaming.SseEvent;
 {% endif -%}
 import java.math.BigDecimal;
+import java.math.BigInteger;
 import java.net.URI;
 import java.time.OffsetDateTime;
 import java.util.List;
@@ -313,7 +346,7 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
-{% for c in referenced_components -%}
+{% for c in referenced_components if c not in alias_events -%}
 import {{ sdk.java_package }}.models.{{ c | to_upper_camel_case }};
 {% endfor %}
 
@@ -396,6 +429,7 @@ import {{ sdk.java_internal_package }}.Utils;
 {% endif -%}
 
 import java.math.BigDecimal;
+import java.math.BigInteger;
 import java.net.URI;
 import java.time.OffsetDateTime;
 import java.util.List;
@@ -404,10 +438,17 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 import com.fasterxml.jackson.core.type.TypeReference;
+{% if bu.decls -%}
+import com.fasterxml.jackson.annotation.JsonValue;
+import com.fasterxml.jackson.databind.DeserializationContext;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.annotation.JsonDeserialize;
+import java.io.IOException;
+{% endif -%}
 import okhttp3.Headers;
 import okhttp3.HttpUrl;
 {% for c in referenced_components -%}
-{% if c | to_upper_camel_case != resource_type_name -%}
+{% if c | to_upper_camel_case != resource_type_name and c not in alias_events -%}
 import {{ sdk.java_package }}.models.{{ c | to_upper_camel_case }};
 {% endif -%}
 {% endfor %}
@@ -447,8 +488,12 @@ public final class {{ resource_type_name }} {
 {% for op in resource.operations if op.request_body_kind == "multipart" %}
     {% set owner = "operation `" ~ op.id ~ "`" -%}
     {% set fields = op.multipart_fields | map(attribute="name") | list | idents("camel", "java", owner) -%}
-    {% set mp = namespace(vars=[]) -%}
+    {% set mp = namespace(vars=[], types=[]) -%}
     {% for f in fields %}{% set mp.vars = mp.vars + [f ~ "_" if f in ["builder", "toBuilder", "hashCode", "toString", "getClass", "build"] else f] %}{% endfor -%}
+    {#- A list of files is sent as repeated parts. -#}
+    {% for field in op.multipart_fields -%}
+        {% set mp.types = mp.types + [(("List<" ~ UPLOAD ~ ">") if field.is_file_list else UPLOAD) if field.is_file else field.type.to_java()] -%}
+    {% endfor -%}
     {% set body_cls = op.name | to_upper_camel_case ~ "Body" -%}
     /**
      * Multipart form fields of {@link #{{ op.name | ident("camel", "java") }}}, immutable: build them with
@@ -456,13 +501,13 @@ public final class {{ resource_type_name }} {
      */
     public static final class {{ body_cls }} {
         {% for field in op.multipart_fields -%}
-        private final {% if field.is_file %}{{ UPLOAD }}{% else %}{{ field.type.to_java() }}{% endif %} {{ mp.vars[loop.index0] }};
+        private final {{ mp.types[loop.index0] }} {{ mp.vars[loop.index0] }};
         {% endfor %}
 
         private {{ body_cls }}(Builder builder) {
             {% for field in op.multipart_fields -%}
             {% set v = mp.vars[loop.index0] -%}
-            this.{{ v }} = {{ "Utils.copyList(builder." ~ v ~ ")" if field.type.is_list() and not field.is_file else "builder." ~ v }};
+            this.{{ v }} = {{ "Utils.copyList(builder." ~ v ~ ")" if (field.type.is_list() and not field.is_file) or field.is_file_list else "builder." ~ v }};
             {% endfor -%}
         }
 
@@ -475,7 +520,7 @@ public final class {{ resource_type_name }} {
             return new Builder();
         }
         {% for field in op.multipart_fields %}
-        {% set ty = UPLOAD if field.is_file else field.type.to_java() %}
+        {% set ty = mp.types[loop.index0] %}
 
 {% set text -%}
 {% if field.description is defined %}{{ m.html(field.description) }}{% else %}The {@code {{ m.html(field.name) }}} field.{% endif %}
@@ -497,12 +542,12 @@ public final class {{ resource_type_name }} {
         /** Builds {@link {{ body_cls }}}. */
         public static final class Builder {
             {% for field in op.multipart_fields -%}
-            private {% if field.is_file %}{{ UPLOAD }}{% else %}{{ field.type.to_java() }}{% endif %} {{ mp.vars[loop.index0] }};
+            private {{ mp.types[loop.index0] }} {{ mp.vars[loop.index0] }};
             {% endfor %}
 
             private Builder() {}
             {% for field in op.multipart_fields %}
-            {% set ty = UPLOAD if field.is_file else field.type.to_java() %}
+            {% set ty = mp.types[loop.index0] %}
             {% set v = mp.vars[loop.index0] %}
 
 {% set text -%}
@@ -536,6 +581,10 @@ public final class {{ resource_type_name }} {
     }
 {% endfor %}
 
+{% for d in bu.decls %}
+    {{ m.union_class(d[0], d[1], bu.names) | indent(4) }}
+{% endfor %}
+
 {% for o in ops.list -%}
     {% set op = o.op -%}
     {{ overloads(o, "void" if o.type == "Void" else o.type, "send", "", "the response body" ~ o.empty_note if o.type != "Void" else "") | indent(4) }}
@@ -549,16 +598,17 @@ public final class {{ resource_type_name }} {
     {% endif -%}
     {% set op_owner = "operation `" ~ op.id ~ "`" -%}
     {% set required = (op.query_params + op.header_params) | selectattr("required") | list -%}
-    {% set positional = op.path_params + (required | map(attribute="name") | list) -%}
+    {#- Identifiers come from `ident`, unique among the operation's parameters. -#}
+    {% set positional = op.path_params + (required | map(attribute="ident") | list) -%}
     {% set arg_names = positional | idents("camel", "java", op_owner) -%}
-    {% set all_names = (op.query_params + op.header_params) | map(attribute="name") | list | idents("camel", "java", op_owner) -%}
-    {% set all_pascals = (op.query_params + op.header_params) | map(attribute="name") | list | idents("pascal", "java", op_owner) -%}
+    {% set all_names = (op.query_params + op.header_params) | map(attribute="ident") | list | idents("camel", "java", op_owner) -%}
+    {% set all_pascals = (op.query_params + op.header_params) | map(attribute="ident") | list | idents("pascal", "java", op_owner) -%}
     {#- The expression reading each query and header parameter. -#}
     {% set pv = namespace(exprs=[]) -%}
     {% for p in op.query_params + op.header_params -%}
         {% if p.required -%}
             {% set found = namespace(i=-1) -%}
-            {% for name in positional %}{% if loop.index0 >= op.path_params | length and name == p.name and found.i < 0 %}{% set found.i = loop.index0 %}{% endif %}{% endfor -%}
+            {% for name in positional %}{% if loop.index0 >= op.path_params | length and name == p.ident and found.i < 0 %}{% set found.i = loop.index0 %}{% endif %}{% endfor -%}
             {% set pv.exprs = pv.exprs + [arg_names[found.i]] -%}
         {% else -%}
             {% set f = all_names[loop.index0] -%}
@@ -580,7 +630,7 @@ public final class {{ resource_type_name }} {
         {% if (o.has_body or op.request_body_kind in ["binary", "multipart"]) and not op.request_body_optional -%}
         Objects.requireNonNull({{ o.body_var }}, "body");
         {% endif -%}
-        {% set ns = namespace(literal=[], calls=[], expr="") -%}
+        {% set ns = namespace(literal=[], calls=[], expr="", styled=false) -%}
         {% set path_and_query = op.path | split("?") | list -%}
         {% for segment in (path_and_query[0] | split("/") | list)[1:] -%}
             {% if "{" in segment -%}
@@ -589,12 +639,28 @@ public final class {{ resource_type_name }} {
                     {% set ns.literal = [] -%}
                 {% endif -%}
                 {% set ns.expr = segment | tojson -%}
+                {% set ns.styled = false -%}
+                {% for p in op.path_params if p in op.path_styles and ("{" ~ p ~ "}") in segment -%}
+                    {% set ns.styled = true -%}
+                {% endfor -%}
+                {#- A styled parameter is encoded here, and so are the plain ones sharing its segment. -#}
                 {% for p in op.path_params -%}
-                    {% set ns.expr = ns.expr | replace("{" ~ p ~ "}", "\" + " ~ arg_names[loop.index0] ~ " + \"") -%}
+                    {% if p in op.path_styles -%}
+                        {% set ps = op.path_styles[p] -%}
+                        {% set ns.expr = ns.expr | replace("{" ~ p ~ "}", "\" + Utils.encodePathParam(" ~ (p | tojson) ~ ", " ~ arg_names[loop.index0] ~ ", " ~ (ps.style | tojson) ~ ", " ~ (ps.explode | lower) ~ ") + \"") -%}
+                    {% elif ns.styled -%}
+                        {% set ns.expr = ns.expr | replace("{" ~ p ~ "}", "\" + Utils.encodePathValue(" ~ (p | tojson) ~ ", " ~ arg_names[loop.index0] ~ ") + \"") -%}
+                    {% else -%}
+                        {% set ns.expr = ns.expr | replace("{" ~ p ~ "}", "\" + " ~ arg_names[loop.index0] ~ " + \"") -%}
+                    {% endif -%}
                 {% endfor -%}
                 {% set expr = ns.expr | replace("\"\" + ", "") | replace(" + \"\"", "") -%}
                 {% set name = segment[1:-1] if segment[1:-1] in op.path_params else segment -%}
-                {% set ns.calls = ns.calls + [".addPathSegment(Utils.pathSegment(" ~ (name | tojson) ~ ", " ~ expr ~ "))"] -%}
+                {% if ns.styled -%}
+                    {% set ns.calls = ns.calls + [".addEncodedPathSegment(Utils.encodedPathSegment(" ~ (name | tojson) ~ ", " ~ expr ~ "))"] -%}
+                {% else -%}
+                    {% set ns.calls = ns.calls + [".addPathSegment(Utils.pathSegment(" ~ (name | tojson) ~ ", " ~ expr ~ "))"] -%}
+                {% endif -%}
             {% else -%}
                 {% set ns.literal = ns.literal + [segment] -%}
             {% endif -%}
@@ -615,7 +681,11 @@ public final class {{ resource_type_name }} {
         {% set typed_union = m.typed_param_union(p) == "true" -%}
         {% set var = pv.exprs[loop.index0] if p.required else "value" ~ loop.index -%}
         {% set add -%}
-            {% if p.structured or typed_union -%}
+            {% if p.json -%}
+            Utils.addJsonQueryParameter(url, {{ p.name | tojson }}, {{ var }});
+            {% elif p.delimiter is defined -%}
+            Utils.addDelimitedQueryParameter(url, {{ p.name | tojson }}, {{ var }}, {{ p.delimiter | tojson }});
+            {% elif p.structured or typed_union -%}
             Utils.addStructuredQueryParameter(url, {{ p.name | tojson }}, {{ var }}, {{ p.deep_object | lower }}, {{ explode | lower }});
             {% elif (p.type.is_list() or p.type.is_set()) and explode -%}
             Utils.addExplodedQueryParameter(url, {{ p.name | tojson }}, {{ var }});
@@ -644,13 +714,21 @@ public final class {{ resource_type_name }} {
         Headers.Builder headers = new Headers.Builder();
         {% for p in op.header_params -%}
         {% set value = pv.exprs[op.query_params | length + loop.index0] -%}
+        {% set var = value if p.required else "header" ~ loop.index -%}
+        {#- Cookies add up into one `Cookie` header; `content: application/json` headers are JSON text. -#}
+        {% set put -%}
+            {% if p.cookie -%}
+            headers.add("Cookie", Utils.cookiePair({{ p.name | tojson }}, {% if p.json %}Utils.json({{ var }}){% else %}{{ var }}{% endif %}));
+            {%- else -%}
+            headers.set({{ p.name | tojson }}, {% if p.json %}Utils.json({{ var }}){% else %}{{ var }}{% endif %});
+            {%- endif %}
+        {% endset -%}
         {% if p.required -%}
-        headers.set({{ p.name | tojson }}, {{ value }});
+        {{ put | trim }}
         {% else -%}
-        {% set var = "header" ~ loop.index -%}
-        String {{ var }} = {{ value }};
+        {{ p.type.to_java() if p.json else "String" }} {{ var }} = {{ value }};
         if ({{ var }} != null) {
-            headers.set({{ p.name | tojson }}, {{ var }});
+            {{ put | trim }}
         }
         {% endif -%}
         {% endfor -%}
@@ -668,14 +746,14 @@ public final class {{ resource_type_name }} {
                 {%- for field in op.multipart_fields %}
                 {%- set f = fields[loop.index0] %}
                 {%- set f = f ~ "_" if f in ["builder", "toBuilder", "hashCode", "toString", "getClass", "build"] else f %}
-                    .{% if field.is_file %}file{% else %}field{% endif %}({{ field.name | tojson }}, {{ body_var }}.{{ f }}(){% if not field.required %}.orElse(null){% endif %})
+                    .{% if field.is_file and field.is_file_list %}files{% elif field.is_file %}file{% else %}field{% endif %}({{ field.name | tojson }}, {{ body_var }}.{{ f }}(){% if not field.required %}.orElse(null){% endif %}{% if field.content_type is defined %}, {{ field.content_type | tojson }}{% elif field.is_file and field.is_file_list %}, null{% endif %})
                 {%- endfor %}
                     .build()
             {%- endset -%}
             {% set chain = chain + [".body(" ~ (body_var ~ " == null ? null : " if op.request_body_optional else "") ~ body_expr ~ ")"] -%}
         {% elif o.has_body and op.request_body_is_form -%}
             {% set chain = chain + [".form(" ~ body_var ~ ", List.of(" ~ (op.form_deep_object | default([]) | map("tojson") | join(", ")) ~ "), List.of(" ~ (op.form_unexploded | default([]) | map("tojson") | join(", ")) ~ "))"] -%}
-        {% elif o.has_body and op.stream_property is defined -%}
+        {% elif o.has_body and op.stream_property is defined and op.request_body_union is not defined -%}
             {% set setter = op.stream_property | ident("camel", "java") -%}
             {% set streamed = body_var ~ ".toBuilder()." ~ setter ~ "(true).build()" -%}
             {% set only_stream = "java.util.Map.of(" ~ (op.stream_property | tojson) ~ ", true)" -%}
@@ -731,16 +809,20 @@ public final class {{ resource_type_name }} {
         {% elif pg.style == "page" -%}
         {% if pg.total_pages is defined -%}
         long pages = {{ path_expr("response", pg.total_pages) }}.map(Number::longValue).orElse(Long.MAX_VALUE);
+        {% if T == "BigInteger" -%}
+        if (current.subtract({{ o.page.first }}).add(BigInteger.ONE).compareTo(BigInteger.valueOf(pages)) >= 0) {
+        {% else -%}
         if (current - {{ o.page.first }} + 1 >= pages) {
+        {% endif -%}
             return null;
         }
         {% endif -%}
-        return {{ narrow(T, "current + 1") }};
+        return {{ "current.add(BigInteger.ONE)" if T == "BigInteger" else narrow(T, "current + 1") }};
         {% else -%}
-        {{ T }} next = {{ narrow(T, "current + items.size()") }};
+        {{ T }} next = {{ "current.add(BigInteger.valueOf(items.size()))" if T == "BigInteger" else narrow(T, "current + items.size()") }};
         {% if pg.total is defined -%}
         long total = {{ path_expr("response", pg.total) }}.map(Number::longValue).orElse(Long.MAX_VALUE);
-        if (next >= total) {
+        if ({{ "next.compareTo(BigInteger.valueOf(total)) >= 0" if T == "BigInteger" else "next >= total" }}) {
             return null;
         }
         {% endif -%}

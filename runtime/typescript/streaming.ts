@@ -86,7 +86,9 @@ export class Stream<T> implements AsyncIterable<T> {
         }
       }
     } finally {
-      await reader.cancel().catch(() => undefined);
+      // Not awaited: cancelling one branch of a teed body (a cloned response) only settles
+      // once every branch is cancelled, which would hang the loop on its way out.
+      reader.cancel().catch(() => undefined);
     }
   }
 }
@@ -101,7 +103,7 @@ export class EventStream extends Stream<SseEvent> {
 
 class SseParser {
   public id?: string;
-  private retry?: number;
+  private retry: number | undefined;
   private line = "";
   private data = "";
   private event = "";
@@ -145,7 +147,10 @@ class SseParser {
       }
       const data = this.data.slice(0, -1);
       this.data = "";
-      return { event, data, id: this.id, retry: this.retry };
+      // A `retry` field applies to the event it arrives on, unlike the id.
+      const retry = this.retry;
+      this.retry = undefined;
+      return { event, data, id: this.id, retry };
     }
     if (line.startsWith(":")) {
       return undefined;
@@ -190,28 +195,33 @@ export class MultipartBody {
   public readonly boundary = `perseid-${Math.random().toString(36).slice(2)}${Date.now()}`;
   private readonly parts: BlobPart[] = [];
 
-  /** Adds a field: scalars as text, objects as JSON, lists as one part per item. */
-  public field(name: string, value: unknown): this {
+  /**
+   * Adds a field: scalars as text, objects as JSON, lists as one part per item. `contentType`
+   * is the media type the spec declares for the part.
+   */
+  public field(name: string, value: unknown, contentType?: string): this {
     if (Array.isArray(value)) {
-      value.forEach((item) => this.field(name, item));
+      value.forEach((item) => this.field(name, item, contentType));
       return this;
     }
     const json = typeof value === "object" && value !== null;
+    const declared = contentType ?? (json ? "application/json" : undefined);
     this.parts.push(
       `--${this.boundary}\r\nContent-Disposition: form-data; name="${quoted(name)}"\r\n` +
-        (json ? "Content-Type: application/json\r\n" : "") +
+        (declared ? `Content-Type: ${declared}\r\n` : "") +
         `\r\n${json ? JSON.stringify(value) : String(value)}\r\n`
     );
     return this;
   }
 
-  public file(name: string, upload: Upload): this {
+  /** Adds a file part. `contentType` is the media type the spec declares, used unless the upload has its own. */
+  public file(name: string, upload: Upload, contentType?: string): this {
     const file = upload instanceof Blob || upload instanceof Uint8Array ? { data: upload } : upload;
     const filename = file.filename ?? (typeof File !== "undefined" && file.data instanceof File ? file.data.name : "file");
-    const contentType =
-      file.contentType ?? ((file.data instanceof Blob && file.data.type) || "application/octet-stream");
+    const partType =
+      file.contentType ?? ((file.data instanceof Blob && file.data.type) || contentType || "application/octet-stream");
     this.parts.push(
-      `--${this.boundary}\r\nContent-Disposition: form-data; name="${quoted(name)}"; filename="${quoted(filename)}"\r\nContent-Type: ${contentType}\r\n\r\n`,
+      `--${this.boundary}\r\nContent-Disposition: form-data; name="${quoted(name)}"; filename="${quoted(filename)}"\r\nContent-Type: ${partType}\r\n\r\n`,
       file.data as BlobPart,
       "\r\n"
     );

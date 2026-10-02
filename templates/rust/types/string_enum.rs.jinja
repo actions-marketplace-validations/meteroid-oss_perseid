@@ -4,14 +4,15 @@ use std::fmt;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 {% set name = type.name | to_upper_camel_case -%}
-{% set variants = type.values | map("to_rust_variant") | list -%}
+{% set names = type.values | enum_names -%}
+{% set variants = names | map("to_rust_variant") | list -%}
 {% set unknown = unknown_variant(variants) -%}
 {{ doc_comment }}
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[non_exhaustive]
 pub enum {{ name }} {
     {% for value in type.values -%}
-        {{ value | to_rust_variant }},
+        {{ variants[loop.index0] }},
     {% endfor -%}
     /// A value this version of the SDK does not know yet.
     {{ unknown }}(String),
@@ -23,7 +24,7 @@ impl {{ name }} {
     pub fn as_str(&self) -> &str {
         match self {
             {% for value in type.values -%}
-                Self::{{ value | to_rust_variant }} => {{ value | rust_str }},
+                Self::{{ variants[loop.index0] }} => {{ value | rust_str }},
             {% endfor -%}
             Self::{{ unknown }}(value) => value,
         }
@@ -34,7 +35,7 @@ impl From<&str> for {{ name }} {
     fn from(value: &str) -> Self {
         match value {
             {% for value in type.values -%}
-                {{ value | rust_str }} => Self::{{ value | to_rust_variant }},
+                {{ value | rust_str }} => Self::{{ variants[loop.index0] }},
             {% endfor -%}
             other => Self::{{ unknown }}(other.to_owned()),
         }

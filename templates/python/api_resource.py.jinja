@@ -1,4 +1,4 @@
-{% from "types/macros.py.jinja" import arg_type, docstring, field_ident, field_type, field_decl, has_object_union, is_flat_union, py_str, py_ident, py_type, param_type, resource_module, type_refs, union_refs -%}
+{% from "types/macros.py.jinja" import arg_type, docstring, field_ident, field_type, field_decl, has_object_union, is_flat_union, named_type, py_str, py_field, py_ident, py_type, param_type, resource_module, type_refs, union_refs, union_type -%}
 # this file is @generated
 {% if resource.subresources | length > 0 -%}
     {{ panic("resource `" ~ resource.name ~ "` has subresources, which the Python templates do not support yet") }}
@@ -26,7 +26,7 @@ from __future__ import annotations
     {%- set schema = types[op.request_body_schema_name] if op.request_body_schema_name is defined else none -%}
     {%- if schema and schema.kind == "struct" and not op.request_body_is_list | default(false)
         and op.request_body_kind in ["json", "form"] and not schema.fields | selectattr("flatten") | list -%}
-        {%- set params = (op.path_params | list) + (op.query_params | map(attribute="name") | list) + (op.header_params | map(attribute="name") | list) -%}
+        {%- set params = (op.path_params | list) + (op.query_params | map(attribute="ident") | list) + (op.header_params | map(attribute="ident") | list) -%}
         {%- set taken = (params | map("ident", "snake", "python") | list) + ["self", "t"] -%}
         {%- set out = namespace(indices=[], clash=false) -%}
         {%- for f in schema.fields -%}
@@ -51,13 +51,21 @@ from __future__ import annotations
         {% endfor -%}
     {% endif -%}
     {% if op.event_schema_name is defined and op.response_is_event_stream -%}
-        {% set extra_models.names = extra_models.names + [op.event_schema_name] -%}
+        {% set extra_models.names = extra_models.names + [op.event_schema_name | to_upper_camel_case] -%}
     {% endif -%}
+    {% for body_type in [op.request_body_json_type, op.response_body_json_type] if body_type is defined -%}
+        {% set extra_models.names = extra_models.names + (type_refs(body_type) | trim | split(" ") | reject("equalto", "") | list) -%}
+        {% if has_object_union(body_type) %}{% set extra_models.object_unions = true %}{% endif -%}
+    {% endfor -%}
+    {% for union_name in [op.request_body_union, op.response_body_union] if union_name is defined and union_name | to_upper_camel_case in names -%}
+        {% set extra_models.names = extra_models.names + [union_name | to_upper_camel_case] -%}
+    {% endfor -%}
     {% for p in op.query_params if p.typed_union is defined -%}
         {% set extra_models.names = extra_models.names + (union_refs(p.typed_union) | trim | split(" ") | reject("equalto", "") | list) -%}
     {% endfor -%}
 {% endfor -%}
-{% set models = ((referenced_components | list) + extra_models.names) | map("to_upper_camel_case") | unique | sort | list -%}
+{#- `extra_models` holds class names already: camel-casing `AB` again would make it `Ab`. -#}
+{% set models = ((referenced_components | map("to_upper_camel_case") | list) + extra_models.names) | unique | sort | list -%}
 {% if "multipart" in body_kinds %}import dataclasses
 {% endif -%}
 import typing as t
@@ -97,6 +105,14 @@ from .common import (
     decode_optional_response,
 {%- endif %}
     decode_response,
+{%- if resource.operations | selectattr("path_styles") | list | length > 0 %}
+    encode_path_param,
+{%- endif %}
+{%- set uses = namespace(json_header=false) %}
+{%- for op in resource.operations %}{% for p in op.header_params if p.json %}{% set uses.json_header = true %}{% endfor %}{% endfor %}
+{%- if uses.json_header %}
+    json_header,
+{%- endif %}
     serialize_form_body,
     serialize_query_params,
 )
@@ -139,9 +155,9 @@ from ._streaming import (
 {%- endmacro %}
 {#- An attribute path of the response, each optional step read through `step`. -#}
 {% macro accessor(root, path) -%}
-    {%- set expr = namespace(text=root ~ "." ~ py_ident(path[0])) -%}
+    {%- set expr = namespace(text=root ~ "." ~ py_field(path[0])) -%}
     {%- for key in path[1:] -%}
-        {%- set expr.text = "step(" ~ expr.text ~ ", lambda v: v." ~ py_ident(key) ~ ")" -%}
+        {%- set expr.text = "step(" ~ expr.text ~ ", lambda v: v." ~ py_field(key) ~ ")" -%}
     {%- endfor -%}
     {{ expr.text }}
 {%- endmacro %}
@@ -153,12 +169,22 @@ class {{ resource_class_name }}{{ op.name | to_upper_camel_case }}Body:
     """Multipart form fields of `{{ op.name | to_snake_case }}`."""
 {% for required_pass in [true, false] %}
 {%- for field in op.multipart_fields if (field.required and not field.nullable) == required_pass %}
-    {{ py_ident(field.name) }}: {% if field.is_file %}FileInput{% else %}{{ py_type(field.type) }}{% endif %}{% if not required_pass %} | None = None{% endif %}
+    {{ py_field(field.name) }}: {% if field.is_file and field.is_file_list %}list[FileInput]{% elif field.is_file %}FileInput{% else %}{{ py_type(field.type) }}{% endif %}{% if not required_pass %} | None = None{% endif %}
 {%- if field.description is defined %}
     """{{ field.description }}"""
 {%- endif %}
 {%- endfor %}
 {%- endfor %}
+{%- endfor %}
+{#- A union a body holds that no schema names, such as an inline `oneOf` response, is an alias here. -#}
+{% set declared = namespace(names=[]) -%}
+{% for op in resource.operations -%}
+    {% for body_type, union_name in [(op.request_body_json_type, op.request_body_union), (op.response_body_json_type, op.response_body_union)] if body_type is defined and union_name is defined and (union_name | to_upper_camel_case) not in names and (union_name | to_upper_camel_case) not in declared.names -%}
+        {% set declared.names = declared.names + [union_name | to_upper_camel_case] %}
+
+
+{{ union_name | to_upper_camel_case }}: t.TypeAlias = {{ union_type(body_type) }}
+    {%- endfor %}
 {%- endfor %}
 {% for is_async in [true, false] %}
 {%- set class_name %}{% if is_async %}Async{% endif %}{{ resource_class_name }}{% endset %}
@@ -180,7 +206,7 @@ class {{ class_name }}({{ base_class }}):
 {%- set body_param = none %}
 {%- set body_type = none %}
 {%- if op.response_body_json_type is defined %}
-{%- set response_type = py_type(op.response_body_json_type) %}
+{%- set response_type = named_type(op.response_body_json_type, op.response_body_union | to_upper_camel_case) if op.response_body_union is defined and (op.response_body_union | to_upper_camel_case in declared.names or op.response_body_union | to_upper_camel_case in names) else py_type(op.response_body_json_type) %}
 {%- elif op.response_body_schema_name is defined %}
 {%- set response_type = op.response_body_schema_name | to_upper_camel_case %}
 {%- if op.response_body_is_list %}{% set response_type = "list[" ~ response_type ~ "]" %}{% endif %}
@@ -211,12 +237,12 @@ class {{ class_name }}({{ base_class }}):
 {%- endfor %}
 {%- set defaults = schema.discriminator_defaults if schema.discriminator_defaults is defined else {} %}
 {%- endif %}
-{%- set param_names = (op.path_params | list) + (op.query_params | map(attribute="name") | list) + (op.header_params | map(attribute="name") | list) %}
+{%- set param_names = (op.path_params | list) + (op.query_params | map(attribute="ident") | list) + (op.header_params | map(attribute="ident") | list) %}
 {%- set arg_names = namespace(list=param_names | map("ident", "snake", "python") | list) %}
 {%- for f in flat_fields.list %}{% set arg_names.list = arg_names.list + [field_ident(f)] %}{% endfor %}
 {%- set body_param = ("request_body" if "body" in arg_names.list else "body") if not flat else none %}
 {%- if op.request_body_json_type is defined %}
-{%- set body_type = py_type(op.request_body_json_type) %}
+{%- set body_type = named_type(op.request_body_json_type, op.request_body_union | to_upper_camel_case) if op.request_body_union is defined and (op.request_body_union | to_upper_camel_case in declared.names or op.request_body_union | to_upper_camel_case in names) else py_type(op.request_body_json_type) %}
 {%- elif op.request_body_schema_name is defined %}
 {%- set body_type = op.request_body_schema_name | to_upper_camel_case %}
 {%- if op.request_body_is_list %}{% set body_type = "list[" ~ body_type ~ "]" %}{% endif %}
@@ -236,7 +262,11 @@ class {{ class_name }}({{ base_class }}):
 
 {%- set signature %}
 {%- for p in op.path_params %}
-        {{ py_ident(p) }}: str,
+{%- set path_type = "str" %}
+{%- if p in op.path_styles and op.path_styles[p].type is defined %}
+{%- set path_type = unshadow(py_type(op.path_styles[p].type)) %}
+{%- endif %}
+        {{ py_ident(p) }}: {{ path_type }},
 {%- endfor %}
 {%- if body_param is not none %}
         {{ body_param }}: {{ unshadow(body_type) }}{% if op.request_body_optional %} | None = None{% endif %},
@@ -249,10 +279,11 @@ class {{ class_name }}({{ base_class }}):
         {%- if f.required and f.name in defaults %} = {{ py_str(defaults[f.name]) }}{% endif %},
 {%- endfor %}
 {%- for p in op.query_params if p.required == required_pass %}
-        {{ py_ident(p.name) }}: {{ unshadow(param_type(p)) }}{% if not p.required %} | None = None{% endif %},
+        {{ py_ident(p.ident) }}: {{ unshadow(param_type(p)) }}{% if not p.required %} | None = None{% endif %},
 {%- endfor %}
 {%- for p in op.header_params if p.required == required_pass %}
-        {{ py_ident(p.name) }}: {% if p.required %}str,{% else %}str | None = None,{% endif %}
+{%- set header_type = unshadow(py_type(p.type)) if p.json else "str" %}
+        {{ py_ident(p.ident) }}: {{ header_type }}{% if not p.required %} | None = None{% endif %},
 {%- endfor %}
 {%- endfor %}
         {{ option("extra_headers") }}: t.Mapping[str, str] | None = None,
@@ -283,7 +314,11 @@ class {{ class_name }}({{ base_class }}):
 {%- if op.path_params | length > 0 %}
                 path_params={
 {%- for p in op.path_params %}
-                    "{{ p }}": {{ py_ident(p) }},
+{%- if p in op.path_styles %}
+                    {{ py_str(p) }}: encode_path_param({{ py_str(p) }}, {{ py_ident(p) }}, {{ py_str(op.path_styles[p].style) }}, {{ "True" if op.path_styles[p].explode else "False" }}),
+{%- else %}
+                    {{ py_str(p) }}: {{ py_ident(p) }},
+{%- endif %}
 {%- endfor %}
                 },
 {%- endif %}
@@ -291,7 +326,7 @@ class {{ class_name }}({{ base_class }}):
                 query_params=serialize_query_params(
                     {
 {%- for p in op.query_params %}
-                        {{ py_str(p.name) }}: {% if pg and p.name == pg.param %}page_param{% else %}{{ py_ident(p.name) }}{% endif %},
+                        {{ py_str(p.name) }}: {% if pg and p.name == pg.param %}page_param{% else %}{{ py_ident(p.ident) }}{% endif %},
 {%- endfor %}
                     },
 {%- set comma_joined %}
@@ -318,12 +353,35 @@ class {{ class_name }}({{ base_class }}):
 {%- if deep_object | trim %}
                     deep_object=({{ deep_object | trim }}),
 {%- endif %}
+{%- set delimited %}
+{%- for p in op.query_params if p.delimiter is defined -%}
+{{ py_str(p.name) }}: {{ py_str(p.delimiter) }},
+{%- endfor -%}
+{%- endset %}
+{%- if delimited | trim %}
+                    delimited={ {{- delimited | trim -}} },
+{%- endif %}
+{%- set json_params %}
+{%- for p in op.query_params if p.json -%}
+{{ py_str(p.name) }},
+{%- endfor -%}
+{%- endset %}
+{%- if json_params | trim %}
+                    json_params=({{ json_params | trim }}),
+{%- endif %}
                 ),
 {%- endif %}
-{%- if op.header_params | length > 0 %}
+{%- if op.header_params | rejectattr("cookie") | list | length > 0 %}
                 header_params={
-{%- for p in op.header_params %}
-                    {{ py_str(p.name) }}: {{ py_ident(p.name) }},
+{%- for p in op.header_params if not p.cookie %}
+                    {{ py_str(p.name) }}: {% if p.json %}json_header({{ py_ident(p.ident) }}){% else %}{{ py_ident(p.ident) }}{% endif %},
+{%- endfor %}
+                },
+{%- endif %}
+{%- if op.header_params | selectattr("cookie") | list | length > 0 %}
+                cookie_params={
+{%- for p in op.header_params if p.cookie %}
+                    {{ py_str(p.name) }}: {{ py_ident(p.ident) }},
 {%- endfor %}
                 },
 {%- endif %}
@@ -338,7 +396,7 @@ class {{ class_name }}({{ base_class }}):
 {%- elif op.request_body_kind == "multipart" %}
                 multipart={% if op.request_body_optional %}None if {{ body_param }} is None else {% endif %}[
 {%- for field in op.multipart_fields %}
-                    ({{ py_str(field.name) }}, {{ body_param }}.{{ py_ident(field.name) }}, {{ "True" if field.is_file else "False" }}),
+                    ({{ py_str(field.name) }}, {{ body_param }}.{{ py_field(field.name) }}, {{ "True" if field.is_file else "False" }}, {{ py_str(field.content_type) if field.content_type is defined else "None" }}),
 {%- endfor %}
                 ],
 {%- elif json_value is not none %}
@@ -390,7 +448,7 @@ class {{ class_name }}({{ base_class }}):
 :param {{ field_ident(f) }}: {{ f.description | replace("\n", " ") }}
 {%- endfor %}
 {%- for p in op.query_params if p.description is defined %}
-:param {{ py_ident(p.name) }}: {{ p.description | replace("\n", " ") }}
+:param {{ py_ident(p.ident) }}: {{ p.description | replace("\n", " ") }}
 {%- endfor %}
 {%- endset %}
 {%- set doc %}
@@ -423,7 +481,7 @@ class {{ class_name }}({{ base_class }}):
             next_cursor=lambda body: {{ accessor("body", pg.next_cursor) }},
 {%- endif %}
 {%- if pg.item_cursor is defined %}
-            item_cursor=lambda item: item.{{ py_ident(pg.item_cursor) }},
+            item_cursor=lambda item: item.{{ py_field(pg.item_cursor) }},
 {%- endif %}
 {%- if pg.total_pages is defined %}
             total_pages=lambda body: {{ accessor("body", pg.total_pages) }},
@@ -435,10 +493,12 @@ class {{ class_name }}({{ base_class }}):
             first_page={{ pg.first_page }},
 {%- endif %}
         )
+{%- set pg_query = op.query_params | selectattr("name", "equalto", pg.param) | first %}
+{%- set pg_arg = py_ident(pg_query.ident if pg_query else pg.param) %}
 {%- if is_async %}
-        return AsyncPaginator(lambda: async_first_page(fetch, {{ py_ident(pg.param) }}, paging))
+        return AsyncPaginator(lambda: async_first_page(fetch, {{ pg_arg }}, paging))
 {%- else %}
-        return first_page(fetch, {{ py_ident(pg.param) }}, paging)
+        return first_page(fetch, {{ pg_arg }}, paging)
 {%- endif %}
 {%- else %}
 
@@ -459,8 +519,8 @@ class {{ class_name }}({{ base_class }}):
 {%- elif return_type != "None" %}
 {%- set decode = "decode_optional_response" if return_type != response_type else "decode_response" %}
 {%- set response_schema = types[op.response_body_schema_name] if op.response_body_schema_name is defined else none %}
-{%- if response_schema and response_schema.kind == "struct_enum" and is_flat_union(response_schema) %}
-        {#- A union alias is not a class, so `decode_response` cannot infer its type. #}
+{%- if op.response_body_union is defined or (response_schema and (response_schema.kind == "alias" or (response_schema.kind == "struct_enum" and is_flat_union(response_schema)))) %}
+        {#- A type alias (such as a union) is not a class, so `decode_response` cannot infer its type. #}
         decoded: {{ unshadow(return_type) }} = {{ decode }}(response, {{ response_type }})
         return decoded
 {%- else %}

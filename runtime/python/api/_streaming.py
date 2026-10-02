@@ -37,6 +37,9 @@ UploadContent: t.TypeAlias = (
 """A raw body. Only ``bytes`` are retried; streams and files are sent once."""
 
 
+_OCTET_STREAM = "application/octet-stream"
+
+
 class Upload(t.NamedTuple):
     """A multipart file with its filename and content type."""
 
@@ -48,8 +51,8 @@ class Upload(t.NamedTuple):
 FileInput: t.TypeAlias = "bytes | t.IO[bytes] | Upload"
 """A multipart file: its content, or an :class:`Upload` naming it."""
 
-MultipartField: t.TypeAlias = "tuple[str, object, bool]"
-"""A multipart field: its name, its value and whether it is a file."""
+MultipartField: t.TypeAlias = "tuple[str, object, bool, str | None]"
+"""A multipart field: its name, its value, whether it is a file and its declared content type."""
 
 
 @dataclasses.dataclass
@@ -109,7 +112,9 @@ class _Parser:
             if not self._data:
                 return None
             data, self._data = self._data[:-1], ""
-            return SseEvent(event, data, self.id, self.retry)
+            # The reconnection delay applies to the event it arrives with only.
+            retry, self.retry = self.retry, None
+            return SseEvent(event, data, self.id, retry)
         if line.startswith(":"):
             return None
         name, _, value = line.partition(":")
@@ -210,9 +215,9 @@ class AsyncEventStream(_AsyncEventSource):
         await self.aclose()
 
 
-def _decode(event: SseEvent, type_: type[_T], response: httpx.Response) -> _T:
+def _decode(event: SseEvent, type_: object, response: httpx.Response) -> object:
     try:
-        return t.cast(_T, from_json_value(type_, json.loads(event.data)))
+        return t.cast(object, from_json_value(type_, json.loads(event.data)))
     except (ValueError, TypeError) as exc:
         raise APIResponseValidationError(response, f"event {event.data!r}: {exc}") from exc
 
@@ -226,7 +231,14 @@ class Stream(_EventSource, t.Generic[_T]):
     last_event: SseEvent | None = None
     """The event the latest item was decoded from."""
 
-    def __init__(self, response: httpx.Response, type_: type[_T]) -> None:
+    @t.overload
+    def __init__(self, response: httpx.Response, type_: type[_T]) -> None: ...
+
+    # A type alias, such as a union of event models, is not a class: the caller names `_T`.
+    @t.overload
+    def __init__(self: Stream[t.Any], response: httpx.Response, type_: object) -> None: ...
+
+    def __init__(self, response: httpx.Response, type_: object) -> None:
         super().__init__(response)
         self._type = type_
 
@@ -236,7 +248,7 @@ class Stream(_EventSource, t.Generic[_T]):
                 self.close()
                 return
             self.last_event = event
-            yield _decode(event, self._type, self.response)
+            yield t.cast(_T, _decode(event, self._type, self.response))
 
     def __enter__(self) -> Stream[_T]:
         return self
@@ -254,7 +266,14 @@ class AsyncStream(_AsyncEventSource, t.Generic[_T]):
     last_event: SseEvent | None = None
     """The event the latest item was decoded from."""
 
-    def __init__(self, response: httpx.Response, type_: type[_T]) -> None:
+    @t.overload
+    def __init__(self, response: httpx.Response, type_: type[_T]) -> None: ...
+
+    # A type alias, such as a union of event models, is not a class: the caller names `_T`.
+    @t.overload
+    def __init__(self: AsyncStream[t.Any], response: httpx.Response, type_: object) -> None: ...
+
+    def __init__(self, response: httpx.Response, type_: object) -> None:
         super().__init__(response)
         self._type = type_
 
@@ -264,7 +283,7 @@ class AsyncStream(_AsyncEventSource, t.Generic[_T]):
                 await self.aclose()
                 return
             self.last_event = event
-            yield _decode(event, self._type, self.response)
+            yield t.cast(_T, _decode(event, self._type, self.response))
 
     async def __aenter__(self) -> AsyncStream[_T]:
         return self
@@ -285,22 +304,33 @@ _File: t.TypeAlias = (
 
 
 def multipart_files(fields: t.Sequence[MultipartField]) -> list[_File]:
-    """Renders multipart fields as ``httpx`` files, skipping ``None``."""
+    """Renders multipart fields as ``httpx`` files, skipping ``None``.
+
+    A list of files is sent as repeated parts of the same name. ``content_type`` is the
+    media type the spec declares for the part: it applies to files whose :class:`Upload`
+    does not set its own, and to every item of a field.
+    """
     files: list[_File] = []
-    for name, value, is_file in fields:
+    for name, value, is_file, content_type in fields:
         if value is None:
             continue
         if is_file:
-            upload = value if isinstance(value, Upload) else Upload(t.cast("bytes", value))
-            filename = upload.filename or os.path.basename(getattr(upload.content, "name", "file"))
-            files.append((name, (filename, upload.content, upload.content_type)))
+            many = isinstance(value, (list, tuple)) and not isinstance(value, Upload)
+            items: list[object] = list(t.cast("t.Sequence[object]", value)) if many else [value]
+            for item in items:
+                upload = item if isinstance(item, Upload) else Upload(t.cast("bytes", item))
+                if content_type and upload.content_type == _OCTET_STREAM:
+                    upload = upload._replace(content_type=content_type)
+                path = getattr(upload.content, "name", "file")
+                filename = upload.filename or os.path.basename(path)
+                files.append((name, (filename, upload.content, upload.content_type)))
             continue
         json_value: JSONValue = to_json_value(value)
         for item in json_value if isinstance(json_value, list) else [json_value]:
             if isinstance(item, (dict, list)):
-                files.append((name, (None, json.dumps(item), "application/json")))
+                files.append((name, (None, json.dumps(item), content_type or "application/json")))
             elif item is not None:
-                files.append((name, (None, _scalar(item), None)))
+                files.append((name, (None, _scalar(item), content_type)))
     return files
 
 

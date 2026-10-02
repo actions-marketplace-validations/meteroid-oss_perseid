@@ -10,7 +10,7 @@ use std::{
 };
 
 use aide::openapi::OpenApi;
-use anyhow::{Context as _, Result, bail};
+use anyhow::{Context as _, Result};
 use schemars::schema::Schema;
 use serde_json::Value;
 use tracing::{
@@ -25,6 +25,7 @@ use tracing_subscriber::{
 
 use crate::api::Api;
 
+mod external;
 mod normalize;
 mod upgrade;
 
@@ -53,9 +54,9 @@ pub struct Filters {
 /// Largest spec read from a URL: GitHub's REST description is over 10 MB, ureq's default.
 const MAX_SPEC_BYTES: u64 = 200 * 1024 * 1024;
 
-/// Reads an OpenAPI document (JSON or YAML) from a path or an http(s) URL, as JSON text, upgraded to 3.1 when it is 3.0.
-pub(crate) fn read(location: &str, root: &Path) -> Result<String> {
-    let text = if location.starts_with("https://") || location.starts_with("http://") {
+/// Reads a JSON or YAML document from a path (under `root`) or an http(s) URL.
+fn load(location: &str, root: &Path) -> Result<Value> {
+    let text = if is_url(location) {
         let agent: ureq::Agent = crate::http::config(Duration::from_secs(300)).build().into();
         agent
             .get(location)
@@ -71,38 +72,112 @@ pub(crate) fn read(location: &str, root: &Path) -> Result<String> {
         std::fs::read_to_string(root.join(location))
             .with_context(|| format!("reading {location}"))?
     };
-    let mut value: Value = if text.trim_start().starts_with('{') {
+    if text.trim_start().starts_with('{') {
         serde_json::from_str(&text).map_err(anyhow::Error::from)
     } else {
         serde_norway::from_str::<yaml::Json>(&text)
             .map(|json| json.0)
             .map_err(anyhow::Error::from)
     }
-    .with_context(|| format!("parsing {location}"))?;
+    .with_context(|| format!("parsing {location}"))
+}
+
+fn is_url(location: &str) -> bool {
+    location.starts_with("https://") || location.starts_with("http://")
+}
+
+/// Reads an OpenAPI document (JSON or YAML) from a path or an http(s) URL, as JSON text, upgraded to 3.1 when it is 3.0.
+/// References to other files are bundled into its components.
+pub(crate) fn read(location: &str, root: &Path) -> Result<String> {
+    let mut value = load(location, root)?;
     upgrade::to_3_1(&mut value).with_context(|| location.to_owned())?;
+    external::bundle(&mut value, location, root)?;
     Ok(serde_json::to_string(&value)?)
 }
 
 pub(crate) fn api(spec: &str, filters: &Filters) -> Result<Api> {
+    Ok(api_with_renames(spec, filters)?.0)
+}
+
+/// The API model, and the schemas renamed for `filters.reserved` (spec name to model name).
+pub(crate) fn api_with_renames(
+    spec: &str,
+    filters: &Filters,
+) -> Result<(Api, BTreeMap<String, String>)> {
     let mut doc: Value = serde_json::from_str(spec).context("the spec is not valid JSON")?;
+    if doc["openapi"]
+        .as_str()
+        .is_some_and(|v| v.starts_with("3.1") || v.starts_with("3.2"))
+    {
+        doc["openapi"] = Value::from("3.1.0");
+    }
+    upgrade::boolean_schemas(&mut doc);
     normalize::normalize(&mut doc)?;
-    normalize::rename_reserved_schemas(&mut doc, &filters.reserved);
+    let renames = normalize::rename_reserved_schemas(&mut doc, &filters.reserved);
+    warn_ignored_servers(&doc);
     let raw = doc;
     // `OpenApi` borrows its version string, so it cannot deserialize from a `Value`.
     let doc = serde_json::to_string(&raw)?;
     let mut spec: OpenApi =
         serde_json::from_str(&doc).context("the spec is not a valid OpenAPI 3 document")?;
     let webhooks = webhooks(&spec);
-    let Some(paths) = spec.paths.take() else {
-        bail!("the spec has no paths");
-    };
-    Api::new(
+    // A spec of only webhooks and components still yields models, with a client without resources.
+    let paths = spec.paths.take().unwrap_or_default();
+    let api = Api::new(
         paths,
         &mut spec.components.take().unwrap_or_default(),
         &webhooks,
         &raw,
         filters,
-    )
+    )?;
+    Ok((api, renames))
+}
+
+/// Warns about each operation whose path item or operation `servers` name a URL the root
+/// `servers` do not: the generated client sends every operation to its one base URL.
+fn warn_ignored_servers(doc: &Value) {
+    let urls = |servers: &Value| -> Vec<String> {
+        servers
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|s| s["url"].as_str().map(str::to_owned))
+            .collect()
+    };
+    let root = urls(&doc["servers"]);
+    let Some(paths) = doc["paths"].as_object() else {
+        return;
+    };
+    for (path, item) in paths {
+        let Some(item) = item.as_object() else {
+            continue;
+        };
+        for (method, op) in item {
+            if ![
+                "get", "put", "post", "delete", "options", "head", "patch", "trace",
+            ]
+            .contains(&method.as_str())
+            {
+                continue;
+            }
+            let own = match op.get("servers").or_else(|| item.get("servers")) {
+                Some(servers) => urls(servers),
+                None => continue,
+            };
+            if own.is_empty() || own.iter().all(|u| root.contains(u)) {
+                continue;
+            }
+            let id = op["operationId"].as_str().unwrap_or(path);
+            let _span = tracing::warn_span!("operation", name = %id).entered();
+            tracing::warn!(
+                "{} {path} declares its own `servers` ({}), which perseid ignores: the SDK sends it \
+                 to the client's base URL; move the operation to a spec of its own, or set \
+                 the base URL of the client when creating it",
+                method.to_uppercase(),
+                own.join(", ")
+            );
+        }
+    }
 }
 
 fn webhooks(spec: &OpenApi) -> Vec<String> {

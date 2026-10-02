@@ -46,7 +46,7 @@ impl TypeData {
             let len = variant.properties.len();
             ensure!(
                 (1..=2).contains(&len),
-                "Found struct enum variant with {len} properties, expected 1 or 2"
+                "an inline `oneOf` variant has {len} properties, expected 1 (the discriminator) or 2 (the discriminator and its content)"
             );
             if variant.properties.len() == 1 {
                 variants.push(SimpleVariant {
@@ -67,15 +67,24 @@ impl TypeData {
             }
         }
 
+        let discriminator_field = discriminator_field
+            .inner()
+            .context("a `oneOf` without variants")?;
+        let content_field = content_field
+            .inner()
+            .context("no `oneOf` variant carries content")?;
+        // The shared properties may declare the discriminator and the content again: the
+        // variants already carry them.
+        let fields = fields
+            .iter()
+            .filter(|f| f.name != discriminator_field && f.name != content_field)
+            .cloned()
+            .collect();
         Ok(Self::StructEnum {
-            discriminator_field: discriminator_field
-                .inner()
-                .context("a `oneOf` without variants")?,
-            fields: fields.to_vec(),
+            discriminator_field,
+            fields,
             repr: StructEnumRepr::AdjacentlyTagged {
-                content_field: content_field
-                    .inner()
-                    .context("no `oneOf` variant carries content")?,
+                content_field,
                 variants,
             },
         })
@@ -87,8 +96,8 @@ fn get_content(variant: &ObjectValidation) -> anyhow::Result<(String, EnumVarian
         let schema_obj = get_schema_obj(p)?;
         if let Some(obj) = &schema_obj.object {
             let ty = TypeData::from_object_schema(*obj.clone(), None)?;
-            let TypeData::Struct { fields } = ty else {
-                bail!("Expected obj to be a struct");
+            let TypeData::Struct { fields, .. } = ty else {
+                bail!("the content of an inline `oneOf` variant must be an object with properties");
             };
 
             return Ok((p_name.to_owned(), EnumVariantType::Struct { fields }));
@@ -108,7 +117,9 @@ fn get_content(variant: &ObjectValidation) -> anyhow::Result<(String, EnumVarian
         }
     }
 
-    bail!("Failed to find content on struct enum")
+    bail!(
+        "no property of an inline `oneOf` variant holds an object or `$ref` to use as its content"
+    )
 }
 
 fn get_discriminator(obj: &ObjectValidation) -> anyhow::Result<(String, String)> {
@@ -125,16 +136,22 @@ fn get_discriminator(obj: &ObjectValidation) -> anyhow::Result<(String, String)>
                     discriminator_field_name = Some(p_name.clone());
                     discriminator = Some((*v).to_owned());
                 }
-                None => bail!("Expected discriminator field name to be a string"),
+                None => bail!(
+                    "the single-value `enum` of property `{p_name}` in an inline `oneOf` variant is not a string, so it cannot name the variant"
+                ),
             }
         }
     }
 
-    let Some(discriminator_field_name) = discriminator_field_name else {
-        bail!("Unable to figure out discriminator field name")
-    };
-    let Some(discriminator) = discriminator else {
-        bail!("Unable to figure out discriminator")
+    let (Some(discriminator_field_name), Some(discriminator)) =
+        (discriminator_field_name, discriminator)
+    else {
+        bail!(
+            "an inline `oneOf` variant has no property with a single-value `enum` (or `const`) \
+             naming the variant, so perseid cannot tell the variants apart; add one, such as \
+             `type: {{type: string, enum: [circle]}}`, or `discriminator.mapping` with `$ref` \
+             variants, or set `x-perseid-union: json` on the schema to keep it untyped"
+        )
     };
 
     Ok((discriminator_field_name, discriminator))
@@ -142,14 +159,14 @@ fn get_discriminator(obj: &ObjectValidation) -> anyhow::Result<(String, String)>
 
 fn get_schema_obj(s: &Schema) -> anyhow::Result<&SchemaObject> {
     match s {
-        Schema::Bool(_) => bail!("unsupported bool schema"),
+        Schema::Bool(_) => bail!("a boolean schema inside `oneOf` is not supported"),
         Schema::Object(o) => Ok(o),
     }
 }
 
 fn get_obj_validation(s: &Schema) -> anyhow::Result<&ObjectValidation> {
     let Some(obj) = get_schema_obj(s)?.object.as_ref() else {
-        bail!("unsupported: object type without further validation");
+        bail!("an inline `oneOf` variant must be an object with properties");
     };
     Ok(obj)
 }

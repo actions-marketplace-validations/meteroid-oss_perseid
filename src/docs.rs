@@ -125,7 +125,11 @@ fn json_body(types: &Value, op: &Value) -> Option<Value> {
     let params = ["path_params", "query_params", "header_params"]
         .iter()
         .flat_map(|key| op[key].as_array().into_iter().flatten())
-        .filter_map(|p| p.as_str().or_else(|| p["name"].as_str()));
+        .filter_map(|p| {
+            (p.as_str())
+                .or_else(|| p["ident"].as_str())
+                .or_else(|| p["name"].as_str())
+        });
     taken.extend(params.map(|p| p.to_snake_case()));
     let mut fields = Vec::new();
     for field in schema["fields"].as_array()? {
@@ -141,7 +145,8 @@ fn json_body(types: &Value, op: &Value) -> Option<Value> {
             return None;
         }
         let example = &field["example"];
-        let (kind, int64, value) = match field["type"]["id"].as_str()? {
+        let id = field["type"]["id"].as_str()?;
+        let (kind, int64, value) = match id {
             "String" => match example.as_str().filter(|s| plain_text(s)) {
                 Some(example) => ("string", false, json!(example)),
                 None => ("string", false, text(name)),
@@ -153,7 +158,12 @@ fn json_body(types: &Value, op: &Value) -> Option<Value> {
             "Bool" => ("boolean", false, json!(example.as_bool().unwrap_or(true))),
             _ => return None,
         };
-        fields.push(literal(name, kind, int64, value));
+        let mut lit = literal(name, kind, int64, value);
+        if id == "UInt64" {
+            // Java holds an unsigned 64-bit integer in a `BigInteger`.
+            lit["unsigned64"] = json!(true);
+        }
+        fields.push(lit);
     }
     Some(json!({ "schema": name, "fields": fields }))
 }
@@ -217,9 +227,13 @@ mod tests {
         assert!(petstore["list"].is_null() && petstore["stream"].is_null());
 
         let features = examples_of("tests/fixtures/features.yaml");
-        assert_eq!(summary(&features["call"]), "account.check_health");
-        assert_eq!(summary(&features["list"]), "gadgets.list");
-        assert_eq!(features["list"]["item"], "Gadget");
+        assert_eq!(
+            summary(&features["call"]),
+            "encoding.retrieve_scenario_path"
+        );
+        assert_eq!(features["call"]["path_args"][0]["value"], "segment");
+        assert_eq!(summary(&features["list"]), "errors.list_scenarios_pages");
+        assert_eq!(features["list"]["item"], "Widget");
         let stream = &features["stream"];
         assert_eq!(summary(stream), "streaming.create_completion_stream");
         assert_eq!(stream["body"]["schema"], "CompletionRequest");

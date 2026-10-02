@@ -1,4 +1,4 @@
-{% from "types/macros.py.jinja" import field_ident, field_type, param_type, py_ident, py_type -%}
+{% from "types/macros.py.jinja" import field_ident, field_type, named_type, param_type, py_ident, py_type -%}
 {% import "docs.jinja" as docs -%}
 {% set _ = set_summary_filename("api.md") -%}
 {% macro model(name) -%}
@@ -12,7 +12,7 @@
     {%- set schema = api.types[op.request_body_schema_name] if op.request_body_schema_name is defined else none -%}
     {%- if schema and schema.kind == "struct" and not op.request_body_is_list | default(false)
         and op.request_body_kind in ["json", "form"] and not schema.fields | selectattr("flatten") | list -%}
-        {%- set params = (op.path_params | list) + (op.query_params | map(attribute="name") | list) + (op.header_params | map(attribute="name") | list) -%}
+        {%- set params = (op.path_params | list) + (op.query_params | map(attribute="ident") | list) + (op.header_params | map(attribute="ident") | list) -%}
         {%- set taken = (params | map("ident", "snake", "python") | list) + ["self", "t"] -%}
         {%- set out = namespace(indices=[], clash=false) -%}
         {%- for f in schema.fields -%}
@@ -26,7 +26,10 @@
 {%- endmacro -%}
 {% macro signature(resource, op) -%}
     {%- set args = namespace(list=[], required=[], optional=[]) -%}
-    {%- for p in op.path_params %}{% set args.list = args.list + [py_ident(p) ~ ": str"] %}{% endfor -%}
+    {%- for p in op.path_params -%}
+        {%- set path_type = py_type(op.path_styles[p].type) if p in op.path_styles and op.path_styles[p].type is defined else "str" -%}
+        {%- set args.list = args.list + [py_ident(p) ~ ": " ~ path_type] -%}
+    {%- endfor -%}
     {%- set flat = flat_fields(resource, op) | trim -%}
     {%- if flat -%}
         {%- set schema = api.types[op.request_body_schema_name] -%}
@@ -41,7 +44,7 @@
         {%- endfor -%}
     {%- else -%}
         {%- if op.request_body_json_type is defined -%}
-            {%- set body_type = py_type(op.request_body_json_type) -%}
+            {%- set body_type = named_type(op.request_body_json_type, op.request_body_union | to_upper_camel_case) if op.request_body_union is defined else py_type(op.request_body_json_type) -%}
         {%- elif op.request_body_schema_name is defined -%}
             {%- set body_type = op.request_body_schema_name | to_upper_camel_case -%}
             {%- if op.request_body_is_list %}{% set body_type = "list[" ~ body_type ~ "]" %}{% endif -%}
@@ -57,14 +60,14 @@
         {%- endif -%}
     {%- endif -%}
     {%- for p in op.query_params -%}
-        {%- if p.required %}{% set args.required = args.required + [py_ident(p.name) ~ ": " ~ param_type(p)] %}{% else %}{% set args.optional = args.optional + [py_ident(p.name) ~ "=..."] %}{% endif -%}
+        {%- if p.required %}{% set args.required = args.required + [py_ident(p.ident) ~ ": " ~ param_type(p)] %}{% else %}{% set args.optional = args.optional + [py_ident(p.ident) ~ "=..."] %}{% endif -%}
     {%- endfor -%}
     {%- for p in op.header_params -%}
-        {%- if p.required %}{% set args.required = args.required + [py_ident(p.name) ~ ": str"] %}{% else %}{% set args.optional = args.optional + [py_ident(p.name) ~ "=..."] %}{% endif -%}
+        {%- if p.required %}{% set args.required = args.required + [py_ident(p.ident) ~ ": " ~ (py_type(p.type) if p.json else "str")] %}{% else %}{% set args.optional = args.optional + [py_ident(p.ident) ~ "=..."] %}{% endif -%}
     {%- endfor -%}
     {%- if args.required or args.optional %}{% set args.list = args.list + ["*"] + args.required + args.optional %}{% endif -%}
     {%- if op.response_body_json_type is defined -%}
-        {%- set response = py_type(op.response_body_json_type) -%}
+        {%- set response = named_type(op.response_body_json_type, op.response_body_union | to_upper_camel_case) if op.response_body_union is defined else py_type(op.response_body_json_type) -%}
     {%- elif op.response_body_schema_name is defined -%}
         {%- set response = op.response_body_schema_name | to_upper_camel_case -%}
         {%- if op.response_body_is_list %}{% set response = "list[" ~ response ~ "]" %}{% endif -%}
@@ -92,7 +95,7 @@
     {%- elif op.response_is_binary %}bytes
     {%- elif op.response_is_text %}text
     {%- elif op.response_body_schema_name is defined %}{{ model(op.response_body_schema_name) }}{% if op.response_body_is_list %} list{% endif %}
-    {%- elif op.response_body_json_type is defined %}`{{ py_type(op.response_body_json_type) | replace("|", "\\|") }}`
+    {%- elif op.response_body_json_type is defined %}`{{ (named_type(op.response_body_json_type, op.response_body_union | to_upper_camel_case) if op.response_body_union is defined else py_type(op.response_body_json_type)) | replace("|", "\\|") }}`
     {%- else %}nothing{% endif -%}
 {%- endmacro -%}
 {% macro table(resource) -%}

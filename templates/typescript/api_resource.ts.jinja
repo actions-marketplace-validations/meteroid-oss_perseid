@@ -62,7 +62,7 @@
             {% if field.description is defined -%}
                 {{ field.description | to_doc_comment(style="js") }}
             {% endif -%}
-            {{ field.name | ident("camel") }}{% if not field.required %}?{% endif %}: {% if field.is_file %}Upload{% else %}{{ m.js_type(field.type) }}{% endif %}{% if field.nullable %} | null{% endif %}{% if not field.required %} | undefined{% endif %};
+            {{ field.name | ident("camel") }}{% if not field.required %}?{% endif %}: {% if field.is_file and field.is_file_list %}Upload[]{% elif field.is_file %}Upload{% else %}{{ m.js_type(field.type) }}{% endif %}{% if field.nullable %} | null{% endif %}{% if not field.required %} | undefined{% endif %};
         {% endfor -%}
     }
 
@@ -73,11 +73,11 @@
         {% for p in op.query_params -%}
             {#- A union is typed as such rather than as untyped JSON. -#}
             {% set ptype = p.typed_union if p.typed_union is defined and not unimported(p.typed_union) else p.type -%}
-            {{ m.doc(p.description, false) }}{{ p.name | ident("camel") }}{% if not p.required %}?{% endif %}: {{ m.js_type(ptype) }}{% if not p.required %} | undefined{% endif %};
+            {{ m.doc(p.description, false) }}{{ p.ident | ident("camel") }}{% if not p.required %}?{% endif %}: {{ m.js_type(ptype) }}{% if not p.required %} | undefined{% endif %};
         {% endfor -%}
         {% for p in op.header_params -%}
-            /** Sent as the `{{ p.name }}` header. */
-            {{ p.name | ident("camel") }}{% if not p.required %}?{% endif %}: {{ text_type(p.schema_type) if p.schema_type is defined else "string" }}{% if not p.required %} | undefined{% endif %};
+            /** Sent as the `{{ p.name }}` {{ "cookie" if p.cookie else "header" }}{% if p.json %}, as compact JSON{% endif %}. */
+            {{ p.ident | ident("camel") }}{% if not p.required %}?{% endif %}: {% if p.json and p.type is defined %}{{ m.js_type(p.type) }}{% else %}{{ text_type(p.schema_type) if p.schema_type is defined else "string" }}{% endif %}{% if not p.required %} | undefined{% endif %};
         {% endfor -%}
     }
 
@@ -110,7 +110,8 @@ export class {{ resource_type_name }} {
         {% else -%}
             {% set response_type = "void" -%}
         {% endif -%}
-        {% if op.response_may_be_empty | default(false) and (op.response_body_schema_name is defined or op.response_body_json_type is defined) -%}
+        {% set may_be_empty = op.response_may_be_empty | default(false) and op.pagination is not defined and (op.response_body_schema_name is defined or op.response_body_json_type is defined) -%}
+        {% if may_be_empty -%}
             {% set response_type = response_type ~ " | undefined" -%}
         {% endif -%}
         {% set method = op.name | ident("camel") -%}
@@ -123,8 +124,9 @@ export class {{ resource_type_name }} {
         {% endif -%}
         {#- The parameters, and the arguments passing them on. -#}
         {% set params -%}
+            {#- A path parameter of another style, or a list, object or JSON value, takes its type. -#}
             {% for p in op.typed_path_params -%}
-                {{ p.name | ident("camel", "typescript") }}: {{ text_type(p.type) }},
+                {{ p.name | ident("camel", "typescript") }}: {% if p.name in op.path_styles and op.path_styles[p.name].type is defined %}{{ m.js_type(op.path_styles[p.name].type) }}{% else %}{{ text_type(p.type) }}{% endif %},
             {% endfor -%}
             {% if op.request_body_schema_name is defined -%}
                 {{ body_arg }}: {{ op.request_body_schema_name | to_upper_camel_case }}{% if op.request_body_is_list %}[]{% endif %},
@@ -154,7 +156,9 @@ export class {{ resource_type_name }} {
         {% set pg = op.pagination -%}
         {% set item_type = pg.item_schema | to_upper_camel_case -%}
         {% set page_type = op.response_body_schema_name | to_upper_camel_case -%}
-        {% set param_field = pg.param | ident("camel") -%}
+        {% set pf = namespace(name=pg.param) -%}
+        {% for p in op.query_params if p.name == pg.param %}{% set pf.name = p.ident %}{% endfor -%}
+        {% set param_field = pf.name | ident("camel") -%}
         {% set pv = namespace(value=pg.style) -%}
         {% for p in op.query_params if p.name == pg.param and pg.style != "cursor" and m.is_int64(p.type) -%}
             {% set pv.value = ("BigInt(" if sdk.int64 == "bigint" else "String(") ~ pg.style ~ ")" -%}
@@ -197,7 +201,13 @@ export class {{ resource_type_name }} {
             const request = new {{ sdk.client_name }}Request("{{ op.method | upper }}", {{ op.path | tojson }});
 
             {% for p in op.path_params -%}
+                {% if p in op.path_styles -%}
+                {% set ps = op.path_styles[p] -%}
+                {% set arg = p | ident("camel", "typescript") -%}
+                request.setStyledPathParam({{ p | tojson }}, {% if ps.type is defined and m.converted(ps.type, true) %}{{ m.to_json(arg, ps.type) }}{% else %}{{ arg }}{% endif %}, {{ ps.style | tojson }}, {{ ps.explode | lower }});
+                {% else -%}
                 request.setPathParam({{ p | tojson }}, {{ p | ident("camel", "typescript") }});
+                {% endif -%}
             {% endfor -%}
             {% if op.security is defined -%}
                 request.setSecurity({{ op.security | tojson }});
@@ -211,11 +221,17 @@ export class {{ resource_type_name }} {
             {% endif -%}
 
             {% for p in op.query_params -%}
-                {% set accessor %}options{% if not p.required %}?{% endif %}.{{ p.name | ident("camel") }}{% endset -%}
+                {% set accessor %}options{% if not p.required %}?{% endif %}.{{ p.ident | ident("camel") }}{% endset -%}
                 {% set ptype = p.typed_union if p.typed_union is defined and not unimported(p.typed_union) else p.type -%}
                 {% if p.structured -%}
-                    {% set value = accessor if not m.converted(ptype, true) else accessor ~ " != null ? " ~ m.to_json("options." ~ (p.name | ident("camel")), ptype) ~ " : undefined" -%}
+                    {% set value = accessor if not m.converted(ptype, true) else accessor ~ " != null ? " ~ m.to_json("options." ~ (p.ident | ident("camel")), ptype) ~ " : undefined" -%}
+                    {% if p.json -%}
+                    request.setJsonQueryParam({{ p.name | tojson }}, {{ value }});
+                    {% elif p.delimiter is defined -%}
+                    request.setDelimitedQueryParam({{ p.name | tojson }}, {{ value }}, {{ p.delimiter | tojson }});
+                    {% else -%}
                     request.setStructuredQueryParam({{ p.name | tojson }}, {{ value }}, {{ p.deep_object | lower }}, {{ p.explode | lower }});
+                    {% endif -%}
                 {% elif (p.type.is_list() or p.type.is_set()) and p.explode | default(true) -%}
                     request.setExplodedQueryParam({{ p.name | tojson }}, {{ accessor }});
                 {% else -%}
@@ -224,7 +240,12 @@ export class {{ resource_type_name }} {
             {% endfor -%}
 
             {% for p in op.header_params -%}
-                request.setHeaderParam({{ p.name | tojson }}, options{% if not p.required %}?{% endif %}.{{ p.name | ident("camel") }});
+                {% set accessor %}options{% if not p.required %}?{% endif %}.{{ p.ident | ident("camel") }}{% endset -%}
+                {% if p.json -%}
+                request.setJsonHeaderParam({{ p.name | tojson }}, {% if p.type is defined and m.converted(p.type, true) %}{{ accessor }} != null ? {{ m.to_json("options." ~ (p.ident | ident("camel")), p.type) }} : undefined{% else %}{{ accessor }}{% endif %});
+                {% else -%}
+                request.set{{ "Cookie" if p.cookie else "Header" }}Param({{ p.name | tojson }}, {{ accessor }});
+                {% endif -%}
             {% endfor -%}
 
             {% if op.request_body_schema_name is defined -%}
@@ -250,10 +271,13 @@ export class {{ resource_type_name }} {
                 {% for field in op.multipart_fields -%}
                     {% set value = "body." ~ (field.name | ident("camel")) -%}
                     {% if not field.required or field.nullable %}if ({{ value }} !== undefined && {{ value }} !== null) { {% endif -%}
-                    {% if field.is_file -%}
-                    form.file({{ field.name | tojson }}, {{ value }});
+                    {% set part_type = (", " ~ (field.content_type | tojson)) if field.content_type is defined else "" -%}
+                    {% if field.is_file and field.is_file_list -%}
+                    for (const file of {{ value }}) { form.file({{ field.name | tojson }}, file{{ part_type }}); }
+                    {% elif field.is_file -%}
+                    form.file({{ field.name | tojson }}, {{ value }}{{ part_type }});
                     {% else -%}
-                    form.field({{ field.name | tojson }}, {{ m.to_json(value, field.type) }});
+                    form.field({{ field.name | tojson }}, {{ m.to_json(value, field.type) }}{{ part_type }});
                     {% endif -%}
                     {% if not field.required or field.nullable %} } {% endif -%}
                 {% endfor -%}
@@ -271,13 +295,13 @@ export class {{ resource_type_name }} {
                 return request.sendText(this.requestCtx, requestOptions);
             {% elif op.response_body_json_type is defined -%}
                 {% set parse = m.from_json("json", op.response_body_json_type) -%}
-                return request.send(this.requestCtx, (json: any) => {{ parse }}, requestOptions);
+                return request.send{% if may_be_empty %}Optional{% endif %}(this.requestCtx, (json: any) => {{ parse }}, requestOptions);
             {% elif op.response_body_schema_name is defined -%}
                 {% set serializer = (op.response_body_schema_name | to_upper_camel_case) ~ "Serializer" -%}
                 {% if op.response_body_is_list -%}
-                return request.send(this.requestCtx, (json: any[]) => json.map((item) => {{ serializer }}.parse(item)), requestOptions);
+                return request.send{% if may_be_empty %}Optional{% endif %}(this.requestCtx, (json: any[]) => json.map((item) => {{ serializer }}.parse(item)), requestOptions);
                 {% else -%}
-                return request.send(this.requestCtx, {{ serializer }}.parse, requestOptions);
+                return request.send{% if may_be_empty %}Optional{% endif %}(this.requestCtx, {{ serializer }}.parse, requestOptions);
                 {% endif -%}
             {% else -%}
                 return request.sendNoResponseBody(this.requestCtx, requestOptions);
@@ -301,7 +325,13 @@ export class {{ resource_type_name }} {
 
 {# A blank line keeps the marker apart from the imports, which may be removed if unused. -#}
 {% for c in referenced_components -%}
-import { type {{ c | to_upper_camel_case }}, {{ c | to_upper_camel_case }}Serializer } from "../models/{{ c | to_lower_camel_case }}.js";
+{% set name = c | to_upper_camel_case -%}
+{% set used = [] -%}
+{% if body | mentions_ident(name) %}{% set used = used + ["type " ~ name] %}{% endif -%}
+{% if body | mentions_ident(name ~ "Serializer") %}{% set used = used + [name ~ "Serializer"] %}{% endif -%}
+{% if used -%}
+import { {{ used | join(", ") }} } from "../models/{{ c | to_lower_camel_case }}.js";
+{% endif -%}
 {% endfor -%}
 {% if "isJsonObject(" in body -%}
 import { isJsonObject } from "../json.js";
@@ -309,7 +339,7 @@ import { isJsonObject } from "../json.js";
 {% if "parseDateTime(" in body -%}
 import { parseDateTime } from "../datetime.js";
 {% endif -%}
-{% set union_helpers = ["unionBestMatch", "unionHas"] | select("in", body) | list -%}
+{% set union_helpers = ["unionBestMatch", "unionHas", "unionTry"] | select("in", body) | list -%}
 {% if union_helpers -%}
 import { {{ union_helpers | join(", ") }} } from "../unions.js";
 {% endif -%}

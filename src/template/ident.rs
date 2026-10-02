@@ -23,6 +23,24 @@ const PYTHON: &[&str] = &[
     // Not keywords, but names that linters reject as ambiguous (E741).
     "I", "O", "l",
 ];
+/// Python names that, as a class member or parameter, shadow a name the generated annotations use
+/// (`str`, `datetime`, `t`), or are `self` and `cls`. Builtins the generated class bodies never
+/// reference (`type`, `object`, `set`) stay usable: they are common JSON member names.
+const PYTHON_SHADOWING: &[&str] = &[
+    "self", "cls", "str", "bool", "int", "float", "bytes", "datetime", "t",
+];
+/// Python names only model fields must avoid: the builtin generics a model body uses (`list`
+/// operations are annotated `t.List`), and the members `BaseModel` defines.
+const PYTHON_FIELD: &[&str] = &[
+    "list",
+    "dict",
+    "tuple",
+    "to_dict",
+    "to_json",
+    "from_dict",
+    "from_json",
+    "extra_fields",
+];
 const GO: &[&str] = &[
     "break",
     "case",
@@ -158,13 +176,14 @@ const TYPESCRIPT: &[&str] = &[
     "await",
 ];
 
-fn keywords(language: &str) -> Result<&'static [&'static str], Error> {
+fn keywords(language: &str) -> Result<Vec<&'static [&'static str]>, Error> {
     Ok(match language {
-        "rust" => RUST,
-        "python" => PYTHON,
-        "go" => GO,
-        "java" => JAVA,
-        "typescript" => TYPESCRIPT,
+        "rust" => vec![RUST],
+        "python" => vec![PYTHON, PYTHON_SHADOWING],
+        "python_field" => vec![PYTHON, PYTHON_SHADOWING, PYTHON_FIELD],
+        "go" => vec![GO],
+        "java" => vec![JAVA],
+        "typescript" => vec![TYPESCRIPT],
         other => {
             return Err(Error::new(
                 ErrorKind::InvalidOperation,
@@ -174,10 +193,36 @@ fn keywords(language: &str) -> Result<&'static [&'static str], Error> {
     })
 }
 
+/// `name` as the value of a Go `json:"..."` struct tag. `encoding/json` silently ignores tags whose
+/// name has a quote, backslash, comma or other punctuation outside its allowed set, so such a name
+/// is rejected instead of generating a struct that serializes under the wrong key. Plain structs
+/// check `go_taggable` first and encode such fields by hand.
+pub(crate) fn go_tag(name: &str) -> Result<String, Error> {
+    const ALLOWED: &str = "!#$%&()*+-./:;<=>?@[]^_{|}~ ";
+    if name.is_empty()
+        || !name
+            .chars()
+            .all(|c| c.is_alphanumeric() || ALLOWED.contains(c))
+    {
+        return Err(Error::new(
+            ErrorKind::InvalidOperation,
+            format!(
+                "go codegen: the property name {name:?} cannot be a `json` struct tag \
+                 (quotes, backslashes, commas and control characters are not allowed), \
+                 rename it in the spec"
+            ),
+        ));
+    }
+    Ok(name.to_owned())
+}
+
 /// `name` as a `case` (`snake`, `camel`, `pascal` or `shouty`) identifier. Comparison operators
 /// become words (`created<` is `created_lt`), other punctuation separates words, a leading digit
 /// gets a `value` prefix and, given a `language`, its keywords get escaped.
 pub(crate) fn ident(name: &str, case: &str, language: Option<&str>) -> Result<String, Error> {
+    if let Some(words) = symbol_words(name) {
+        return ident(&words, case, language);
+    }
     let mut words = String::with_capacity(name.len());
     let mut chars = name.chars().peekable();
     let mut previous = None;
@@ -216,8 +261,14 @@ pub(crate) fn ident(name: &str, case: &str, language: Option<&str>) -> Result<St
     } else if out.starts_with(|c: char| c.is_ascii_digit()) {
         out = convert(&format!("value {words}"))?;
     }
+    if language == Some("go") && case == "pascal" && !out.starts_with(|c: char| c.is_uppercase()) {
+        // A first rune that is not an uppercase letter would leave the field unexported.
+        out.insert(0, 'X');
+    }
     if let Some(language) = language
-        && keywords(language)?.contains(&out.as_str())
+        && keywords(language)?
+            .iter()
+            .any(|set| set.contains(&out.as_str()))
     {
         out = match language == "rust" && !RUST_NOT_RAW.contains(&out.as_str()) {
             true => format!("r#{out}"),
@@ -225,6 +276,85 @@ pub(crate) fn ident(name: &str, case: &str, language: Option<&str>) -> Result<St
         };
     }
     Ok(out)
+}
+
+/// The words naming a value made only of punctuation (`-` is `minus`, `*` is `star`), so that such
+/// values stay distinct instead of all becoming `empty`. Operators `ident` already spells (`+`,
+/// `<`, `>`, `=`) and values with any letter or digit are left to it.
+fn symbol_words(name: &str) -> Option<String> {
+    if name.is_empty() || name.chars().any(char::is_alphanumeric) {
+        return None;
+    }
+    let words: Option<Vec<&str>> = name
+        .chars()
+        .map(|c| {
+            Some(match c {
+                '-' => "minus",
+                '*' => "star",
+                '/' => "slash",
+                '\\' => "backslash",
+                '.' => "dot",
+                ',' => "comma",
+                ':' => "colon",
+                ';' => "semicolon",
+                '_' => "underscore",
+                '#' => "hash",
+                '@' => "at",
+                '&' => "and",
+                '%' => "percent",
+                '!' => "bang",
+                '?' => "question",
+                '~' => "tilde",
+                '^' => "caret",
+                '|' => "pipe",
+                '$' => "dollar",
+                '+' => "plus",
+                '<' => "lt",
+                '>' => "gt",
+                '=' => "eq",
+                '(' => "lparen",
+                ')' => "rparen",
+                '[' => "lbracket",
+                ']' => "rbracket",
+                '{' => "lbrace",
+                '}' => "rbrace",
+                '\'' => "apostrophe",
+                '"' => "dquote",
+                '`' => "backtick",
+                _ => return None,
+            })
+        })
+        .collect();
+    words.map(|w| w.join(" "))
+}
+
+/// The names to derive the identifiers of enum `values` from: the values themselves, except that
+/// one whose identifier another earlier value already has (`a-b` and `a_b`, `Active` and `active`)
+/// gets a number suffix, so every enum member is named while the wire values stay as they are.
+pub(crate) fn enum_names(values: &[String]) -> Vec<String> {
+    const CASES: [&str; 3] = ["pascal", "shouty", "snake"];
+    let key = |name: &str| -> Vec<String> {
+        CASES
+            .iter()
+            .map(|case| ident(name, case, None).unwrap_or_default())
+            .collect()
+    };
+    let mut used: Vec<Vec<String>> = Vec::with_capacity(values.len());
+    let mut names = Vec::with_capacity(values.len());
+    for value in values {
+        let mut name = value.clone();
+        let mut n = 1;
+        while used
+            .iter()
+            .any(|u| u.iter().zip(key(&name)).any(|(a, b)| *a == b))
+        {
+            n += 1;
+            name = format!("{value} {n}");
+        }
+        used.push(key(&name));
+        names.push(name);
+    }
+    names
 }
 
 /// [`ident`] of every name, failing when two names of `owner` become the same identifier.
@@ -272,6 +402,35 @@ mod tests {
     }
 
     #[test]
+    fn python_members_avoid_shadowing() {
+        let field = |n: &str| ident(n, "snake", Some("python_field")).unwrap();
+        let method = |n: &str| ident(n, "snake", Some("python")).unwrap();
+        assert_eq!(method("str"), "str_");
+        assert_eq!(method("self"), "self_");
+        assert_eq!(method("list"), "list");
+        assert_eq!(field("list"), "list_");
+        assert_eq!(field("str"), "str_");
+        assert_eq!(field("to_dict"), "to_dict_");
+        assert_eq!(field("toJson"), "to_json_");
+        assert_eq!(field("extra_fields"), "extra_fields_");
+        assert_eq!(field("name"), "name");
+        assert_eq!(field("type"), "type");
+        assert_eq!(field("object"), "object");
+        assert_eq!(field("tuple"), "tuple_");
+    }
+
+    #[test]
+    fn go_fields_are_exported_and_tags_checked() {
+        assert_eq!(ident("名前", "pascal", Some("go")).unwrap(), "X名前");
+        assert_eq!(ident("name", "pascal", Some("go")).unwrap(), "Name");
+        assert_eq!(go_tag("user-id").unwrap(), "user-id");
+        assert_eq!(go_tag("名前").unwrap(), "名前");
+        assert!(go_tag("say\"hi").is_err());
+        assert!(go_tag("back\\slash").is_err());
+        assert!(go_tag("a,b").is_err());
+    }
+
+    #[test]
     fn punctuation_digits_and_empty_names_become_identifiers() {
         assert_eq!(rust("DateCreated<"), "date_created_lt");
         assert_eq!(rust("DateCreated>="), "date_created_gt_eq");
@@ -288,6 +447,20 @@ mod tests {
         assert_eq!(ident("3d", "pascal", None).unwrap(), "Value3d");
         assert_eq!(ident("", "pascal", None).unwrap(), "Empty");
         assert_eq!(ident("a.b", "shouty", None).unwrap(), "A_B");
+    }
+
+    #[test]
+    fn symbols_are_named_and_enum_collisions_get_numbers() {
+        assert_eq!(ident("-", "pascal", None).unwrap(), "Minus");
+        assert_eq!(ident("*", "pascal", None).unwrap(), "Star");
+        assert_eq!(ident("/", "shouty", None).unwrap(), "SLASH");
+        let names = |v: &[&str]| enum_names(&v.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+        assert_eq!(names(&["a-b", "a_b"]), ["a-b", "a_b 2"]);
+        assert_eq!(names(&["Active", "active"]), ["Active", "active 2"]);
+        assert_eq!(names(&["x", "y"]), ["x", "y"]);
+        let all = names(&["a-b", "a_b", "A B"]);
+        assert!(idents(&all, "pascal", None, "x").is_ok());
+        assert!(idents(&all, "shouty", None, "x").is_ok());
     }
 
     #[test]

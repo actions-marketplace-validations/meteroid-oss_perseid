@@ -3,6 +3,7 @@ package @@JAVA_INTERNAL_PACKAGE@@;
 
 import @@JAVA_PACKAGE@@.exceptions.InvalidDataException;
 import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.JsonNode;
 import java.io.UncheckedIOException;
 
@@ -23,6 +24,22 @@ public final class Unions {
             return Utils.objectMapper().convertValue(value, type);
         } catch (IllegalArgumentException e) {
             throw new InvalidDataException("not a " + type.getSimpleName() + ": " + e.getMessage(), e);
+        }
+    }
+
+    /**
+     * {@code value} converted to a generic {@code type} through its JSON form.
+     *
+     * @param <T> the type
+     * @param value the value
+     * @param type the type
+     * @return the converted value
+     */
+    public static <T> T convert(Object value, TypeReference<T> type) {
+        try {
+            return Utils.objectMapper().convertValue(value, type);
+        } catch (IllegalArgumentException e) {
+            throw new InvalidDataException("not a " + type.getType().getTypeName() + ": " + e.getMessage(), e);
         }
     }
 
@@ -77,5 +94,42 @@ public final class Unions {
             }
         }
         return best;
+    }
+
+    /**
+     * The indexes of the candidates, as their required then known properties, whose required
+     * properties the JSON object {@code node} all has, best match first: the one knowing the most
+     * of its properties, the first one on ties. Decoding tries them in this order.
+     *
+     * @param node the JSON object
+     * @param candidates per variant, its required then known properties
+     * @return the indexes of the variants that fit, best first
+     */
+    public static int[] rank(JsonNode node, String[][]... candidates) {
+        int[] order = new int[candidates.length];
+        int[] scores = new int[candidates.length];
+        int count = 0;
+        for (int i = 0; i < candidates.length; i++) {
+            boolean fits = true;
+            for (String property : candidates[i][0]) {
+                fits &= node.has(property);
+            }
+            if (!fits) {
+                continue;
+            }
+            int score = 0;
+            for (String property : candidates[i][1]) {
+                score += node.has(property) ? 1 : 0;
+            }
+            int at = count++;
+            while (at > 0 && scores[at - 1] < score) {
+                order[at] = order[at - 1];
+                scores[at] = scores[at - 1];
+                at--;
+            }
+            order[at] = i;
+            scores[at] = score;
+        }
+        return java.util.Arrays.copyOf(order, count);
     }
 }

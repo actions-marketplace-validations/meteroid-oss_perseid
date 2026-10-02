@@ -13,15 +13,15 @@
             {%- if not (t.to_go() in ["string", "bool", "int16", "int32", "int64", "uint16", "uint64", "float32", "float64"] or (t.is_schema_ref() and v.json_type not in ["", "object"])) %}{% set ns.ok = false %}{% endif -%}
         {%- endfor -%}
     {%- endif -%}
-    {%- if ns.ok %}{{ (go_ident(resource.name) ~ (op.name | ident("pascal", "go")) ~ (p.name | ident("pascal", "go"))) | go_name }}{% else %}{{ go_type(p.type) }}{% endif -%}
+    {%- if ns.ok %}{{ (go_ident(resource.name) ~ (op.name | ident("pascal", "go")) ~ (p.ident | ident("pascal", "go"))) | go_name }}{% else %}{{ go_type(p.type) }}{% endif -%}
 {%- endmacro -%}
 {#- `(ctx, ...)` of a method, without the request options every method takes last. -#}
 {% macro params(resource, op) -%}
     {%- set prefix = go_ident(resource.name) ~ (op.name | ident("pascal", "go")) -%}
     {%- set args = namespace(list=["ctx"], taken=[]) -%}
-    {%- for p in op.path_params %}{% set args.list = args.list + [go_arg(p) ~ " string"] %}{% set args.taken = args.taken + [go_arg(p)] %}{% endfor -%}
-    {%- for p in op.query_params if p.required %}{% set args.list = args.list + [go_arg(p.name) ~ " " ~ param_type(resource, op, p)] %}{% set args.taken = args.taken + [go_arg(p.name)] %}{% endfor -%}
-    {%- for p in op.header_params if p.required %}{% set args.list = args.list + [go_arg(p.name) ~ " " ~ go_header_type(p)] %}{% set args.taken = args.taken + [go_arg(p.name)] %}{% endfor -%}
+    {%- for p in op.path_params %}{% set args.list = args.list + [go_arg(p) ~ " " ~ (go_type(op.path_styles[p].type) if p in op.path_styles and op.path_styles[p].type is defined else "string")] %}{% set args.taken = args.taken + [go_arg(p)] %}{% endfor -%}
+    {%- for p in op.query_params if p.required %}{% set args.list = args.list + [go_arg(p.ident) ~ " " ~ param_type(resource, op, p)] %}{% set args.taken = args.taken + [go_arg(p.ident)] %}{% endfor -%}
+    {%- for p in op.header_params if p.required %}{% set args.list = args.list + [go_arg(p.ident) ~ " " ~ go_header_type(p)] %}{% set args.taken = args.taken + [go_arg(p.ident)] %}{% endfor -%}
     {%- if op.request_body_schema_name is defined -%}
         {%- set body_var = go_local(op.request_body_schema_name) -%}
         {%- if body_var in ["ctx", "options", "opts", "req", "a", "out", "params", "resp", "page", "next", "current", "last", "item"] or body_var in args.taken %}{% set body_var = "body" %}{% endif -%}

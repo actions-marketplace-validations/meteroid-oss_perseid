@@ -1,3 +1,4 @@
+{% import "types/macros.java.jinja" as import_m -%}
 {% import "docs.jinja" as docs -%}
 {% set _ = set_summary_filename("api.md") -%}
 {% macro model(name) -%}
@@ -8,12 +9,16 @@
 {% macro params(resource, op) -%}
     {%- set owner = "operation `" ~ op.id ~ "`" -%}
     {%- set required = (op.query_params + op.header_params) | selectattr("required") | list -%}
-    {%- set positional = op.path_params + (required | map(attribute="name") | list) -%}
+    {%- set positional = op.path_params + (required | map(attribute="ident") | list) -%}
     {%- set names = positional | idents("camel", "java", owner) -%}
     {%- set args = namespace(list=[]) -%}
     {%- for p in positional -%}
         {%- set index = loop.index0 - op.path_params | length -%}
-        {%- set ty = "String" if index < 0 else (required[index].type.to_java() if required[index].type is defined else "String") -%}
+        {%- if index < 0 -%}
+            {%- set ty = op.path_styles[p].type.to_java() if p in op.path_styles and op.path_styles[p].type is defined else "String" -%}
+        {%- else -%}
+            {%- set ty = required[index].type.to_java() if required[index].type is defined else "String" -%}
+        {%- endif -%}
         {%- set args.list = args.list + [ty ~ " " ~ names[loop.index0]] -%}
     {%- endfor -%}
     {%- if op.request_body_schema_name is defined -%}
@@ -22,7 +27,7 @@
         {%- if body_var in ["options", "url", "headers", "client", "requestOptions", "sync", "raw"] or body_var in names %}{% set body_var = "body" %}{% endif -%}
         {%- set args.list = args.list + [("List<" ~ body_type ~ ">" if op.request_body_is_list else body_type) ~ " " ~ body_var] -%}
     {%- elif op.request_body_json_type is defined -%}
-        {%- set args.list = args.list + [op.request_body_json_type.to_java() ~ " body"] -%}
+        {%- set args.list = args.list + [(import_m.java_type(op.request_body_json_type, op.request_body_union | to_upper_camel_case) if op.request_body_union is defined else op.request_body_json_type.to_java()) ~ " body"] -%}
     {%- elif op.request_body_kind == "binary" -%}
         {%- set args.list = args.list + ["Upload body"] -%}
     {%- elif op.request_body_kind == "multipart" -%}
@@ -34,10 +39,12 @@
     ({{ args.list | join(", ") }})
 {%- endmacro -%}
 {% macro returned(op) -%}
-    {%- if op.response_is_event_stream %}EventStream<{{ op.event_schema_name | to_upper_camel_case if op.event_schema_name is defined else "SseEvent" }}>
+    {%- if op.response_is_event_stream and op.event_json_type is defined %}EventStream<{{ import_m.java_type(op.event_json_type, op.event_schema_name | to_upper_camel_case) }}>
+    {%- elif op.response_is_event_stream %}EventStream<{{ op.event_schema_name | to_upper_camel_case if op.event_schema_name is defined else "SseEvent" }}>
     {%- elif op.response_is_binary %}byte[]
+    {%- elif op.response_is_text %}String
     {%- else -%}
-        {%- if op.response_body_json_type is defined %}{% set body = op.response_body_json_type.to_java() -%}
+        {%- if op.response_body_json_type is defined %}{% set body = import_m.java_type(op.response_body_json_type, op.response_body_union | to_upper_camel_case) if op.response_body_union is defined else op.response_body_json_type.to_java() -%}
         {%- elif op.response_body_is_list %}{% set body = "List<" ~ (op.response_body_schema_name | to_upper_camel_case) ~ ">" -%}
         {%- elif op.response_body_schema_name is defined %}{% set body = op.response_body_schema_name | to_upper_camel_case -%}
         {%- else %}{% set body = "void" %}{% endif -%}
@@ -45,10 +52,12 @@
     {%- endif -%}
 {%- endmacro -%}
 {% macro returns(op) -%}
-    {%- if op.response_is_event_stream %}{% if op.event_schema_name is defined %}stream of {{ model(op.event_schema_name) }}{% else %}event stream{% endif %}
+    {%- if op.response_is_event_stream and op.event_json_type is defined %}stream of `{{ import_m.java_type(op.event_json_type, op.event_schema_name | to_upper_camel_case) }}`
+    {%- elif op.response_is_event_stream %}{% if op.event_schema_name is defined %}stream of {{ model(op.event_schema_name) }}{% else %}event stream{% endif %}
     {%- elif op.response_is_binary %}bytes
+    {%- elif op.response_is_text %}text
     {%- elif op.response_body_schema_name is defined %}{{ model(op.response_body_schema_name) }}{% if op.response_body_is_list %} list{% endif %}
-    {%- elif op.response_body_json_type is defined %}`{{ op.response_body_json_type.to_java() }}`
+    {%- elif op.response_body_json_type is defined %}`{{ import_m.java_type(op.response_body_json_type, op.response_body_union | to_upper_camel_case) if op.response_body_union is defined else op.response_body_json_type.to_java() }}`
     {%- else %}nothing{% endif -%}
 {%- endmacro -%}
 {% macro table(resource) -%}

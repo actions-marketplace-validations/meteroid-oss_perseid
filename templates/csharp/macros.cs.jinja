@@ -60,10 +60,11 @@
 {%- endif %}
 {%- endmacro %}
 
-{# A PascalCase member name, which C# forbids to equal its enclosing type's. -#}
+{# A PascalCase member name, which C# forbids to equal its enclosing type's or to redeclare a
+   member every record inherits or synthesizes. -#}
 {% macro member(name, owner) -%}
 {% set id = name | to_rust_variant -%}
-{% if id == owner %}{{ id }}Value{% else %}{{ id }}{% endif %}
+{% if id == owner or id in ["Equals", "GetHashCode", "ToString", "GetType", "MemberwiseClone", "ReferenceEquals", "Finalize", "EqualityContract", "PrintMembers", "Deconstruct"] %}{{ id }}Value{% else %}{{ id }}{% endif %}
 {%- endmacro %}
 
 {# The class of a resource: `ActivityApi` for both `activity` and a renamed `activity_api`. -#}
@@ -98,7 +99,7 @@
 {% macro union_class(field, owner, taken) -%}
 {% set t = namespace(ty=field.type) -%}
 {% for _ in range(8) -%}
-{% if t.ty.is_list() or t.ty.is_set() %}{% set t.ty = t.ty.inner_type() %}{% elif t.ty.is_map() %}{% set t.ty = t.ty.value_type() %}{% endif -%}
+{% if t.ty.is_list() or t.ty.is_set() or t.ty.is_nullable() %}{% set t.ty = t.ty.inner_type() %}{% elif t.ty.is_map() %}{% set t.ty = t.ty.value_type() %}{% endif -%}
 {% endfor -%}
 {% if t.ty.is_union() -%}
 {% set id = owner ~ (field.name | to_rust_variant) -%}
@@ -107,27 +108,82 @@
 {%- endmacro %}
 
 
+{# The class of the union named `name` by an operation body: a model of `types` when it is a named
+   alias (declared with the models), else declared with the resource. -#}
+{% macro union_ref(name, types) -%}
+{% if name in types %}{{ model(name) }}{% else %}{{ name | to_upper_camel_case }}{% endif %}
+{%- endmacro %}
+
+{# The C# type of a JSON body of the type `ty`, its union (named `union`, if any) typed. A union is a
+   reference type: `typeof` cannot take a nullable one, so it is never written with `?`. -#}
+{% macro json_body_type(ty, union, types) -%}
+{% if union %}{{ ty.to_csharp() | replace("JsonNode", union_ref(union, types)) | trim("?") }}{% else %}{{ ty.to_csharp() }}{% endif %}
+{%- endmacro %}
+
 {# The C# type of an operation's JSON request body, empty without one. -#}
-{% macro body_type(op) -%}
+{% macro body_type(op, types={}) -%}
 {% if op.request_body_schema_name is defined -%}
 {% if op.request_body_is_list %}List<{% endif %}{{ model(op.request_body_schema_name) }}{% if op.request_body_is_list %}>{% endif %}
 {%- elif op.request_body_json_type is defined -%}
-{{ op.request_body_json_type.to_csharp() }}
+{{ json_body_type(op.request_body_json_type, op.request_body_union | default(""), types) }}
+{%- endif %}
+{%- endmacro %}
+
+{# The union named after the event schema of an event stream, when that schema is an alias whose
+   target holds a union: declared like the union of a JSON body. Empty otherwise. -#}
+{% macro event_union(op) -%}
+{% if op.event_json_type is defined -%}
+{% set t = namespace(ty=op.event_json_type) -%}
+{% for _ in range(8) -%}
+{% if t.ty.is_list() or t.ty.is_set() or t.ty.is_nullable() %}{% set t.ty = t.ty.inner_type() %}{% elif t.ty.is_map() %}{% set t.ty = t.ty.value_type() %}{% endif -%}
+{% endfor -%}
+{% if t.ty.is_union() %}{{ op.event_schema_name }}{% endif -%}
+{% endif -%}
+{%- endmacro %}
+
+{# The C# type of each event of an event stream naming its schema: the model, or the target of an alias. -#}
+{% macro event_type(op, types={}) -%}
+{% if op.event_json_type is defined -%}
+{{ json_body_type(op.event_json_type, event_union(op), types) }}
+{%- else -%}
+{{ model(op.event_schema_name) }}
 {%- endif %}
 {%- endmacro %}
 
 {# The C# type of an operation's JSON response, empty without one. -#}
-{% macro response_type(op) -%}
+{% macro response_type(op, types={}) -%}
 {% if op.response_body_json_type is defined -%}
-{{ op.response_body_json_type.to_csharp() }}
+{{ json_body_type(op.response_body_json_type, op.response_body_union | default(""), types) }}
 {%- elif op.response_body_schema_name is defined -%}
 {% if op.response_body_is_list %}List<{% endif %}{{ model(op.response_body_schema_name) }}{% if op.response_body_is_list %}>{% endif %}
 {%- endif %}
 {%- endmacro %}
 
+{# Whether the C# type `ty` is a value type, which `?` makes a `Nullable<T>` of. -#}
+{% macro is_value_type(ty) -%}
+{% if ty in ["bool", "int", "long", "short", "ushort", "ulong", "float", "double", "decimal", "DateTimeOffset"] %}yes{% endif %}
+{%- endmacro %}
+
+{# The kind of the schema the JSON type `ty` names (`struct`, `string_enum`...), empty for other types. -#}
+{% macro schema_kind(ty, types={}) -%}
+{% if ty.is_schema_ref() -%}
+{% set inner = ty.inner_schema_ref_ty() -%}
+{% set target = inner or types[ty.to_csharp()] -%}
+{{ target.kind if target else "" }}
+{%- endif %}
+{%- endmacro %}
+
+{# `yes` when a required argument of the C# type `ty`, naming a schema of the kind `kind` (if any),
+   takes an `ArgumentNullException.ThrowIfNull` check: a non-nullable reference type. A value type
+   (number, boolean, date, enum record struct) is never null, so checking it is a no-op (CA2264),
+   and a nullable type accepts `null`. -#}
+{% macro needs_null_check(ty, kind="") -%}
+{% if ty[-1:] != "?" and not is_value_type(ty) and kind not in ["string_enum", "integer_enum"] %}yes{% endif %}
+{%- endmacro %}
+
 {# The `JsonContext` property of a body type: its name, or a flattened name for generics. -#}
 {% macro type_info(type) -%}
-{% set type = type | replace("Models.", "") -%}
+{% set type = type | replace("Models.", "") | replace("?", "OrNull") -%}
 {% set clr = {"string": "String", "bool": "Boolean", "int": "Int32", "long": "Int64", "short": "Int16",
     "ushort": "UInt16", "ulong": "UInt64", "float": "Single", "double": "Double", "decimal": "Decimal"} -%}
 {% if "<" in type %}Json{{ type | to_upper_camel_case }}{% else %}{{ clr[type] | default(type) }}{% endif %}

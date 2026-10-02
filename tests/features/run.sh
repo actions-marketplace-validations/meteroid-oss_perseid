@@ -13,12 +13,21 @@ FEATURES_URL=$(cat "$url")
 export FEATURES_URL
 case $lang in
   typescript)
+    # The int64 scenarios need exact 64-bit integers: regenerate the SDK with `int64 = "bigint"`.
+    if ! grep -q '^int64 = "bigint"' ../perseid.toml; then
+      if grep -q '^\[typescript\]' ../perseid.toml; then
+        sed -i '/^\[typescript\]/a int64 = "bigint"' ../perseid.toml
+      else
+        printf '\n[typescript]\nint64 = "bigint"\n' >> ../perseid.toml
+      fi
+      (cd .. && perseid generate typescript)
+    fi
     mkdir -p smoke && cp "$here/smoke.ts" smoke/
     npx tsc --outDir smoke-build --rootDir . --strict --target es2020 --module commonjs --lib es2020,dom --types node --skipLibCheck smoke/smoke.ts
     echo '{"type":"commonjs"}' > smoke-build/package.json
     node smoke-build/smoke/smoke.js ;;
   python) cp "$here/smoke.py" . && uv run --no-project python smoke.py ;;
-  go) cp "$here/smoke_test.go" . && go test -run TestSmoke -count=1 . ;;
+  go) cp "$here/smoke_test.go" . && go test -run 'TestSmoke|TestScenario' -count=1 . ;;
   java)
     mkdir -p smoke && cp "$here/Smoke.java" smoke/
     grep -q "register('smoke'" build.gradle || cat >> build.gradle <<'GRADLE'
