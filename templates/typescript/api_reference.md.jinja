@@ -20,7 +20,7 @@
 {% macro signature(resource, op) -%}
     {%- set type_name = resource.name | to_upper_camel_case ~ (op.name | to_upper_camel_case) -%}
     {%- set params = namespace(list=[]) -%}
-    {%- for p in op.typed_path_params %}{% set params.list = params.list + [(p.name | ident("camel", "typescript")) ~ ": " ~ text_type(p.type)] %}{% endfor -%}
+    {%- for p in op.typed_path_params %}{% set params.list = params.list + [(p.name | ident("camel", "typescript")) ~ ": " ~ (m.js_type(op.path_styles[p.name].type) if p.name in op.path_styles and op.path_styles[p.name].type is defined else text_type(p.type))] %}{% endfor -%}
     {%- set body_arg = op.request_body_schema_name | ident("camel", "typescript") if op.request_body_schema_name is defined else "body" -%}
     {%- if body_arg in ["request", "options", "requestOptions"] or body_arg in (op.path_params | map("ident", "camel", "typescript") | list) %}{% set body_arg = "body" %}{% endif -%}
     {%- if op.request_body_schema_name is defined -%}

@@ -16,7 +16,7 @@
             {
 {%- for field in type.fields %}
 {%- set ty = m.field_type(field, m.union_class(field, type_name, type_names)) %}
-                {{ m.member(field.name, type_name) }} = {% if field.required %}Json.Deserialize<{{ ty }}>(Json.Property(root, "{{ field.name }}"), options){% else %}Json.Optional<{{ ty }}>(root, "{{ field.name }}", options){% endif %},
+                {{ m.member(field.name, type_name) }} = {% if field.required %}Json.Deserialize<{{ ty }}>(Json.Property(root, {{ field.name | tojson }}), options){% else %}Json.Optional<{{ ty }}>(root, {{ field.name | tojson }}, options){% endif %},
 {%- endfor %}
             }{% endif %}
 {%- endmacro -%}
@@ -62,7 +62,7 @@ public abstract partial record {{ type_name }}
 {%- endif %}
     {
         /// <inheritdoc/>
-        public override string {{ tag_prop }} => "{{ variant.name }}";
+        public override string {{ tag_prop }} => {{ variant.name | tojson }};
     }
 {%- if variant.type == "struct" and variant.fields | default([]) | length > 0 %}
 
@@ -105,11 +105,11 @@ internal sealed class {{ type_name }}Converter : JsonConverter<{{ type_name }}>
     {
         using var document = JsonDocument.ParseValue(ref reader);
         var root = document.RootElement;
-        return Json.Tag(root, "{{ tag_json }}") switch
+        return Json.Tag(root, {{ tag_json | tojson }}) switch
         {
 {%- for variant in type.variants %}
 {%- set class = variant_class(variant) %}
-{%- set source %}{% if adjacent %}Json.Property(root, "{{ type.content_field }}"){% else %}root{% endif %}{% endset %}
+{%- set source %}{% if adjacent %}Json.Property(root, {{ type.content_field | tojson }}){% else %}root{% endif %}{% endset %}
 {%- if variant.type == "ref" and variant.schema_ref is defined %}
 {%- set args = ["Json.Deserialize<" ~ (variant.schema_ref | to_upper_camel_case) ~ ">(" ~ source ~ ", options)"] %}
 {%- elif variant.type == "struct" and variant.fields | default([]) | length > 0 %}
@@ -117,7 +117,7 @@ internal sealed class {{ type_name }}Converter : JsonConverter<{{ type_name }}>
 {%- else %}
 {%- set args = [] %}
 {%- endif %}
-            {{ m.wrap("\"" ~ variant.name ~ "\" => new " ~ type_name ~ "." ~ class, args, 12, "" if type.fields else ",") }}{{ base_init() }}{% if type.fields %},{% endif %}
+            {{ m.wrap((variant.name | tojson) ~ " => new " ~ type_name ~ "." ~ class, args, 12, "" if type.fields else ",") }}{{ base_init() }}{% if type.fields %},{% endif %}
 {%- endfor %}
             var tag => new {{ type_name }}.Unrecognized(tag ?? string.Empty, root.Clone()){{ base_init() }},
         };
@@ -134,11 +134,11 @@ internal sealed class {{ type_name }}Converter : JsonConverter<{{ type_name }}>
 {%- for field in type.fields %}
 {%- set prop = m.member(field.name, type_name) %}
 {%- if field.required %}
-        fields.Add(new("{{ field.name }}", Json.ToNode(value.{{ prop }}, options)));
+        fields.Add(new({{ field.name | tojson }}, Json.ToNode(value.{{ prop }}, options)));
 {%- else %}
         if (value.{{ prop }} is not null)
         {
-            fields.Add(new("{{ field.name }}", Json.ToNode(value.{{ prop }}, options)));
+            fields.Add(new({{ field.name | tojson }}, Json.ToNode(value.{{ prop }}, options)));
         }
 {%- endif %}
 {%- endfor %}
@@ -149,7 +149,7 @@ internal sealed class {{ type_name }}Converter : JsonConverter<{{ type_name }}>
 {%- if (variant.type == "ref" and variant.schema_ref is defined) or (variant.type == "struct" and variant.fields | default([]) | length > 0) %}
             case {{ type_name }}.{{ class }} variant:
 {%- if adjacent %}
-                fields.Add(new("{{ type.content_field }}", Json.ToNode(variant.Value, options)));
+                fields.Add(new({{ type.content_field | tojson }}, Json.ToNode(variant.Value, options)));
 {%- else %}
                 fields.AddRange(Json.ToObject(variant.Value, options));
 {%- endif %}
@@ -157,7 +157,7 @@ internal sealed class {{ type_name }}Converter : JsonConverter<{{ type_name }}>
 {%- endif %}
 {%- endfor %}
         }
-        Json.WriteTagged(writer, "{{ tag_json }}", value.{{ tag_prop }}, fields, options);
+        Json.WriteTagged(writer, {{ tag_json | tojson }}, value.{{ tag_prop }}, fields, options);
     }
 }
 {%- with fields = type.fields, union_owner = type_name %}{% include "types/unions.cs.jinja" %}{% endwith %}

@@ -29,16 +29,46 @@ func extraFields(data []byte, known ...string) map[string]json.RawMessage {
 	return fields
 }
 
+// typedExtraFields is extraFields for a model whose additionalProperties
+// schema types the values: it decodes each unknown property of data as a T
+// into target, which is left nil when there are none.
+func typedExtraFields[T any](target *map[string]T, data []byte, known ...string) error {
+	raw := extraFields(data, known...)
+	if raw == nil {
+		*target = nil
+		return nil
+	}
+	fields := make(map[string]T, len(raw))
+	for name, value := range raw {
+		var decoded T
+		if err := json.Unmarshal(value, &decoded); err != nil {
+			return fmt.Errorf("@@PACKAGE_NAME@@: additional property %q: %w", name, err)
+		}
+		fields[name] = decoded
+	}
+	*target = fields
+	return nil
+}
+
 // marshalWithExtra encodes v, an object, followed by the extra properties it
 // does not already have, in name order.
-func marshalWithExtra(v any, extra map[string]json.RawMessage) ([]byte, error) {
+func marshalWithExtra[T any](v any, extra map[string]T) ([]byte, error) {
 	data, err := json.Marshal(v)
 	if err != nil || len(extra) == 0 {
 		return data, err
 	}
+	return appendExtra(data, extra)
+}
+
+// appendExtra adds to data, an encoded JSON object, the extra properties it
+// does not already have, in name order.
+func appendExtra[T any](data []byte, extra map[string]T) ([]byte, error) {
+	if len(extra) == 0 {
+		return data, nil
+	}
 	var present map[string]json.RawMessage
 	if err := json.Unmarshal(data, &present); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("@@PACKAGE_NAME@@: a model with extra fields must encode to a JSON object: %w", err)
 	}
 	names := make([]string, 0, len(extra))
 	for name := range extra {
@@ -53,12 +83,16 @@ func marshalWithExtra(v any, extra map[string]json.RawMessage) ([]byte, error) {
 	separator := len(present) > 0
 	for _, name := range names {
 		value := extra[name]
-		if len(bytes.TrimSpace(value)) == 0 {
+		if raw, ok := any(value).(json.RawMessage); ok && len(bytes.TrimSpace(raw)) == 0 {
 			continue
 		}
 		key, err := json.Marshal(name)
 		if err != nil {
 			return nil, err
+		}
+		encoded, err := json.Marshal(value)
+		if err != nil {
+			return nil, fmt.Errorf("@@PACKAGE_NAME@@: extra field %s is not JSON: %w", key, err)
 		}
 		if separator {
 			out.WriteByte(',')
@@ -66,9 +100,7 @@ func marshalWithExtra(v any, extra map[string]json.RawMessage) ([]byte, error) {
 		separator = true
 		out.Write(key)
 		out.WriteByte(':')
-		if err := json.Compact(&out, value); err != nil {
-			return nil, fmt.Errorf("@@PACKAGE_NAME@@: extra field %s is not JSON: %w", key, err)
-		}
+		out.Write(encoded)
 	}
 	out.WriteByte('}')
 	return out.Bytes(), nil

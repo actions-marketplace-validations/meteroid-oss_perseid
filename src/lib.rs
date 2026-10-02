@@ -1,5 +1,6 @@
 mod api;
 pub mod assets;
+pub mod client_name;
 mod codesamples;
 pub mod config;
 mod docs;
@@ -13,6 +14,8 @@ pub mod init;
 mod postprocessing;
 pub mod pr;
 mod prompt;
+mod reserved;
+pub mod samples;
 pub mod scaffold;
 pub mod sizing;
 pub mod spec;

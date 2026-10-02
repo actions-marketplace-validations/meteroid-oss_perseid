@@ -7,17 +7,18 @@
 {% set context = sdk.client_name ~ "JsonContext.Default" -%}
 {#- What each operation takes and returns, shared by the interfaces and classes below. -#}
 {% macro facts(f, op) -%}
-{% set f.body_type = m.body_type(op) -%}
+{% set f.body_type = m.body_type(op, types) -%}
 {% if op.request_body_kind == "binary" %}{% set f.body_type = "Upload" %}{% elif op.request_body_kind == "multipart" %}{% set f.body_type = (resource.name | to_upper_camel_case) ~ (op.name | to_upper_camel_case) ~ "Body" %}{% endif -%}
 {% set f.body = m.param(op.request_body_schema_name | default("body")) -%}
 {% if f.body in ["options", "requestOptions", "cancellationToken", "request", "form"] or f.body in (op.path_params | map("to_lower_camel_case") | list) %}{% set f.body = "body" %}{% endif -%}
-{% set f.response_type = m.response_type(op) -%}
-{% if op.response_is_event_stream and op.event_schema_name is defined %}{% set f.value = "EventStream<" ~ m.model(op.event_schema_name) ~ ">" -%}
+{% set f.response_type = m.response_type(op, types) -%}
+{% if op.response_is_event_stream and op.event_schema_name is defined %}{% set f.value = "EventStream<" ~ m.event_type(op, types) ~ ">" -%}
 {% elif op.response_is_event_stream %}{% set f.value = "EventStream" -%}
 {% elif op.response_is_binary %}{% set f.value = "byte[]" -%}
 {% elif op.response_is_text %}{% set f.value = "string" -%}
 {% else %}{% set f.value = f.response_type -%}
 {% endif -%}
+{#- Without a value: a bodiless success next to one with a body, or a `null` body. -#}
 {% set f.may_be_empty = op.response_may_be_empty | default(false) and f.response_type and f.value == f.response_type and op.pagination is not defined -%}
 {% if f.may_be_empty %}{% set f.value = f.value ~ "?" %}{% endif -%}
 {% set f.takes_body = op.request_body_schema_name is defined or op.request_body_json_type is defined or op.request_body_kind in ["binary", "multipart"] -%}
@@ -25,9 +26,14 @@
 {% set f.required_options = op | has_required_query_or_header_params -%}
 {% set f.options_type = (resource.name | to_upper_camel_case) ~ (op.name | to_upper_camel_case) ~ "Options" -%}
 {%- endmacro -%}
+{#- The C# type of path parameter `p`: a string, unless its style or `content` types it. -#}
+{% macro path_param_type(op, p) -%}
+{% set styles = op.path_styles | default({}) -%}
+{% if p in styles and styles[p].type is defined %}{{ styles[p].type.to_csharp() }}{% else %}string{% endif %}
+{%- endmacro -%}
 {% macro params(op, f, defaults=true, cancellation=true) -%}
 {% set out = namespace(list=[]) -%}
-{% for p in op.path_params %}{% set out.list = out.list + ["string " ~ m.param(p)] %}{% endfor -%}
+{% for p in op.path_params %}{% set out.list = out.list + [path_param_type(op, p) ~ " " ~ m.param(p)] %}{% endfor -%}
 {% if f.takes_body -%}
 {% if op.request_body_optional and f.required_options %}{% set out.list = out.list + [f.body_type ~ "? " ~ f.body] -%}
 {% elif op.request_body_optional %}{% set out.list = out.list + [f.body_type ~ "? " ~ f.body ~ (" = null" if defaults else "")] -%}
@@ -70,10 +76,20 @@ requestOptions{% if cancellation %}, cancellationToken{% endif %}
 {#- The argument checks of a method body, each line starting with a newline. -#}
 {% macro checks(op, f) -%}
 {% for p in op.path_params %}
+{%- set ty = path_param_type(op, p) %}
+{%- if ty == "string" %}
         ArgumentException.ThrowIfNullOrEmpty({{ m.param(p) }});
+{%- elif m.needs_null_check(ty, m.schema_kind(op.path_styles[p].type, types) if p in op.path_styles | default({}) and op.path_styles[p].type is defined else "") %}
+        ArgumentNullException.ThrowIfNull({{ m.param(p) }});
+{%- endif %}
 {%- endfor -%}
 {% if f.takes_body and not op.request_body_optional %}
+{%- if op.request_body_schema_name is defined and not op.request_body_is_list %}{% set kind = (types[op.request_body_schema_name] or {}).kind | default("") %}
+{%- elif op.request_body_json_type is defined %}{% set kind = m.schema_kind(op.request_body_json_type, types) %}
+{%- else %}{% set kind = "" %}{% endif %}
+{%- if m.needs_null_check(f.body_type, kind) %}
         ArgumentNullException.ThrowIfNull({{ f.body }});
+{%- endif %}
 {%- endif -%}
 {% if f.required_options %}
         ArgumentNullException.ThrowIfNull(options);
@@ -81,26 +97,42 @@ requestOptions{% if cancellation %}, cancellationToken{% endif %}
 {%- endmacro -%}
 {#- The summary of an operation, starting with a newline. -#}
 {% macro summary(op) -%}
-{% if op.description is defined %}
+{% if op.description | default("") | trim %}
     {{ m.doc(op.description) | indent(4) }}
 {%- else %}
     /// <summary>Calls <c>{{ op.method | upper }} {{ op.path | replace("&", "&amp;") }}</c>.</summary>
 {%- endif -%}
 {%- endmacro -%}
 {% macro pager_type(op) -%}
-AsyncPager<{{ m.response_type(op) }}, {{ m.model(op.pagination.item_schema) }}>
+AsyncPager<{{ m.response_type(op, types) }}, {{ m.model(op.pagination.item_schema) }}>
 {%- endmacro -%}
 {#- The C# expression of the JSON `path` from `root`, typed `owner`, null-safe past its first step. -#}
 {% macro path_expr(root, path, owner) -%}
 {{ root }}{% for segment in path %}{% if not loop.first %}?{% endif %}.{{ m.member(segment, owner if loop.first else "") }}{% endfor %}
 {%- endmacro -%}
+{#- The unions of inline JSON bodies, declared after the classes: a named alias is declared with the models. -#}
+{% set bu = namespace(names=[], fields=[]) -%}
+{% for op in resource.operations -%}
+{% for union, ty in [(op.request_body_union | default(""), op.request_body_json_type | default(none)), (op.response_body_union | default(""), op.response_body_json_type | default(none)), (m.event_union(op), op.event_json_type | default(none))] -%}
+{% if union and ty is not none and union not in types and (union | to_upper_camel_case) not in bu.names -%}
+{% set bu.names = bu.names + [union | to_upper_camel_case] -%}
+{% set bu.fields = bu.fields + [{"name": union, "union_name": union | to_upper_camel_case, "type": ty, "required": true, "nullable": false}] -%}
+{% endif -%}
+{% endfor -%}
+{% endfor -%}
 // this file is @generated
 #pragma warning disable CS0612, CS0618 // generated code may use deprecated API
 #pragma warning disable CA1707, CA1711, CA1716, CA1720 // identifiers follow the API's own names
 using System;
 using System.Collections.Generic;
 using System.Net.Http;
+{%- if bu.fields %}
+using System.Text.Json;
+{%- endif %}
 using System.Text.Json.Nodes;
+{%- if bu.fields %}
+using System.Text.Json.Serialization;
+{%- endif %}
 using System.Text.Json.Serialization.Metadata;
 using System.Threading;
 using System.Threading.Tasks;
@@ -134,7 +166,7 @@ public interface {{ interface_name }}
     /// <exception cref="{{ class }}">{% for status in statuses.list %}{{ (("Any" if loop.first else "any") ~ " other status") if status == "default" else status }}{% if not loop.last %}, {% endif %}{% endfor %}: <c>Error</c> is the <see cref="Models.{{ statuses.schemas | map("to_upper_camel_case") | join("\"/>, <see cref=\"Models.") }}"/> body.</exception>
 {%- endfor %}
 {%- if op.deprecated %}
-    [Obsolete]
+    [Obsolete("Deprecated by the API.")]
 {%- endif %}
     {{ signature("Task" ~ ("<" ~ f.value ~ ">" if f.value else "") ~ " " ~ method_name, op, f, ";") }}
 {%- if op.pagination is defined %}
@@ -143,7 +175,7 @@ public interface {{ interface_name }}
     /// <c>await foreach</c> over it, or over its <c>AsPagesAsync()</c>.</summary>
 {{- param_docs(op, f, cancellation=false) }}
 {%- if op.deprecated %}
-    [Obsolete]
+    [Obsolete("Deprecated by the API.")]
 {%- endif %}
     {{ signature(pager_type(op) ~ " " ~ (op.name | to_upper_camel_case) ~ "AutoPagingAsync", op, f, ";", cancellation=false) }}
 {%- endif %}
@@ -160,7 +192,7 @@ public interface {{ raw_interface_name }}
     /// <summary><see cref="{{ interface_name }}.{{ method_name }}"/>, with the status and headers of the response.</summary>
 {{- param_docs(op, f) }}
 {%- if op.deprecated %}
-    [Obsolete]
+    [Obsolete("Deprecated by the API.")]
 {%- endif %}
     {{ signature("Task<ApiResponse" ~ ("<" ~ f.value ~ ">" if f.value else "") ~ "> " ~ method_name, op, f, ";") }}
 {%- endfor %}
@@ -190,7 +222,7 @@ public sealed partial class {{ resource_type_name }} : {{ interface_name }}
 
     /// <inheritdoc/>
 {%- if op.deprecated %}
-    [Obsolete]
+    [Obsolete("Deprecated by the API.")]
 {%- endif %}
 {%- if f.value %}
     {{ signature("public async Task<" ~ f.value ~ "> " ~ method_name, op, f) }}
@@ -213,30 +245,30 @@ public sealed partial class {{ resource_type_name }} : {{ interface_name }}
 {%- if op.pagination is defined %}
 {%- set pg = op.pagination %}
 {%- set param = op.query_params | selectattr("name", "equalto", pg.param) | first %}
-{%- set property = m.member(pg.param, f.options_type) %}
+{%- set property = m.member(param.ident, f.options_type) %}
 {%- set first = "options" if f.required_options else "(options ?? new())" %}
 {%- set response_class = op.response_body_schema_name | to_upper_camel_case %}
 {%- set item_class = pg.item_schema | to_upper_camel_case %}
 
     /// <inheritdoc/>
 {%- if op.deprecated %}
-    [Obsolete]
+    [Obsolete("Deprecated by the API.")]
 {%- endif %}
     {{ signature("public " ~ pager_type(op) ~ " " ~ (op.name | to_upper_camel_case) ~ "AutoPagingAsync", op, f, cancellation=false) }}
     {
 {{- checks(op, f) }}
 {%- if pg.style == "cursor" %}
-        return Paging.Cursor<{{ m.response_type(op) }}, {{ m.model(pg.item_schema) }}>(
+        return Paging.Cursor<{{ m.response_type(op, types) }}, {{ m.model(pg.item_schema) }}>(
             options{% if not f.required_options %}?{% endif %}.{{ property }},
             (cursor, ct) => {{ method_name }}({% for p in op.path_params %}{{ m.param(p) }}, {% endfor %}{% if f.takes_body %}{{ f.body }}, {% endif %}{{ first }} with { {{ property }} = cursor }, requestOptions, ct),
 {%- else %}
-        return Paging.Numbered<{{ m.response_type(op) }}, {{ m.model(pg.item_schema) }}>(
+        return Paging.Numbered<{{ m.response_type(op, types) }}, {{ m.model(pg.item_schema) }}>(
             options{% if not f.required_options %}?{% endif %}.{{ property }} ?? {{ pg.first_page if pg.style == "page" else 0 }},
             {{ pg.first_page }},
             pages: {{ "true" if pg.style == "page" else "false" }},
             (param, ct) => {{ method_name }}({% for p in op.path_params %}{{ m.param(p) }}, {% endfor %}{% if f.takes_body %}{{ f.body }}, {% endif %}{{ first }} with { {{ property }} = ({{ param.type.to_csharp() }})param }, requestOptions, ct),
 {%- endif %}
-            page => {{ path_expr("page", pg.items, response_class) }}{% if pg.items | length > 1 %} ?? []{% endif %},
+            page => {{ path_expr("page", pg.items, response_class) }},
             {% if pg.has_more is defined %}page => {{ path_expr("page", pg.has_more, response_class) }}{% else %}null{% endif %},
 {%- if pg.style == "cursor" %}
 {%- if pg.next_cursor is defined %}
@@ -275,7 +307,7 @@ public sealed class {{ raw_type_name }} : {{ raw_interface_name }}
 
     /// <inheritdoc/>
 {%- if op.deprecated %}
-    [Obsolete]
+    [Obsolete("Deprecated by the API.")]
 {%- endif %}
     {{ signature("public Task<ApiResponse" ~ ("<" ~ f.value ~ ">" if f.value else "") ~ "> " ~ method_name, op, f) }}
     {
@@ -283,8 +315,18 @@ public sealed class {{ raw_type_name }} : {{ raw_interface_name }}
 {{- checked }}
 {%- if checked %}{{ "\n" }}{% endif %}
 {%- set path = namespace(value=op.path) %}
+{%- set styles = op.path_styles | default({}) %}
 {%- for p in op.path_params %}
+{%- if p in styles %}
+{%- set ps = styles[p] %}
+{%- set ty = path_param_type(op, p) %}
+{%- set segment = (m.param(p) | replace("@", "")) ~ "Segment" %}
+{%- set encode_args = [p | tojson, m.param(p)] + ([context ~ "." ~ m.type_info(ty)] if ty not in ["string", "JsonNode"] else []) + [ps.style | tojson, ps.explode | lower] %}
+        {{ m.wrap("var " ~ segment ~ " = ApiRequest.EncodePathParam", encode_args, 8, ";") }}
+{%- set path.value = path.value | replace("{" ~ p ~ "}", "{" ~ segment ~ "}") %}
+{%- else %}
 {%- set path.value = path.value | replace("{" ~ p ~ "}", "{Uri.EscapeDataString(" ~ m.param(p) ~ ")}") %}
+{%- endif %}
 {%- endfor %}
         {{ m.wrap("var request = new ApiRequest", ["HttpMethod." ~ (op.method | to_upper_camel_case), ("$" if op.path_params else "") ~ "\"" ~ path.value ~ "\"", "\"" ~ resource.name ~ "." ~ op.name ~ "\""], 8, ";") }}
 {%- if op.security is defined and op.security %}
@@ -316,20 +358,34 @@ public sealed class {{ raw_type_name }} : {{ raw_interface_name }}
 {%- endif %}
 {%- for p in op.query_params %}
 {%- set explode = p.explode | default(true) %}
-{%- set value %}options{% if not f.required_options %}?{% endif %}.{{ m.member(p.name, f.options_type) }}{% endset %}
+{%- set value %}options{% if not f.required_options %}?{% endif %}.{{ m.member(p.ident, f.options_type) }}{% endset %}
+{%- set wire = p.name | tojson %}
+{%- set typed = p.type.to_csharp() != "JsonNode" %}
+{%- set adder = "StructuredQuery" %}
 {%- if p.typed_union is defined %}
-{%- set query_args = ["\"" ~ p.name ~ "\"", value, context ~ "." ~ f.options_type ~ (p.name | to_rust_variant), p.deep_object | lower, explode | lower] %}
-{%- elif p.structured and p.type.to_csharp() == "JsonNode" %}
-{%- set query_args = ["\"" ~ p.name ~ "\"", value, p.deep_object | lower, explode | lower] %}
+{%- set query_args = [wire, value, context ~ "." ~ f.options_type ~ (p.ident | to_rust_variant), p.deep_object | lower, explode | lower] %}
+{%- elif p.structured and p.json %}
+{%- set adder = "JsonQuery" %}
+{%- set query_args = [wire, value] + ([context ~ "." ~ m.type_info(p.type.to_csharp())] if typed else []) %}
+{%- elif p.structured and p.delimiter is defined %}
+{%- set adder = "DelimitedQuery" %}
+{%- set query_args = [wire, value] + ([context ~ "." ~ m.type_info(p.type.to_csharp())] if typed else []) + [p.delimiter | tojson] %}
 {%- elif p.structured %}
-{%- set query_args = ["\"" ~ p.name ~ "\"", value, context ~ "." ~ m.type_info(p.type.to_csharp()), p.deep_object | lower, explode | lower] %}
+{%- set query_args = [wire, value] + ([context ~ "." ~ m.type_info(p.type.to_csharp())] if typed else []) + [p.deep_object | lower, explode | lower] %}
 {%- else %}
-{%- set query_args = ["\"" ~ p.name ~ "\"", value] + (["explode: false"] if (p.type.is_list() or p.type.is_set()) and not explode else []) %}
+{%- set adder = "Query" %}
+{%- set query_args = [wire, value] + (["explode: false"] if (p.type.is_list() or p.type.is_set()) and not explode else []) %}
 {%- endif %}
-        {{ m.wrap("request.Add" ~ ("StructuredQuery" if p.structured or p.typed_union is defined else "Query"), query_args, 8, ";") }}
+        {{ m.wrap("request.Add" ~ adder, query_args, 8, ";") }}
 {%- endfor %}
 {%- for p in op.header_params %}
-        {{ m.wrap("request.SetHeader", ["\"" ~ p.name ~ "\"", "options" ~ ("" if f.required_options else "?") ~ "." ~ m.member(p.name, f.options_type)], 8, ";") }}
+{%- set value = "options" ~ ("" if f.required_options else "?") ~ "." ~ m.member(p.ident, f.options_type) %}
+{%- if p.json %}
+{%- set ty = p.type.to_csharp() %}
+        {{ m.wrap("request.SetJsonHeader", [p.name | tojson, value] + ([context ~ "." ~ m.type_info(ty)] if ty != "JsonNode" else []), 8, ";") }}
+{%- else %}
+        {{ m.wrap("request.Set" ~ ("Cookie" if p.cookie else "Header"), [p.name | tojson, value], 8, ";") }}
+{%- endif %}
 {%- endfor %}
 {%- set body = f.body %}
 {%- if op.stream_property is defined and op.request_body_schema_name is defined and not op.request_body_is_list %}
@@ -369,11 +425,21 @@ public sealed class {{ raw_type_name }} : {{ raw_interface_name }}
 {%- set lines = namespace(list=["var form = new MultipartBody();"]) %}
 {%- for field in op.multipart_fields %}
 {%- set value = f.body ~ "." ~ m.member(field.name, f.body_type) %}
-{%- set add %}form.{% if field.is_file %}File("{{ field.name }}", {{ value }}){% else %}Field("{{ field.name }}", {{ value }}, {{ context }}.Options){% endif %};{% endset %}
-{%- if field.required and not field.nullable %}
-{%- set lines.list = lines.list + [add] %}
+{%- set part_type = (", " ~ (field.content_type | tojson)) if field.content_type is defined else "" %}
+{%- if field.is_file and field.is_file_list %}
+{%- set item = "item" if f.body == "upload" else "upload" %}
+{%- set add = ["foreach (var " ~ item ~ " in " ~ value ~ ")", "{", "    form.File(" ~ (field.name | tojson) ~ ", " ~ item ~ part_type ~ ");", "}"] %}
+{%- elif field.is_file %}
+{%- set add = ["form.File(" ~ (field.name | tojson) ~ ", " ~ value ~ part_type ~ ");"] %}
 {%- else %}
-{%- set lines.list = lines.list + ["if (" ~ value ~ " is not null)", "{", "    " ~ add, "}"] %}
+{%- set add = ["form.Field(" ~ (field.name | tojson) ~ ", " ~ value ~ ", " ~ context ~ ".Options" ~ part_type ~ ");"] %}
+{%- endif %}
+{%- if field.required and not field.nullable %}
+{%- set lines.list = lines.list + add %}
+{%- else %}
+{%- set lines.list = lines.list + ["if (" ~ value ~ " is not null)", "{"] %}
+{%- for line in add %}{% set lines.list = lines.list + ["    " ~ line] %}{% endfor %}
+{%- set lines.list = lines.list + ["}"] %}
 {%- endif %}
 {%- endfor %}
 {%- set lines.list = lines.list + ["request.SetMultipartBody(form);"] %}
@@ -391,7 +457,7 @@ public sealed class {{ raw_type_name }} : {{ raw_interface_name }}
 {%- endif %}
 {%- endif %}
 {%- if op.response_is_event_stream and op.event_schema_name is defined %}
-{%- set send = ["_transport.SendEventStreamAsync", ["request", context ~ "." ~ m.type_info(m.model(op.event_schema_name)), "requestOptions", "cancellationToken"]] %}
+{%- set send = ["_transport.SendEventStreamAsync", ["request", context ~ "." ~ m.type_info(m.event_type(op, types)), "requestOptions", "cancellationToken"]] %}
 {%- elif op.response_is_event_stream %}
 {%- set send = ["_transport.SendEventStreamAsync", ["request", "requestOptions", "cancellationToken"]] %}
 {%- elif op.response_is_binary %}
@@ -417,12 +483,14 @@ public sealed class {{ class_name }}
 {
 {%- for field in op.multipart_fields %}
 {%- if not loop.first %}{{ "\n" }}{% endif %}
-{%- if field.description is defined %}
+{%- if field.description | default("") | trim %}
     {{ m.doc(field.description) | indent(4) }}
 {%- else %}
-    /// <summary>The <c>{{ field.name }}</c> {% if field.is_file %}file{% else %}field{% endif %}.</summary>
+    /// <summary>The <c>{{ field.name | replace("&", "&amp;") | replace("<", "&lt;") | replace(">", "&gt;") }}</c> {% if field.is_file %}file{% else %}field{% endif %}.</summary>
 {%- endif %}
-{%- if field.is_file %}
+{%- if field.is_file and field.is_file_list %}
+    public {% if field.required %}required {% endif %}List<Upload>{% if field.nullable or not field.required %}?{% endif %} {{ m.member(field.name, class_name) }} { get; init; }
+{%- elif field.is_file %}
     public {% if field.required %}required {% endif %}Upload{% if field.nullable or not field.required %}?{% endif %} {{ m.member(field.name, class_name) }} { get; init; }
 {%- else %}
     public {% if field.required %}required {% endif %}{{ m.field_type(field) }} {{ m.member(field.name, class_name) }} { get; init; }
@@ -430,4 +498,5 @@ public sealed class {{ class_name }}
 {%- endfor %}
 }
 {%- endfor %}
+{%- with fields = bu.fields, union_owner = resource_type_name, type_names = {} %}{% include "types/unions.cs.jinja" %}{% endwith %}
 

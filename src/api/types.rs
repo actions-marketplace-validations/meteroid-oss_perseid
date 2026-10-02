@@ -20,7 +20,7 @@ use heck::{ToSnakeCase as _, ToUpperCamelCase as _};
 use super::{
     get_schema_name,
     resources::{self, Resource, Resources},
-    unions::{self, Condition, UnionMode},
+    unions::{self, Condition, JsonShape, UnionDecode, UnionMode},
 };
 
 /// Named types referenced by API operations.
@@ -166,8 +166,79 @@ pub(crate) fn untag_unions_with_non_object_variants(types: &mut Types) {
     }
 }
 
-/// Settles the JSON type of the variants of every union referencing a schema, typing the unions
-/// whose variants cannot be told apart as untyped JSON. Operations only take untyped JSON.
+/// Declares the inline object variants of the tagged unions as structs of their own, named
+/// `{Union}{Variant}Variant`, which the variants then reference like any other schema. Go has no
+/// anonymous variant types, and hoists them as openai-go does. The struct of an internally
+/// tagged variant carries the discriminator, which it fills in when left empty.
+pub(crate) fn hoist_inline_variants(types: &mut Types) {
+    let mut taken: BTreeSet<String> = types.keys().map(|n| n.to_upper_camel_case()).collect();
+    let mut hoisted = Vec::new();
+    for (name, ty) in types.iter_mut() {
+        let TypeData::StructEnum {
+            discriminator_field,
+            repr,
+            ..
+        } = &mut ty.data
+        else {
+            continue;
+        };
+        let (variants, tagged) = match repr {
+            StructEnumRepr::AdjacentlyTagged { variants, .. } => (variants, false),
+            StructEnumRepr::InternallyTagged { variants } => (variants, true),
+        };
+        for variant in variants.iter_mut() {
+            let EnumVariantType::Struct { fields } = &mut variant.content else {
+                continue;
+            };
+            let mut hoisted_name = format!("{name}{}Variant", variant.name.to_upper_camel_case());
+            while taken.contains(&hoisted_name.to_upper_camel_case()) {
+                hoisted_name.push_str("Content");
+            }
+            taken.insert(hoisted_name.to_upper_camel_case());
+            let mut own = Vec::new();
+            let mut discriminator_defaults = BTreeMap::new();
+            if tagged {
+                own.push(Field {
+                    name: discriminator_field.clone(),
+                    r#type: FieldType::String,
+                    default: None,
+                    description: None,
+                    required: true,
+                    nullable: false,
+                    deprecated: false,
+                    example: None,
+                    read_only: false,
+                    write_only: false,
+                    flatten: false,
+                    constant: Some(serde_json::Value::String(variant.name.clone())),
+                });
+                discriminator_defaults.insert(discriminator_field.clone(), variant.name.clone());
+            }
+            own.append(fields);
+            hoisted.push(Type {
+                name: hoisted_name.clone(),
+                description: None,
+                deprecated: false,
+                discriminator_defaults,
+                data: TypeData::Struct {
+                    fields: own,
+                    additional_properties: None,
+                },
+            });
+            variant.content = EnumVariantType::Ref {
+                schema_ref: Some(hoisted_name),
+                inner: None,
+            };
+        }
+    }
+    for ty in hoisted {
+        types.insert(ty.name.clone(), ty);
+    }
+}
+
+/// Settles the JSON type of the variants of every union referencing a schema, and how they are
+/// told apart, typing as untyped JSON the unions with a variant of unknown type. Operations
+/// keep the unions of their query parameters (in `typed_union`) and bodies.
 pub(crate) fn resolve_unions(types: &mut Types, resources: &mut Resources) {
     fn json_type(types: &Types, name: &str, depth: usize) -> Option<&'static str> {
         match &types.get(name)?.data {
@@ -190,6 +261,7 @@ pub(crate) fn resolve_unions(types: &mut Types, resources: &mut Resources) {
                 variants,
                 mode,
                 requested,
+                decode,
             } => {
                 let mut settled = true;
                 for variant in variants.iter_mut() {
@@ -200,26 +272,35 @@ pub(crate) fn resolve_unions(types: &mut Types, resources: &mut Resources) {
                             None => settled = false,
                         }
                     }
+                    variant.items = match &variant.r#type {
+                        FieldType::List { inner } | FieldType::Set { inner } => {
+                            json_shape(inner, &known.kinds).map(Box::new)
+                        }
+                        _ => None,
+                    };
                 }
                 let _span = tracing::warn_span!("schema", name = %owner).entered();
                 if *requested == Some(UnionMode::Json) {
                     *ty = FieldType::JsonObject;
-                } else if settled && distinct_json_types(variants) {
-                } else if let Some(decided) = settled
-                    .then(|| decide_objects(variants, &known.shapes))
-                    .flatten()
-                {
-                    *mode = decided;
-                } else {
+                } else if !settled {
                     tracing::warn!(
                         "`oneOf`/`anyOf` without a discriminator is typed as an untyped JSON value"
                     );
                     *ty = FieldType::JsonObject;
+                } else {
+                    *decode = if distinct_json_types(variants) {
+                        UnionDecode::JsonType
+                    } else {
+                        UnionDecode::Try
+                    };
+                    if variants.iter().filter(|v| v.json_type == "object").count() > 1 {
+                        *mode = decide_objects(variants, &known.shapes);
+                    }
                 }
             }
-            FieldType::List { inner } | FieldType::Set { inner } => {
-                settle(Arc::make_mut(inner), known, owner)
-            }
+            FieldType::List { inner }
+            | FieldType::Set { inner }
+            | FieldType::Nullable { inner } => settle(Arc::make_mut(inner), known, owner),
             FieldType::Map { value_ty } => settle(Arc::make_mut(value_ty), known, owner),
             _ => {}
         }
@@ -248,6 +329,13 @@ pub(crate) fn resolve_unions(types: &mut Types, resources: &mut Resources) {
             for param in &mut op.query_params {
                 settle(&mut param.r#type, &known, &op.id);
             }
+            for ty in op
+                .request_body_json_type
+                .iter_mut()
+                .chain(op.response_body_json_type.iter_mut())
+            {
+                settle(ty, &known, &op.id);
+            }
             op.untype_unions();
             op.forget_typed_unions_of_unknown_types(types);
         }
@@ -268,7 +356,9 @@ pub(crate) fn set_union_ids(types: &mut Types) {
                     }
                 }
             }
-            FieldType::List { inner } | FieldType::Set { inner } => set(Arc::make_mut(inner), ids),
+            FieldType::List { inner }
+            | FieldType::Set { inner }
+            | FieldType::Nullable { inner } => set(Arc::make_mut(inner), ids),
             FieldType::Map { value_ty } => set(Arc::make_mut(value_ty), ids),
             _ => {}
         }
@@ -276,7 +366,7 @@ pub(crate) fn set_union_ids(types: &mut Types) {
     let ids: BTreeMap<String, Option<String>> = types
         .iter()
         .map(|(name, ty)| {
-            let TypeData::Struct { fields } = &ty.data else {
+            let TypeData::Struct { fields, .. } = &ty.data else {
                 return (name.clone(), None);
             };
             let id = fields
@@ -293,41 +383,70 @@ pub(crate) fn set_union_ids(types: &mut Types) {
     }
 }
 
-/// The mode of a union whose object variants, all structs, have rules telling them apart,
-/// else best match; `None` when its other variants share a JSON type or an object variant
-/// is not a struct.
+/// What the items of an array of `ty` look like, `None` when any value is accepted.
+fn json_shape(ty: &FieldType, kinds: &BTreeMap<String, Option<&'static str>>) -> Option<JsonShape> {
+    let leaf = |json_type: &str| JsonShape {
+        json_type: json_type.to_owned(),
+        items: None,
+    };
+    match ty.non_null() {
+        FieldType::SchemaRef { name, .. } => kinds.get(name).copied().flatten().map(leaf),
+        FieldType::List { inner } | FieldType::Set { inner } => Some(JsonShape {
+            json_type: "array".to_owned(),
+            items: json_shape(inner, kinds).map(Box::new),
+        }),
+        // Any JSON value.
+        FieldType::JsonObject | FieldType::Union { .. } => None,
+        other => UnionVariant::json_type_of(other).map(leaf),
+    }
+}
+
+/// The mode of a union of several objects: rules when the structs among them have some telling
+/// them apart, else best match. The objects that are no struct, free-form maps and unions, are
+/// tried last and accept any object.
 fn decide_objects(
     variants: &mut [UnionVariant],
     shapes: &BTreeMap<String, Option<Vec<unions::Property>>>,
-) -> Option<UnionMode> {
-    let (mut objects, others): (Vec<_>, Vec<_>) =
-        variants.iter_mut().partition(|v| v.json_type == "object");
-    let others: Vec<UnionVariant> = others.into_iter().map(|v| v.clone()).collect();
-    if objects.len() < 2 || !distinct_json_types(&others) {
-        return None;
-    }
-    let object_shapes = objects
+) -> UnionMode {
+    let objects = variants.iter_mut().filter(|v| v.json_type == "object");
+    let shape_of = |v: &UnionVariant| match &v.r#type {
+        FieldType::SchemaRef { name, .. } => shapes.get(name).cloned().flatten(),
+        _ => None,
+    };
+    let (mut structs, mut others): (Vec<_>, Vec<_>) = objects
+        .map(|v| (shape_of(v), v))
+        .partition(|(shape, _)| shape.is_some());
+    let struct_shapes: Vec<Vec<unions::Property>> = structs
         .iter()
-        .map(|v| match &v.r#type {
-            FieldType::SchemaRef { name, .. } => shapes.get(name).cloned().flatten(),
-            _ => None,
-        })
-        .collect::<Option<Vec<_>>>()?;
-    match unions::infer(&object_shapes) {
+        .map(|(shape, _)| shape.clone().unwrap_or_default())
+        .collect();
+    let rules = if struct_shapes.len() > 1 {
+        unions::infer(&struct_shapes)
+    } else {
+        None
+    };
+    let count = structs.len();
+    let mode = match rules {
         Some(rules) => {
-            for (variant, (rank, when)) in objects.iter_mut().zip(rules) {
+            for ((_, variant), (rank, when)) in structs.iter_mut().zip(rules) {
                 variant.rank = rank;
                 variant.when = when;
             }
-            Some(UnionMode::Rules)
+            UnionMode::Rules
         }
         None => {
-            for (variant, shape) in objects.iter_mut().zip(&object_shapes) {
+            for (rank, ((_, variant), shape)) in structs.iter_mut().zip(&struct_shapes).enumerate()
+            {
+                variant.rank = rank;
                 (variant.required, variant.properties) = unions::best_match(shape);
             }
-            Some(UnionMode::BestMatch)
+            UnionMode::BestMatch
         }
+    };
+    for (index, (_, variant)) in others.iter_mut().enumerate() {
+        variant.rank = count + index;
     }
+    mode
 }
 
 /// Sets the `discriminator_defaults` of the structs that are variants of internally tagged unions.
@@ -359,42 +478,13 @@ pub(crate) fn set_discriminator_defaults(types: &mut Types) {
         let Some(ty) = types.get_mut(&target) else {
             continue;
         };
-        let TypeData::Struct { fields } = &ty.data else {
+        let TypeData::Struct { fields, .. } = &ty.data else {
             continue;
         };
         let own = fields.iter().any(|f| f.name == field && !f.flatten);
         if let (true, [value]) = (own, &values.into_iter().collect::<Vec<_>>()[..]) {
             ty.discriminator_defaults.insert(field, value.clone());
         }
-    }
-}
-
-/// Types string enums whose values would share an identifier, such as `bps` and `Bps`, as
-/// strings: no SDK could name both members.
-pub(crate) fn untype_clashing_enums(types: &mut Types) {
-    let mut untyped = false;
-    for (name, ty) in types.iter_mut() {
-        let TypeData::StringEnum { values } = &ty.data else {
-            continue;
-        };
-        let owner = format!("schema `{name}`");
-        let clash = ["pascal", "shouty", "snake"]
-            .into_iter()
-            .find_map(|case| crate::template::ident::idents(values, case, None, &owner).err());
-        if let Some(error) = clash {
-            let _span = tracing::warn_span!("schema", name = %name).entered();
-            let detail = error.detail().unwrap_or_default();
-            let detail = detail.split(": ").nth(1).unwrap_or(detail);
-            tracing::warn!(
-                "{}, so the enum is typed as a string",
-                detail.split(',').next().unwrap_or(detail)
-            );
-            ty.data = TypeData::StringAlias;
-            untyped = true;
-        }
-    }
-    if untyped {
-        resolve_schema_refs(types);
     }
 }
 
@@ -443,13 +533,18 @@ pub(crate) fn clashing_identifiers(types: &Types) -> Vec<String> {
         }
     };
     for (name, ty) in types {
-        let field_names = |fields: &[Field]| fields.iter().map(|f| f.name.clone()).collect();
+        let field_names =
+            |fields: &[Field]| -> Vec<String> { fields.iter().map(|f| f.name.clone()).collect() };
         match &ty.data {
-            TypeData::Struct { fields } => {
-                check(field_names(fields), "snake", format!("schema `{name}`"))
-            }
-            TypeData::StringEnum { values } => {
-                check(values.clone(), "pascal", format!("schema `{name}`"))
+            TypeData::Struct {
+                fields,
+                additional_properties,
+            } => {
+                let mut names = field_names(fields);
+                if additional_properties.is_some() {
+                    names.push("additional_properties".to_owned());
+                }
+                check(names, "snake", format!("schema `{name}`"))
             }
             TypeData::StructEnum { fields, repr, .. } => {
                 check(field_names(fields), "snake", format!("schema `{name}`"));
@@ -464,7 +559,11 @@ pub(crate) fn clashing_identifiers(types: &Types) -> Vec<String> {
                     }
                 }
             }
-            TypeData::IntegerEnum { .. } | TypeData::StringAlias | TypeData::Alias { .. } => {}
+            // String enum members that share an identifier get numbered by `enum_names`.
+            TypeData::StringEnum { .. }
+            | TypeData::IntegerEnum { .. }
+            | TypeData::StringAlias
+            | TypeData::Alias { .. } => {}
         }
     }
     errors
@@ -502,9 +601,15 @@ pub(crate) fn resolve_schema_ref_in_field_type_public(
 fn resolve_schema_refs_in_type(ty: &mut Type, string_alias_names: &BTreeSet<String>) {
     match &mut ty.data {
         TypeData::Alias { target } => resolve_schema_ref_in_field_type(target, string_alias_names),
-        TypeData::Struct { fields } => {
+        TypeData::Struct {
+            fields,
+            additional_properties,
+        } => {
             for field in fields {
                 resolve_schema_ref_in_field_type(&mut field.r#type, string_alias_names);
+            }
+            if let Some(extra) = additional_properties {
+                resolve_schema_ref_in_field_type(extra, string_alias_names);
             }
         }
         TypeData::StructEnum { fields, repr, .. } => {
@@ -547,7 +652,7 @@ fn resolve_schema_ref_in_field_type(
                 data: TypeData::StringAlias,
             });
         }
-        FieldType::List { inner } | FieldType::Set { inner } => {
+        FieldType::List { inner } | FieldType::Set { inner } | FieldType::Nullable { inner } => {
             resolve_schema_ref_in_field_type(Arc::make_mut(inner), string_alias_names);
         }
         FieldType::Map { value_ty } => {
@@ -584,7 +689,17 @@ pub(crate) fn inline_flattened_fields(types: &mut Types) -> anyhow::Result<()> {
             Ok(())
         };
         match &mut ty.data {
-            TypeData::Struct { fields } => flat(fields)?,
+            TypeData::Struct {
+                fields,
+                additional_properties,
+            } => {
+                // Inlined parts bring their `additionalProperties`, unless the owner has its own.
+                if additional_properties.is_none() {
+                    *additional_properties =
+                        inherited_additional_properties(&snapshot, fields, &mut BTreeSet::new());
+                }
+                flat(fields)?;
+            }
             TypeData::StructEnum { fields, repr, .. } => {
                 flat(fields)?;
                 let (StructEnumRepr::AdjacentlyTagged { variants, .. }
@@ -618,7 +733,7 @@ fn flattened<'a>(
             continue;
         }
         let part = field.r#type.referenced_schema().unwrap_or_default();
-        let Some(TypeData::Struct { fields: inner }) = types.get(part).map(|t| &t.data) else {
+        let Some(TypeData::Struct { fields: inner, .. }) = types.get(part).map(|t| &t.data) else {
             bail!(
                 "schema `{owner}`: its `allOf` part `{part}` is not an object, which this target cannot embed"
             );
@@ -633,6 +748,33 @@ fn flattened<'a>(
         }
     }
     Ok(out)
+}
+
+/// The `additionalProperties` type of the first embedded part of `fields` declaring one.
+fn inherited_additional_properties<'a>(
+    types: &'a Types,
+    fields: &'a [Field],
+    seen: &mut BTreeSet<&'a str>,
+) -> Option<Box<FieldType>> {
+    for field in fields.iter().filter(|f| f.flatten) {
+        let part = field.r#type.referenced_schema().unwrap_or_default();
+        if !seen.insert(part) {
+            continue;
+        }
+        if let Some(TypeData::Struct {
+            fields: inner,
+            additional_properties,
+        }) = types.get(part).map(|t| &t.data)
+        {
+            if let Some(extra) = additional_properties {
+                return Some(extra.clone());
+            }
+            if let Some(extra) = inherited_additional_properties(types, inner, seen) {
+                return Some(extra);
+            }
+        }
+    }
+    None
 }
 
 /// Replace every reference to a [`TypeData::Alias`] type by the alias target, for
@@ -650,26 +792,79 @@ pub(crate) fn inline_aliases(types: &mut Types, resources: &mut Resources) -> an
                 StructEnumRepr::AdjacentlyTagged { variants, .. }
                 | StructEnumRepr::InternallyTagged { variants },
             ..
-        } = &ty.data
+        } = &mut ty.data
         {
-            for variant in variants {
-                if let EnumVariantType::Ref {
+            // A variant that is an alias stands for the schema the alias leads to; one that
+            // leads to no schema has nothing to decode into.
+            variants.retain_mut(|variant| {
+                let EnumVariantType::Ref {
                     schema_ref: Some(name),
                     ..
-                } = &variant.content
-                {
-                    ensure!(
-                        !aliases.contains_key(name),
-                        "alias schema `{name}` cannot be a union variant"
-                    );
+                } = &mut variant.content
+                else {
+                    return true;
+                };
+                let Some(target) = aliases.get(name.as_str()) else {
+                    return true;
+                };
+                match target {
+                    FieldType::SchemaRef { name: target, .. } => {
+                        *name = target.clone();
+                        true
+                    }
+                    _ => {
+                        tracing::warn!(
+                            "alias schema `{name}` is not an object, so the union variant `{}` is dropped",
+                            variant.name
+                        );
+                        false
+                    }
                 }
-            }
+            });
         }
     }
     for resource in resources.values_mut() {
         resource.inline_aliases(&aliases)?;
     }
     Ok(())
+}
+
+/// Aliases that lead back to themselves through other aliases, such as
+/// `Tree: {type: array, items: {$ref: Tree}}`. A type alias cannot name itself in Rust, so
+/// those are declared as newtypes.
+pub(crate) fn recursive_aliases(types: &Types) -> BTreeSet<String> {
+    let alias_refs = |name: &str| -> Vec<&str> {
+        match types.get(name).map(|t| &t.data) {
+            Some(TypeData::Alias { target }) => target
+                .referenced_schema()
+                .into_iter()
+                .chain(target.union_refs())
+                .filter(|r| matches!(types.get(*r).map(|t| &t.data), Some(TypeData::Alias { .. })))
+                .collect(),
+            _ => Vec::new(),
+        }
+    };
+    types
+        .iter()
+        .filter(|(name, ty)| {
+            matches!(&ty.data, TypeData::Alias { .. }) && {
+                let mut seen = BTreeSet::new();
+                let mut stack = alias_refs(name);
+                let mut found = false;
+                while let Some(next) = stack.pop() {
+                    if next == name.as_str() {
+                        found = true;
+                        break;
+                    }
+                    if seen.insert(next) {
+                        stack.extend(alias_refs(next));
+                    }
+                }
+                found
+            }
+        })
+        .map(|(name, _)| name.clone())
+        .collect()
 }
 
 fn resolve_alias_targets(types: &Types) -> anyhow::Result<BTreeMap<String, FieldType>> {
@@ -682,7 +877,12 @@ fn resolve_alias_targets(types: &Types) -> anyhow::Result<BTreeMap<String, Field
         if resolved.contains_key(name) {
             return Ok(());
         }
-        ensure!(!stack.contains(&name), "cyclic alias schema `{name}`");
+        if stack.contains(&name) {
+            // A cycle cannot be inlined: the reference closing it is untyped JSON, which every
+            // target can hold (Rust keeps aliases and breaks the cycle with a newtype instead).
+            resolved.insert(name.to_owned(), FieldType::JsonObject);
+            return Ok(());
+        }
         stack.push(name);
         let source = raw[name];
         for inner in source
@@ -750,10 +950,17 @@ pub(crate) fn promote_inline_enums(
 
     for (type_name, ty) in types.iter_mut() {
         match &mut ty.data {
-            TypeData::Struct { fields } => {
+            TypeData::Struct {
+                fields,
+                additional_properties,
+            } => {
                 for field in fields {
                     let base = format!("{}_{}", type_name, field.name);
                     promote_field_type(&mut field.r#type, &base, &existing, &mut new_types)?;
+                }
+                if let Some(extra) = additional_properties {
+                    let base = format!("{type_name}_additional_properties");
+                    promote_field_type(extra, &base, &existing, &mut new_types)?;
                 }
             }
             TypeData::StructEnum { fields, repr, .. } => {
@@ -828,6 +1035,18 @@ fn promote_inline_enums_in_resource(
             let base = format!("{}_{}", op_id, param.name);
             promote_field_type(&mut param.r#type, &base, existing, new_types)?;
         }
+        for param in &mut op.header_params {
+            if let Some(ty) = &mut param.r#type {
+                let base = format!("{}_{}", op_id, param.name);
+                promote_field_type(ty, &base, existing, new_types)?;
+            }
+        }
+        for (name, param) in &mut op.path_styles {
+            if let Some(ty) = &mut param.r#type {
+                let base = format!("{}_{}", op_id, name);
+                promote_field_type(ty, &base, existing, new_types)?;
+            }
+        }
     }
     Ok(())
 }
@@ -856,13 +1075,10 @@ fn promote_field_type(
                 };
                 return Ok(());
             }
-            let mut base = match title.take() {
-                Some(t) => t.to_upper_camel_case(),
-                None => base_name.to_upper_camel_case(),
-            };
-            if existing.reserved.contains(&base) {
-                base.push_str("Model");
-            }
+            let base = crate::reserved::safe_type_name(
+                &title.take().unwrap_or_else(|| base_name.to_owned()),
+                &existing.reserved,
+            );
             let data = TypeData::StringEnum { values };
             let mut name = base.clone();
             for n in 2.. {
@@ -888,6 +1104,9 @@ fn promote_field_type(
                 existing,
                 new_types,
             )?;
+        }
+        FieldType::Nullable { inner } => {
+            promote_field_type(Arc::make_mut(inner), base_name, existing, new_types)?;
         }
         FieldType::Map { value_ty } => {
             promote_field_type(
@@ -931,6 +1150,48 @@ pub(crate) struct Type {
     pub data: TypeData,
 }
 
+/// Whether a `oneOf`/`anyOf` part only states which properties are required, which constrains
+/// values without adding a type.
+fn is_required_only(part: &Schema) -> bool {
+    let Schema::Object(obj) = part else {
+        return false;
+    };
+    let Some(object) = &obj.object else {
+        return false;
+    };
+    let mut bare = obj.clone();
+    bare.metadata = None;
+    bare.object = None;
+    bare.extensions.clear();
+    bare == SchemaObject::default()
+        && !object.required.is_empty()
+        && object.properties.is_empty()
+        && object.additional_properties.is_none()
+        && object.pattern_properties.is_empty()
+}
+
+/// Removes the `oneOf`/`anyOf` of an object whose parts only add `required`: the properties
+/// stay optional and the object stays a struct.
+fn drop_required_only_alternatives(s: &mut SchemaObject) {
+    if s.object.as_ref().is_none_or(|o| o.properties.is_empty()) {
+        return;
+    }
+    let Some(sub) = s.subschemas.as_mut() else {
+        return;
+    };
+    for parts in [&mut sub.one_of, &mut sub.any_of] {
+        if parts
+            .as_ref()
+            .is_some_and(|p| !p.is_empty() && p.iter().all(is_required_only))
+        {
+            *parts = None;
+        }
+    }
+    if **sub == SubschemaValidation::default() {
+        s.subschemas = None;
+    }
+}
+
 fn has_open_additional_properties(obj: &ObjectValidation) -> bool {
     obj.additional_properties
         .as_deref()
@@ -938,7 +1199,8 @@ fn has_open_additional_properties(obj: &ObjectValidation) -> bool {
 }
 
 impl Type {
-    pub(crate) fn from_schema(name: String, s: SchemaObject) -> anyhow::Result<Self> {
+    pub(crate) fn from_schema(name: String, mut s: SchemaObject) -> anyhow::Result<Self> {
+        drop_required_only_alternatives(&mut s);
         let metadata = s.metadata.clone().unwrap_or_default();
         let ty = |data| Self {
             name: name.clone(),
@@ -1032,7 +1294,18 @@ impl Type {
 
     pub(crate) fn referenced_components(&self) -> BTreeSet<&str> {
         match &self.data {
-            TypeData::Struct { fields } => fields_referenced_schemas(fields),
+            TypeData::Struct {
+                fields,
+                additional_properties,
+            } => {
+                let mut res = fields_referenced_schemas(fields);
+                res.extend(
+                    additional_properties
+                        .as_deref()
+                        .and_then(FieldType::referenced_schema),
+                );
+                res
+            }
             TypeData::StringEnum { .. } => BTreeSet::new(),
             TypeData::IntegerEnum { .. } => BTreeSet::new(),
             TypeData::StringAlias => BTreeSet::new(),
@@ -1061,7 +1334,7 @@ impl Type {
         let mut stack = vec![self];
         let mut seen = BTreeSet::new();
         while let Some(ty) = stack.pop() {
-            let TypeData::Struct { fields: own } = &ty.data else {
+            let TypeData::Struct { fields: own, .. } = &ty.data else {
                 continue;
             };
             for base in own.iter().filter(|f| f.flatten) {
@@ -1070,7 +1343,10 @@ impl Type {
                 };
                 if let Some(
                     base @ Type {
-                        data: TypeData::Struct { fields: inherited },
+                        data:
+                            TypeData::Struct {
+                                fields: inherited, ..
+                            },
                         ..
                     },
                 ) = types.get(name)
@@ -1102,7 +1378,7 @@ impl Type {
             fields.iter().filter_map(|f| direct(&f.r#type)).collect()
         }
         match &self.data {
-            TypeData::Struct { fields: f } => fields(f),
+            TypeData::Struct { fields: f, .. } => fields(f),
             TypeData::Alias { target } => direct(target).into_iter().collect(),
             TypeData::StructEnum {
                 repr, fields: f, ..
@@ -1151,7 +1427,7 @@ fn is_null_schema(schema: &Schema) -> bool {
 }
 
 /// `X` in the `oneOf`/`anyOf: [X, {type: null}]` nullable pattern, in either order.
-fn extract_nullable_variant(variants: &[Schema]) -> Option<&Schema> {
+pub(super) fn extract_nullable_variant(variants: &[Schema]) -> Option<&Schema> {
     match variants {
         [a, b] if is_null_schema(a) && !is_null_schema(b) => Some(b),
         [a, b] if is_null_schema(b) && !is_null_schema(a) => Some(a),
@@ -1179,6 +1455,16 @@ fn implied_type(obj: &SchemaObject) -> Option<InstanceType> {
 pub(crate) enum TypeData {
     Struct {
         fields: Vec<Field>,
+        /// The map type of the properties beyond `fields` (`additionalProperties` as `true`,
+        /// `{}` or a schema, or `patternProperties`), which the model keeps instead of
+        /// dropping. Always a [`FieldType::Map`], its values untyped JSON when no schema
+        /// types them.
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            serialize_with = "serialize_optional_boxed_field_type"
+        )]
+        additional_properties: Option<Box<FieldType>>,
     },
     StringEnum {
         values: Vec<String>,
@@ -1209,7 +1495,14 @@ impl TypeData {
     fn field_types(&self) -> Vec<&FieldType> {
         match self {
             Self::Alias { target } => vec![&**target],
-            Self::Struct { fields } => fields.iter().map(|f| &f.r#type).collect(),
+            Self::Struct {
+                fields,
+                additional_properties,
+            } => fields
+                .iter()
+                .map(|f| &f.r#type)
+                .chain(additional_properties.as_deref())
+                .collect(),
             Self::StructEnum { fields, repr, .. } => {
                 let (StructEnumRepr::AdjacentlyTagged { variants, .. }
                 | StructEnumRepr::InternallyTagged { variants }) = repr;
@@ -1228,7 +1521,7 @@ impl TypeData {
 
     fn for_each_field(&mut self, mut visit: impl FnMut(&mut Field)) {
         match self {
-            Self::Struct { fields } => fields.iter_mut().for_each(visit),
+            Self::Struct { fields, .. } => fields.iter_mut().for_each(visit),
             Self::StructEnum { fields, repr, .. } => {
                 fields.iter_mut().for_each(&mut visit);
                 let (StructEnumRepr::AdjacentlyTagged { variants, .. }
@@ -1249,7 +1542,13 @@ impl TypeData {
     fn for_each_field_type(&mut self, mut visit: impl FnMut(&mut FieldType)) {
         match self {
             Self::Alias { target } => visit(target),
-            Self::Struct { fields } => fields.iter_mut().for_each(|f| visit(&mut f.r#type)),
+            Self::Struct {
+                fields,
+                additional_properties,
+            } => {
+                fields.iter_mut().for_each(|f| visit(&mut f.r#type));
+                additional_properties.iter_mut().for_each(|ty| visit(ty));
+            }
             Self::StructEnum { fields, repr, .. } => {
                 fields.iter_mut().for_each(|f| visit(&mut f.r#type));
                 let (StructEnumRepr::AdjacentlyTagged { variants, .. }
@@ -1268,9 +1567,7 @@ impl TypeData {
         obj: ObjectValidation,
         subschemas: Option<Box<SubschemaValidation>>,
     ) -> anyhow::Result<Self> {
-        if has_open_additional_properties(&obj) || !obj.pattern_properties.is_empty() {
-            tracing::warn!("properties beyond the declared ones are dropped when decoding");
-        }
+        let additional_properties = Self::additional_properties_of(&obj)?;
 
         let fields: Vec<_> = obj
             .properties
@@ -1298,7 +1595,28 @@ impl TypeData {
             }
         }
 
-        Ok(Self::Struct { fields })
+        Ok(Self::Struct {
+            fields,
+            additional_properties,
+        })
+    }
+
+    /// The map type of the properties a struct keeps beyond its declared ones: typed by the
+    /// `additionalProperties` schema, else untyped JSON for `true`, `{}` and `patternProperties`.
+    fn additional_properties_of(obj: &ObjectValidation) -> anyhow::Result<Option<Box<FieldType>>> {
+        if !has_open_additional_properties(obj) && obj.pattern_properties.is_empty() {
+            return Ok(None);
+        }
+        let value_ty = match obj.additional_properties.as_deref() {
+            Some(Schema::Object(schema)) if obj.pattern_properties.is_empty() => {
+                FieldType::from_schema_object_nullable(schema.clone())
+                    .context("unsupported `additionalProperties` schema")?
+            }
+            _ => FieldType::JsonObject,
+        };
+        Ok(Some(Box::new(FieldType::Map {
+            value_ty: Arc::new(value_ty),
+        })))
     }
 
     /// A struct embedding the referenced `allOf` parts, which the spec normalization leaves
@@ -1329,11 +1647,22 @@ impl TypeData {
                 constant: None,
             });
         }
-        let Self::Struct { fields: own } = Self::from_object_schema(object, None)? else {
+        let Self::Struct {
+            fields: own,
+            additional_properties,
+        } = Self::from_object_schema(object, None)?
+        else {
             unreachable!("objects without subschemas are structs")
         };
+        if additional_properties.is_some() {
+            // The embedded parts would claim the extra properties too.
+            tracing::warn!("properties beyond the declared ones are dropped next to `allOf`");
+        }
         fields.extend(own);
-        Ok(Self::Struct { fields })
+        Ok(Self::Struct {
+            fields,
+            additional_properties: None,
+        })
     }
 
     /// Parse a oneOf schema with a discriminator - creates a struct enum
@@ -1466,7 +1795,11 @@ impl TypeData {
                 .filter(|(_, v)| !v.is_null())
                 .map(|(i, v)| match v {
                     serde_json::Value::String(s) => Ok(s),
-                    _ => bail!("enum value {} is not a string", i + 1),
+                    other => bail!(
+                        "enum value {} (`{other}`) is not a string although the enum is \
+                         `type: string`, make the values strings or the type `integer`",
+                        i + 1
+                    ),
                 })
                 .collect::<anyhow::Result<Vec<_>>>()?
                 .into_iter()
@@ -1483,7 +1816,8 @@ impl TypeData {
         if let Some(names) = &names {
             ensure!(
                 names.len() == values.len(),
-                "{} enum varnames for {} values",
+                "`x-enum-varnames` lists {} names for {} enum values, so every value needs exactly \
+                 one name",
                 names.len(),
                 values.len()
             );
@@ -1492,9 +1826,12 @@ impl TypeData {
             .iter()
             .enumerate()
             .map(|(i, v)| {
-                let value = v
-                    .as_i64()
-                    .with_context(|| format!("enum value {v} is not an integer"))?;
+                let value = v.as_i64().with_context(|| {
+                    format!(
+                        "enum value `{v}` is not an integer although the enum is \
+                             `type: integer`, make the values integers or the type `string`"
+                    )
+                })?;
                 let name = match &names {
                     Some(names) => names[i].clone(),
                     None if value < 0 => format!("Minus{}", value.unsigned_abs()),
@@ -1580,7 +1917,7 @@ impl Field {
     pub(crate) fn from_schema(name: String, s: Schema, required: bool) -> anyhow::Result<Self> {
         let _span = tracing::warn_span!("field", name = %name).entered();
         let obj = match s {
-            Schema::Bool(_) => bail!("unsupported bool schema"),
+            Schema::Bool(_) => SchemaObject::default(),
             Schema::Object(o) => o,
         };
         let example = obj.extensions.get("example").cloned();
@@ -1602,7 +1939,14 @@ impl Field {
             .unwrap_or(false);
 
         // Handle OpenAPI 3.1 oneOf nullable pattern: oneOf: [{type: null}, {actual type}]
-        let (field_type, is_oneof_nullable) = FieldType::from_schema_object_with_nullable(obj)?;
+        // A field no SDK can model only loses its own type, not its parent's.
+        let (field_type, is_oneof_nullable) =
+            FieldType::from_schema_object_with_nullable(obj).unwrap_or_else(|e| {
+                tracing::warn!(
+                    "field `{name}` is not supported ({e:#}), so it is typed as an untyped JSON value"
+                );
+                (FieldType::JsonObject, false)
+            });
         nullable = nullable || is_oneof_nullable;
 
         Ok(Self {
@@ -1648,12 +1992,17 @@ pub(crate) struct SimpleVariant {
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
 pub(crate) struct UnionVariant {
     /// Unique in its union: the snake_case schema name of a reference, else `string`,
-    /// `integer`, `number`, `boolean`, `date_time`, `decimal`, `list`, `object` or `empty`.
+    /// `integer`, `number`, `boolean`, `date_time`, `decimal`, `object`, `empty` or
+    /// `array_of_<items>` (`array_of_strings`, `array_of_integer_arrays`, `array_of_items`);
+    /// a repeated name gets a numeric suffix (`string_2`).
     pub name: String,
-    /// JSON type deciding the variant when decoding: `string`, `integer`, `number`, `boolean`,
-    /// `array` or `object`. No two variants of a union share one (`integer` and `number` count
-    /// as one).
+    /// JSON type a value must have to be this variant: `string`, `integer`, `number`,
+    /// `boolean`, `array` or `object`. Variants may share one, see `UnionDecode`.
     pub json_type: String,
+    /// What the items of an `array` variant look like, to tell it from the other arrays of its
+    /// union by its first item; absent when any item is accepted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub items: Option<Box<JsonShape>>,
     /// Only the empty string, which Stripe accepts to unset a value (`enum: [""]`).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub empty: bool,
@@ -1688,6 +2037,7 @@ impl UnionVariant {
             return Some(Self {
                 name: "empty".into(),
                 json_type: "string".into(),
+                items: None,
                 empty: true,
                 r#type: FieldType::String,
                 when: Vec::new(),
@@ -1705,14 +2055,12 @@ impl UnionVariant {
         };
         let (name, json_type) = match &r#type {
             FieldType::SchemaRef { name, .. } => (name.to_snake_case(), String::new()),
-            ty => (
-                Self::name_of(ty)?.to_owned(),
-                Self::json_type_of(ty)?.to_owned(),
-            ),
+            ty => (Self::name_of(ty)?, Self::json_type_of(ty)?.to_owned()),
         };
         Some(Self {
             name,
             json_type,
+            items: None,
             empty: false,
             r#type,
             when: Vec::new(),
@@ -1723,26 +2071,85 @@ impl UnionVariant {
         })
     }
 
-    fn name_of(ty: &FieldType) -> Option<&'static str> {
+    /// The variant name of a scalar, list or map: `string`, `integer`, `number`, `boolean`,
+    /// `date_time`, `decimal`, `object`, or `array_of_<items>` such as `array_of_strings` and
+    /// `array_of_integer_arrays`.
+    fn name_of(ty: &FieldType) -> Option<String> {
         Some(match ty {
-            FieldType::Bool => "boolean",
+            FieldType::List { inner } | FieldType::Set { inner } => {
+                let items = Self::item_name_of(inner).unwrap_or_else(|| "value".into());
+                let plural = if items.ends_with('s') { "es" } else { "s" };
+                format!("array_of_{items}{plural}")
+            }
+            ty => Self::item_name_of(ty)?,
+        })
+    }
+
+    /// The singular name of values of `ty`, as the items of an array.
+    fn item_name_of(ty: &FieldType) -> Option<String> {
+        Some(match ty {
+            FieldType::Bool => "boolean".into(),
             FieldType::Int16
             | FieldType::UInt16
             | FieldType::Int32
             | FieldType::Int64
-            | FieldType::UInt64 => "integer",
-            FieldType::Float | FieldType::Double => "number",
-            FieldType::String | FieldType::Uri | FieldType::Date => "string",
-            FieldType::DateTime => "date_time",
-            FieldType::Decimal => "decimal",
-            FieldType::List { .. } | FieldType::Set { .. } => "list",
-            FieldType::Map { .. } | FieldType::JsonObject => "object",
-            FieldType::SchemaRef { .. }
-            | FieldType::Union { .. }
-            | FieldType::StringEnum { .. } => {
-                return None;
+            | FieldType::UInt64 => "integer".into(),
+            FieldType::Float | FieldType::Double => "number".into(),
+            FieldType::String | FieldType::Uri | FieldType::Date => "string".into(),
+            FieldType::DateTime => "date_time".into(),
+            FieldType::Decimal => "decimal".into(),
+            FieldType::List { inner } | FieldType::Set { inner } => {
+                let items = Self::item_name_of(inner).unwrap_or_else(|| "value".into());
+                format!("{items}_array")
             }
+            FieldType::Map { .. } | FieldType::JsonObject => "object".into(),
+            FieldType::SchemaRef { name, .. } => name.to_snake_case(),
+            FieldType::Nullable { inner } => return Self::item_name_of(inner),
+            FieldType::Union { .. } | FieldType::StringEnum { .. } => return None,
         })
+    }
+
+    /// Variants without the repeated ones, with `integer` folded into `number`, and unique
+    /// names (`string`, `string_2`).
+    fn merge(mut variants: Vec<Self>) -> Vec<Self> {
+        let mut seen: Vec<(FieldType, bool)> = Vec::new();
+        variants.retain(|v| {
+            let key = (v.r#type.clone(), v.empty);
+            let new = !seen.contains(&key);
+            seen.push(key);
+            new
+        });
+        // A JSON number is read as the wider type.
+        let plain = |v: &Self, kind: &str| {
+            v.json_type == kind && !matches!(v.r#type, FieldType::SchemaRef { .. })
+        };
+        if variants.iter().any(|v| plain(v, "number")) {
+            variants.retain(|v| !plain(v, "integer"));
+        }
+        let mut used = BTreeSet::new();
+        for variant in &mut variants {
+            let base = variant.name.clone();
+            let mut n = 1;
+            while !used.insert(variant.name.clone()) {
+                n += 1;
+                variant.name = format!("{base}_{n}");
+            }
+        }
+        variants
+    }
+
+    /// Where the variant stands in the order decoders try them: the plain strings come last,
+    /// after the variants that parse them, and objects follow their rank.
+    fn try_key(&self) -> (bool, usize) {
+        let plain = !self.empty && matches!(self.r#type, FieldType::String | FieldType::Uri);
+        (
+            plain,
+            if self.json_type == "object" {
+                self.rank
+            } else {
+                0
+            },
+        )
     }
 
     /// The JSON type of values of `ty`, unknown for references.
@@ -1763,6 +2170,7 @@ impl UnionVariant {
             | FieldType::StringEnum { .. } => "string",
             FieldType::List { .. } | FieldType::Set { .. } => "array",
             FieldType::Map { .. } | FieldType::JsonObject => "object",
+            FieldType::Nullable { inner } => return Self::json_type_of(inner),
             FieldType::SchemaRef { .. } | FieldType::Union { .. } => return None,
         })
     }
@@ -1821,6 +2229,12 @@ pub(crate) enum FieldType {
     Map {
         value_ty: Arc<FieldType>,
     },
+    /// A value that may also be `null`: the items of a list or the values of a map that allow
+    /// it, or the body of a response that may be `null`. Fields carry their nullability in
+    /// [`Field::nullable`] instead.
+    Nullable {
+        inner: Arc<FieldType>,
+    },
     /// The name of another schema that defines this type.
     SchemaRef {
         name: String,
@@ -1828,8 +2242,9 @@ pub(crate) enum FieldType {
         inner: Option<Type>,
     },
 
-    /// A value of one of several types told apart by their JSON type, such as Stripe's
-    /// expandable `string | Customer`. Templates render it as untyped JSON (it answers
+    /// A value of one of several types, such as Stripe's expandable `string | Customer` or
+    /// `string | string[] | integer[]`, told apart by their JSON type, the items of lists and
+    /// the properties of objects. Templates render it as untyped JSON (it answers
     /// `is_json_object`) unless they check `is_union` first.
     Union {
         variants: Vec<UnionVariant>,
@@ -1839,6 +2254,10 @@ pub(crate) enum FieldType {
         /// The mode `x-perseid-union` asks for.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         requested: Option<UnionMode>,
+        /// How the variant of any JSON value is picked: by JSON type alone, or by trying the
+        /// variants in order when some share a JSON type.
+        #[serde(default, skip_serializing_if = "UnionDecode::is_json_type")]
+        decode: UnionDecode,
     },
 
     /// An inline string enum that will be promoted to a named top-level type
@@ -1856,7 +2275,25 @@ impl FieldType {
         let openapi::ParameterSchemaOrContent::Schema(s) = format else {
             bail!("found unexpected 'content' data format");
         };
-        Self::from_schema(s.json_schema)
+        // A parameter cannot send `null` items.
+        Ok(Self::from_schema(s.json_schema)?.without_nullable())
+    }
+
+    /// This type with the `null` of the items and values of collections dropped.
+    pub(crate) fn without_nullable(self) -> Self {
+        match self {
+            Self::Nullable { inner } => Arc::unwrap_or_clone(inner).without_nullable(),
+            Self::List { inner } => Self::List {
+                inner: Arc::new(Arc::unwrap_or_clone(inner).without_nullable()),
+            },
+            Self::Set { inner } => Self::Set {
+                inner: Arc::new(Arc::unwrap_or_clone(inner).without_nullable()),
+            },
+            Self::Map { value_ty } => Self::Map {
+                value_ty: Arc::new(Arc::unwrap_or_clone(value_ty).without_nullable()),
+            },
+            other => other,
+        }
     }
 
     fn from_schema(s: Schema) -> anyhow::Result<Self> {
@@ -1867,9 +2304,43 @@ impl FieldType {
         Self::from_schema_object(obj)
     }
 
+    fn from_schema_nullable(s: Schema) -> anyhow::Result<Self> {
+        let Schema::Object(obj) = s else {
+            bail!("found unexpected `true` schema");
+        };
+
+        Self::from_schema_object_nullable(obj)
+    }
+
     pub(crate) fn from_schema_object(obj: SchemaObject) -> anyhow::Result<Self> {
         let (field_type, _nullable) = Self::from_schema_object_with_nullable(obj)?;
         Ok(field_type)
+    }
+
+    /// Like [`Self::from_schema_object`], keeping nullability as [`Self::Nullable`], for the
+    /// items of lists, the values of maps and response bodies.
+    pub(crate) fn from_schema_object_nullable(obj: SchemaObject) -> anyhow::Result<Self> {
+        let (field_type, nullable) = Self::from_schema_object_with_nullable(obj)?;
+        Ok(field_type.nullable_if(nullable))
+    }
+
+    /// This type, which accepts `null` when `nullable`.
+    pub(crate) fn nullable_if(self, nullable: bool) -> Self {
+        match self {
+            Self::Nullable { .. } => self,
+            _ if nullable => Self::Nullable {
+                inner: Arc::new(self),
+            },
+            _ => self,
+        }
+    }
+
+    /// The type without its [`Self::Nullable`] wrapper.
+    pub(crate) fn non_null(&self) -> &Self {
+        match self {
+            Self::Nullable { inner } => inner.non_null(),
+            _ => self,
+        }
     }
 
     /// Parse a schema object, returning the field type and whether it's nullable.
@@ -1904,18 +2375,20 @@ impl FieldType {
                     .filter(|v| !is_null_schema(v))
                     .map(UnionVariant::from_schema)
                     .collect();
-                if let Some(variants) = members
-                    && variants.len() > 1
-                    && distinct_json_types(&variants)
-                {
-                    return Ok((
-                        Self::Union {
-                            variants,
-                            mode: UnionMode::Json,
-                            requested,
-                        },
-                        nullable,
-                    ));
+                if let Some(variants) = members.map(UnionVariant::merge) {
+                    return Ok(match <[UnionVariant; 1]>::try_from(variants) {
+                        Ok([only]) => (only.r#type, nullable),
+                        Err(variants) if variants.len() > 1 => (
+                            Self::Union {
+                                variants,
+                                mode: UnionMode::Json,
+                                requested,
+                                decode: UnionDecode::JsonType,
+                            },
+                            nullable,
+                        ),
+                        Err(_) => (Self::JsonObject, nullable),
+                    });
                 }
                 tracing::warn!(
                     "`oneOf`/`anyOf` without a discriminator is typed as an untyped JSON value"
@@ -1959,10 +2432,15 @@ impl FieldType {
                 if let Some(values) = obj.enum_values {
                     let mut values: Vec<String> = values
                         .into_iter()
-                        .filter(|v| !v.is_null())
-                        .map(|v| match v {
+                        .enumerate()
+                        .filter(|(_, v)| !v.is_null())
+                        .map(|(i, v)| match v {
                             serde_json::Value::String(s) => Ok(s),
-                            _ => bail!("string enums with non-string values are not supported"),
+                            other => bail!(
+                                "enum value {} (`{other}`) is not a string although the enum is \
+                                 `type: string`, make the values strings or the type `integer`",
+                                i + 1
+                            ),
                         })
                         .collect::<anyhow::Result<_>>()?;
                     // A single value is a constant, most often a discriminator.
@@ -1985,7 +2463,7 @@ impl FieldType {
                 let array = obj.array.unwrap_or_default();
                 let inner = match array.items {
                     None => Self::JsonObject,
-                    Some(SingleOrVec::Single(ty)) => Self::from_schema(*ty)?,
+                    Some(SingleOrVec::Single(ty)) => Self::from_schema_nullable(*ty)?,
                     Some(SingleOrVec::Vec(_)) => {
                         bail!("tuple arrays (`items` as a list) are not supported")
                     }
@@ -2006,7 +2484,7 @@ impl FieldType {
                 match obj.additional_properties.map(|s| *s) {
                     None | Some(Schema::Bool(_)) => Self::JsonObject,
                     Some(Schema::Object(schema_object)) => {
-                        let value_ty = Arc::new(Self::from_schema_object(schema_object)?);
+                        let value_ty = Arc::new(Self::from_schema_object_nullable(schema_object)?);
                         Self::Map { value_ty }
                     }
                 }
@@ -2040,6 +2518,7 @@ impl FieldType {
             Self::Decimal => "decimal".into(),
             Self::DateTime => "DateTimeOffset".into(),
             Self::JsonObject | Self::Union { .. } => "JsonNode".into(),
+            Self::Nullable { inner } => format!("{}?", inner.to_csharp_typename()).into(),
             Self::Map { value_ty } => {
                 format!("Dictionary<string, {}>", value_ty.to_csharp_typename()).into()
             }
@@ -2068,6 +2547,15 @@ impl FieldType {
             Self::Uri | Self::String | Self::Decimal => "string".into(),
             Self::DateTime => "time.Time".into(),
             Self::JsonObject | Self::Union { .. } => "map[string]any".into(),
+            // Slices, maps and untyped JSON are nil already.
+            Self::Nullable { inner } => match inner.non_null() {
+                Self::List { .. }
+                | Self::Set { .. }
+                | Self::Map { .. }
+                | Self::JsonObject
+                | Self::Union { .. } => inner.to_go_typename(),
+                _ => format!("*{}", inner.to_go_typename()).into(),
+            },
             Self::Map { value_ty } => format!("map[string]{}", value_ty.to_go_typename()).into(),
             Self::List { inner } | Self::Set { inner } => {
                 format!("[]{}", inner.to_go_typename()).into()
@@ -2091,6 +2579,7 @@ impl FieldType {
             Self::Uri | Self::String => "String".into(),
             Self::Decimal => "java.math.BigDecimal".into(),
             Self::DateTime => "Instant".into(),
+            Self::Nullable { inner } => format!("{}?", inner.to_kotlin_typename()).into(),
             Self::Map { value_ty } => {
                 format!("Map<String,{}>", value_ty.to_kotlin_typename()).into()
             }
@@ -2120,6 +2609,12 @@ impl FieldType {
             Self::String | Self::Uri => "string".into(),
             Self::DateTime => "Date".into(),
             Self::JsonObject | Self::Union { .. } => "any".into(),
+            Self::Nullable { inner } => format!("{} | null", inner.to_js_typename()).into(),
+            Self::List { inner } | Self::Set { inner }
+                if matches!(**inner, Self::Nullable { .. }) =>
+            {
+                format!("({})[]", inner.to_js_typename()).into()
+            }
             Self::List { inner } | Self::Set { inner } => {
                 format!("{}[]", inner.to_js_typename()).into()
             }
@@ -2152,6 +2647,7 @@ impl FieldType {
             Self::List { inner } | Self::Set { inner } => {
                 format!("Vec<{}>", inner.to_rust_typename()).into()
             }
+            Self::Nullable { inner } => format!("Option<{}>", inner.to_rust_typename()).into(),
             Self::Map { value_ty } => format!(
                 "std::collections::HashMap<String, {}>",
                 value_ty.to_rust_typename(),
@@ -2163,31 +2659,6 @@ impl FieldType {
         }
     }
 
-    /// Whether the SDK value is the decoded JSON value itself in every language: scalars,
-    /// untyped JSON, and lists and maps of those.
-    pub(crate) fn is_plain_json(&self) -> bool {
-        match self {
-            Self::Bool
-            | Self::Int16
-            | Self::UInt16
-            | Self::Int32
-            | Self::Int64
-            | Self::UInt64
-            | Self::Float
-            | Self::Double
-            | Self::String
-            | Self::Date
-            | Self::Uri
-            | Self::JsonObject
-            | Self::Union { .. } => true,
-            Self::List { inner } | Self::Set { inner } => inner.is_plain_json(),
-            Self::Map { value_ty } => value_ty.is_plain_json(),
-            Self::Decimal | Self::DateTime | Self::SchemaRef { .. } | Self::StringEnum { .. } => {
-                false
-            }
-        }
-    }
-
     pub(crate) fn inline_aliases(&mut self, aliases: &BTreeMap<String, FieldType>) {
         match self {
             Self::SchemaRef { name, .. } => {
@@ -2195,8 +2666,16 @@ impl FieldType {
                     *self = target.clone();
                 }
             }
-            Self::List { inner } | Self::Set { inner } => {
+            Self::List { inner } | Self::Set { inner } | Self::Nullable { inner } => {
                 Arc::make_mut(inner).inline_aliases(aliases);
+                // An alias of a nullable type is not nested twice.
+                if let Self::Nullable { inner } = self
+                    && let Self::Nullable { inner: twice } = &**inner
+                {
+                    *self = Self::Nullable {
+                        inner: twice.clone(),
+                    };
+                }
             }
             Self::Map { value_ty } => Arc::make_mut(value_ty).inline_aliases(aliases),
             Self::Union { variants, .. } => {
@@ -2215,6 +2694,18 @@ impl FieldType {
         }
     }
 
+    /// Whether this type is a union, or a list of, a map of or a nullable one.
+    pub(crate) fn contains_union(&self) -> bool {
+        match self {
+            Self::Union { .. } => true,
+            Self::List { inner } | Self::Set { inner } | Self::Nullable { inner } => {
+                inner.contains_union()
+            }
+            Self::Map { value_ty } => value_ty.contains_union(),
+            _ => false,
+        }
+    }
+
     /// Schemas the variants of the unions in this type reference.
     pub(crate) fn union_refs(&self) -> BTreeSet<&str> {
         match self {
@@ -2226,18 +2717,21 @@ impl FieldType {
                     refs
                 })
                 .collect(),
-            Self::List { inner } | Self::Set { inner } => inner.union_refs(),
+            Self::List { inner } | Self::Set { inner } | Self::Nullable { inner } => {
+                inner.union_refs()
+            }
             Self::Map { value_ty } => value_ty.union_refs(),
             _ => BTreeSet::new(),
         }
     }
 
-    fn settle_object_unions(&mut self, best_match: bool, counts: &mut (usize, usize)) {
+    pub(crate) fn settle_object_unions(&mut self, best_match: bool, counts: &mut (usize, usize)) {
         match self {
             Self::Union {
                 variants,
                 mode,
                 requested,
+                ..
             } => {
                 for variant in variants.iter_mut() {
                     variant.r#type.settle_object_unions(best_match, counts);
@@ -2252,7 +2746,7 @@ impl FieldType {
                     }
                 }
             }
-            Self::List { inner } | Self::Set { inner } => {
+            Self::List { inner } | Self::Set { inner } | Self::Nullable { inner } => {
                 Arc::make_mut(inner).settle_object_unions(best_match, counts)
             }
             Self::Map { value_ty } => {
@@ -2266,7 +2760,9 @@ impl FieldType {
     pub(crate) fn untype_unions(&mut self) {
         match self {
             Self::Union { .. } => *self = Self::JsonObject,
-            Self::List { inner } | Self::Set { inner } => Arc::make_mut(inner).untype_unions(),
+            Self::List { inner } | Self::Set { inner } | Self::Nullable { inner } => {
+                Arc::make_mut(inner).untype_unions()
+            }
             Self::Map { value_ty } => Arc::make_mut(value_ty).untype_unions(),
             _ => {}
         }
@@ -2275,9 +2771,10 @@ impl FieldType {
     pub(crate) fn referenced_schema(&self) -> Option<&str> {
         match self {
             Self::SchemaRef { name, .. } => Some(name),
-            Self::List { inner: ty } | Self::Set { inner: ty } | Self::Map { value_ty: ty } => {
-                ty.referenced_schema()
-            }
+            Self::List { inner: ty }
+            | Self::Set { inner: ty }
+            | Self::Nullable { inner: ty }
+            | Self::Map { value_ty: ty } => ty.referenced_schema(),
             _ => None,
         }
     }
@@ -2293,6 +2790,9 @@ impl FieldType {
             Self::SchemaRef { name, .. } => name.to_upper_camel_case().into(),
             Self::Uri => "str".into(),
             Self::JsonObject | Self::Union { .. } => "t.Dict[str, t.Any]".into(),
+            Self::Nullable { inner } => {
+                format!("t.Optional[{}]", inner.to_python_typename()).into()
+            }
             Self::Set { inner } | Self::List { inner } => {
                 format!("t.List[{}]", inner.to_python_typename()).into()
             }
@@ -2309,7 +2809,9 @@ impl FieldType {
             // _ => "String".into(),
             FieldType::Bool => "Boolean".into(),
             FieldType::Int16 => "Short".into(),
-            FieldType::UInt16 | FieldType::UInt64 | FieldType::Int64 => "Long".into(),
+            FieldType::UInt16 | FieldType::Int64 => "Long".into(),
+            // A `long` cannot hold the upper half of the unsigned 64-bit range.
+            FieldType::UInt64 => "BigInteger".into(),
             FieldType::Int32 => "Integer".into(),
             FieldType::Float => "Float".into(),
             FieldType::Double => "Double".into(),
@@ -2318,6 +2820,7 @@ impl FieldType {
             FieldType::DateTime => "OffsetDateTime".into(),
             FieldType::Uri => "URI".into(),
             FieldType::JsonObject | FieldType::Union { .. } => "Object".into(),
+            FieldType::Nullable { inner } => inner.to_java_typename(),
             FieldType::List { inner } => format!("List<{}>", inner.to_java_typename()).into(),
             FieldType::Set { inner: field_type } => {
                 format!("Set<{}>", field_type.to_java_typename()).into()
@@ -2359,7 +2862,9 @@ impl FieldType {
             | FieldType::Union { .. }
             | FieldType::Date => false,
             FieldType::StringEnum { .. } => false,
-            FieldType::List { inner } | FieldType::Set { inner } => inner.needs_java_import(),
+            FieldType::List { inner }
+            | FieldType::Set { inner }
+            | FieldType::Nullable { inner } => inner.needs_java_import(),
             FieldType::Map { value_ty } => value_ty.needs_java_import(),
             FieldType::SchemaRef { inner, .. } => {
                 // String aliases don't need import - they resolve to String
@@ -2399,6 +2904,7 @@ impl FieldType {
             | FieldType::Date
             | FieldType::SchemaRef { .. } => self.to_php_typename(),
             FieldType::StringEnum { .. } => "string".into(),
+            FieldType::Nullable { inner } => inner.to_phpdoc_typename(),
             FieldType::Set { inner } | FieldType::List { inner } => {
                 format!("list<{}>", inner.to_phpdoc_typename()).into()
             }
@@ -2426,6 +2932,7 @@ impl FieldType {
             | FieldType::List { .. }
             | FieldType::Set { .. }
             | FieldType::Map { .. } => "array".into(),
+            FieldType::Nullable { inner } => inner.to_php_typename(),
             FieldType::SchemaRef { name, .. } => name.clone().into(),
         }
     }
@@ -2500,6 +3007,10 @@ impl minijinja::value::Object for FieldType {
                 ensure_no_args(args, "is_list")?;
                 Ok(matches!(**self, Self::List { .. }).into())
             }
+            "is_nullable" => {
+                ensure_no_args(args, "is_nullable")?;
+                Ok(matches!(**self, Self::Nullable { .. }).into())
+            }
             "is_set" => {
                 ensure_no_args(args, "is_set")?;
                 Ok(matches!(**self, Self::Set { .. }).into())
@@ -2538,6 +3049,7 @@ impl minijinja::value::Object for FieldType {
                     | F::List { .. }
                     | F::Set { .. }
                     | F::Map { .. }
+                    | F::Nullable { .. }
                     | F::SchemaRef { .. }
                     | F::Date => false,
                     F::StringEnum { .. } => false,
@@ -2557,6 +3069,24 @@ impl minijinja::value::Object for FieldType {
                 Ok(match &**self {
                     Self::Union { mode, .. } => minijinja::Value::from_serialize(mode),
                     _ => minijinja::Value::from(()),
+                })
+            }
+            "union_decode" => {
+                ensure_no_args(args, "union_decode")?;
+                Ok(match &**self {
+                    Self::Union { decode, .. } => minijinja::Value::from_serialize(decode),
+                    _ => minijinja::Value::from(()),
+                })
+            }
+            "try_variants" => {
+                ensure_no_args(args, "try_variants")?;
+                Ok(match &**self {
+                    Self::Union { variants, .. } => {
+                        let mut ordered: Vec<_> = variants.iter().collect();
+                        ordered.sort_by_key(|v| v.try_key());
+                        minijinja::Value::from_serialize(ordered)
+                    }
+                    _ => minijinja::Value::from(Vec::<minijinja::Value>::new()),
                 })
             }
             "object_variants" => {
@@ -2585,12 +3115,14 @@ impl minijinja::value::Object for FieldType {
                 Ok(matches!(**self, Self::Date).into())
             }
 
-            // Returns the inner type of a list or set
+            // Returns the inner type of a list, set or nullable type
             "inner_type" => {
                 ensure_no_args(args, "inner_type")?;
 
                 let ty = match &**self {
-                    FieldType::List { inner } | FieldType::Set { inner } => {
+                    FieldType::List { inner }
+                    | FieldType::Set { inner }
+                    | FieldType::Nullable { inner } => {
                         Some(minijinja::Value::from_dyn_object(inner.clone()))
                     }
                     _ => None,
@@ -2646,6 +3178,19 @@ where
         minijinja::Value::from_object(field_ty.clone()).serialize(serializer)
     } else {
         field_ty.serialize(serializer)
+    }
+}
+
+fn serialize_optional_boxed_field_type<S>(
+    field_ty: &Option<Box<FieldType>>,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    match field_ty {
+        Some(field_ty) => serialize_field_type(field_ty, serializer),
+        None => serializer.serialize_none(),
     }
 }
 
@@ -2741,10 +3286,102 @@ mod tests {
     }
 
     fn field_type<'a>(types: &'a Types, ty: &str, field: &str) -> &'a FieldType {
-        let TypeData::Struct { fields } = &types[ty].data else {
+        let TypeData::Struct { fields, .. } = &types[ty].data else {
             panic!("{ty} is not a struct");
         };
         &fields.iter().find(|f| f.name == field).unwrap().r#type
+    }
+
+    #[test]
+    fn required_only_alternatives_leave_a_struct() {
+        let types = types_from(json!({
+            "Ref": {
+                "type": "object",
+                "properties": {"url": {"type": "string"}, "id": {"type": "string"}},
+                "anyOf": [{"required": ["url"]}, {"required": ["id"]}],
+            },
+        }));
+        let TypeData::Struct { fields, .. } = &types["Ref"].data else {
+            panic!("Ref is not a struct");
+        };
+        assert_eq!(fields.len(), 2);
+    }
+
+    #[test]
+    fn an_unsupported_field_is_untyped_but_its_parent_stays_typed() {
+        let types = types_from(json!({
+            "Holder": {
+                "type": "object",
+                "properties": {
+                    "bad": {"type": "string", "enum": ["a", 1]},
+                    "ok": {"type": "string"},
+                },
+            },
+        }));
+        assert_eq!(field_type(&types, "Holder", "ok"), &FieldType::String);
+        assert_eq!(field_type(&types, "Holder", "bad"), &FieldType::JsonObject);
+    }
+
+    #[test]
+    fn inline_variants_are_hoisted_into_structs() {
+        let mut types = types_from(json!({
+            "Part": {
+                "oneOf": [
+                    {"type": "object", "required": ["type", "text"], "properties": {
+                        "type": {"type": "string", "enum": ["text"]},
+                        "text": {"type": "string"}}},
+                    {"$ref": "#/components/schemas/Image"},
+                ],
+                "discriminator": {"propertyName": "type"},
+            },
+            "Image": {"type": "object", "properties": {"type": {"type": "string"}}},
+        }));
+        super::hoist_inline_variants(&mut types);
+        let TypeData::StructEnum {
+            repr: StructEnumRepr::InternallyTagged { variants },
+            ..
+        } = &types["Part"].data
+        else {
+            panic!("Part is not a tagged union");
+        };
+        assert!(variants.iter().all(|v| matches!(
+            &v.content,
+            EnumVariantType::Ref {
+                schema_ref: Some(_),
+                ..
+            }
+        )));
+        let hoisted = &types["PartTextVariant"];
+        assert_eq!(hoisted.discriminator_defaults["type"], "text");
+        let TypeData::Struct { fields, .. } = &hoisted.data else {
+            panic!("the variant is not a struct");
+        };
+        assert_eq!(
+            fields.iter().map(|f| f.name.as_str()).collect::<Vec<_>>(),
+            ["type", "text"]
+        );
+    }
+
+    #[test]
+    fn alias_variants_resolve_to_their_target_schema() {
+        let mut types = types_from(json!({
+            "Shape": {
+                "oneOf": [{"$ref": "#/components/schemas/Check"}],
+                "discriminator": {"propertyName": "type"},
+            },
+            "Check": {"$ref": "#/components/schemas/Base"},
+            "Base": {"type": "object", "properties": {"type": {"type": "string"}}},
+        }));
+        let mut resources = Resources::new();
+        super::inline_aliases(&mut types, &mut resources).unwrap();
+        let TypeData::StructEnum {
+            repr: StructEnumRepr::InternallyTagged { variants },
+            ..
+        } = &types["Shape"].data
+        else {
+            panic!("Shape is not a tagged union");
+        };
+        assert_eq!(variants.len(), 1);
     }
 
     #[test]
@@ -2781,13 +3418,48 @@ mod tests {
     }
 
     #[test]
-    fn cyclic_aliases_are_rejected() {
+    fn cyclic_aliases_resolve_to_untyped_json() {
         let mut types = types_from(json!({
             "A": {"$ref": "#/components/schemas/B"},
             "B": {"$ref": "#/components/schemas/A"}
         }));
-        let error = inline_aliases(&mut types, &mut Resources::new()).unwrap_err();
-        assert!(error.to_string().contains("cyclic alias"));
+        inline_aliases(&mut types, &mut Resources::new()).unwrap();
+        assert!(matches!(
+            types["A"].data,
+            TypeData::Alias { ref target } if **target == FieldType::JsonObject
+        ));
+    }
+
+    #[test]
+    fn recursive_array_alias_is_inlined_with_untyped_items() {
+        let mut types = types_from(json!({
+            "Tree": {"type": "array", "items": {"$ref": "#/components/schemas/Tree"}},
+            "Plain": {"type": "array", "items": {"type": "string"}}
+        }));
+        assert_eq!(
+            recursive_aliases(&types),
+            BTreeSet::from(["Tree".to_owned()])
+        );
+        inline_aliases(&mut types, &mut Resources::new()).unwrap();
+        let TypeData::Alias { target } = &types["Tree"].data else {
+            panic!("not an alias");
+        };
+        // Tree items are trees, so lists; the reference that closes the cycle is untyped.
+        let FieldType::List { inner } = &**target else {
+            panic!("not a list: {target:?}");
+        };
+        assert!(matches!(&**inner, FieldType::List { inner } if **inner == FieldType::JsonObject));
+    }
+
+    #[test]
+    fn recursive_map_alias_is_detected() {
+        let types = types_from(json!({
+            "Map": {"type": "object", "additionalProperties": {"$ref": "#/components/schemas/Map"}}
+        }));
+        assert_eq!(
+            recursive_aliases(&types),
+            BTreeSet::from(["Map".to_owned()])
+        );
     }
 
     #[test]
@@ -2811,7 +3483,7 @@ mod tests {
             schema(json!({"type": "object", "additionalProperties": false})),
         )
         .unwrap();
-        assert!(matches!(empty.data, TypeData::Struct { ref fields } if fields.is_empty()));
+        assert!(matches!(empty.data, TypeData::Struct { ref fields, .. } if fields.is_empty()));
         let closed = Type::from_schema(
             "Closed".into(),
             schema(json!({
@@ -2821,7 +3493,62 @@ mod tests {
             })),
         )
         .unwrap();
-        assert!(matches!(closed.data, TypeData::Struct { ref fields } if fields.len() == 1));
+        assert!(matches!(closed.data, TypeData::Struct { ref fields, .. } if fields.len() == 1));
+    }
+
+    #[test]
+    fn extra_properties_are_kept_in_a_map() {
+        let additional = |value| match Type::from_schema("Thing".into(), schema(value))
+            .unwrap()
+            .data
+        {
+            TypeData::Struct {
+                additional_properties,
+                ..
+            } => additional_properties.map(|ty| *ty),
+            other => panic!("{other:?} is not a struct"),
+        };
+        let typed = additional(json!({
+            "type": "object",
+            "properties": {"a": {"type": "string"}},
+            "additionalProperties": {"type": "integer"}
+        }));
+        assert_eq!(
+            typed,
+            Some(FieldType::Map {
+                value_ty: Arc::new(FieldType::Int64)
+            })
+        );
+        for open in [json!(true), json!({})] {
+            let untyped = additional(json!({
+                "type": "object",
+                "properties": {"a": {"type": "string"}},
+                "additionalProperties": open
+            }));
+            assert_eq!(
+                untyped,
+                Some(FieldType::Map {
+                    value_ty: Arc::new(FieldType::JsonObject)
+                })
+            );
+        }
+        let pattern = additional(json!({
+            "type": "object",
+            "properties": {"a": {"type": "string"}},
+            "patternProperties": {"^x-": {"type": "string"}}
+        }));
+        assert!(pattern.is_some());
+        let closed = additional(json!({
+            "type": "object",
+            "properties": {"a": {"type": "string"}},
+            "additionalProperties": false
+        }));
+        assert_eq!(closed, None);
+        let undeclared = additional(json!({
+            "type": "object",
+            "properties": {"a": {"type": "string"}}
+        }));
+        assert_eq!(undeclared, None);
     }
 
     #[test]
@@ -2872,13 +3599,50 @@ mod tests {
     }
 
     #[test]
-    fn ambiguous_unions_are_untyped_json() {
-        let f = field(
-            json!({"anyOf": [{"type": "string"}, {"type": "string", "format": "date-time"}]}),
+    fn unions_sharing_json_types_are_typed_and_named_after_their_items() {
+        let f = field(json!({"anyOf": [
+            {"type": "string"},
+            {"type": "array", "items": {"type": "string"}},
+            {"type": "array", "items": {"type": "integer"}},
+            {"type": "array", "items": {"type": "array", "items": {"type": "integer"}}}
+        ]}));
+        assert_eq!(
+            variants(&f.r#type),
+            [
+                ("string", "string"),
+                ("array_of_strings", "array"),
+                ("array_of_integers", "array"),
+                ("array_of_integer_arrays", "array")
+            ]
         );
-        assert_eq!(f.r#type, FieldType::JsonObject);
+        let f = field(json!({"anyOf": [
+            {"type": "string"}, {"type": "string", "format": "date-time"}
+        ]}));
+        assert_eq!(
+            variants(&f.r#type),
+            [("string", "string"), ("date_time", "string")]
+        );
+        let FieldType::Union { variants, .. } = &f.r#type else {
+            unreachable!()
+        };
+        let mut order: Vec<_> = variants.iter().collect();
+        order.sort_by_key(|v| v.try_key());
+        assert_eq!(order[0].name, "date_time");
+    }
+
+    #[test]
+    fn integers_fold_into_numbers_and_repeats_into_one_variant() {
         let f = field(json!({"anyOf": [{"type": "integer"}, {"type": "number"}]}));
-        assert_eq!(f.r#type, FieldType::JsonObject);
+        assert_eq!(f.r#type, FieldType::Double);
+        let f = field(json!({"anyOf": [{"type": "string"}, {"type": "string"}]}));
+        assert_eq!(f.r#type, FieldType::String);
+        let f = field(json!({"anyOf": [
+            {"type": "integer"}, {"type": "number"}, {"type": "string"}
+        ]}));
+        assert_eq!(
+            variants(&f.r#type),
+            [("number", "number"), ("string", "string")]
+        );
         let f = field(json!({"anyOf": [{"type": "string"}, {}]}));
         assert_eq!(f.r#type, FieldType::JsonObject);
         let f = field(json!({"type": ["string", "integer"]}));
@@ -2886,7 +3650,84 @@ mod tests {
     }
 
     #[test]
-    fn union_references_settle_their_json_type_or_untype_the_union() {
+    fn variants_sharing_a_json_type_are_tried_in_order_and_arrays_told_apart_by_items() {
+        let mut types = types_from(json!({
+            "Holder": {"type": "object", "properties": {
+                "prompt": {"anyOf": [
+                    {"type": "string"},
+                    {"type": "array", "items": {"type": "string"}},
+                    {"type": "array", "items": {"type": "integer"}},
+                    {"type": "array", "items": {"type": "array", "items": {"type": "integer"}}},
+                    {"type": "array", "items": {"$ref": "#/components/schemas/Part"}}
+                ]},
+                "plain": {"anyOf": [{"type": "string"}, {"type": "integer"}]}
+            }},
+            "Part": {"type": "object", "properties": {"x": {"type": "string"}}}
+        }));
+        resolve_unions(&mut types, &mut Resources::new());
+        let FieldType::Union {
+            variants, decode, ..
+        } = field_type(&types, "Holder", "prompt")
+        else {
+            panic!("not a union");
+        };
+        assert_eq!(*decode, UnionDecode::Try);
+        let items: Vec<_> = variants
+            .iter()
+            .map(|v| {
+                v.items.as_ref().map(|i| {
+                    (
+                        i.json_type.as_str(),
+                        i.items.as_ref().map(|i| i.json_type.as_str()),
+                    )
+                })
+            })
+            .collect();
+        assert_eq!(
+            items,
+            [
+                None,
+                Some(("string", None)),
+                Some(("integer", None)),
+                Some(("array", Some("integer"))),
+                Some(("object", None))
+            ]
+        );
+        let FieldType::Union { decode, .. } = field_type(&types, "Holder", "plain") else {
+            panic!("not a union");
+        };
+        assert_eq!(*decode, UnionDecode::JsonType);
+    }
+
+    #[test]
+    fn objects_that_are_no_struct_are_tried_after_the_structs() {
+        let mut types = types_from(json!({
+            "Holder": {"type": "object", "properties": {
+                "value": {"oneOf": [
+                    {"type": "object", "additionalProperties": {"type": "string"}},
+                    {"$ref": "#/components/schemas/Item"},
+                    {"type": "string"}
+                ]}
+            }},
+            "Item": {"type": "object", "required": ["id"], "properties": {"id": {"type": "string"}}}
+        }));
+        resolve_unions(&mut types, &mut Resources::new());
+        let FieldType::Union { variants, mode, .. } = field_type(&types, "Holder", "value") else {
+            panic!("not a union");
+        };
+        assert_eq!(*mode, UnionMode::BestMatch);
+        let mut order: Vec<_> = variants
+            .iter()
+            .filter(|v| v.json_type == "object")
+            .collect();
+        order.sort_by_key(|v| v.try_key());
+        let names: Vec<_> = order.iter().map(|v| v.name.as_str()).collect();
+        assert_eq!(names, ["item", "object"]);
+        assert_eq!(order[0].required, ["id"]);
+    }
+
+    #[test]
+    fn union_references_settle_their_json_type() {
         let customer = |a: &str, b: &str| {
             json!({"anyOf": [
                 {"$ref": format!("#/components/schemas/{a}")},
@@ -2922,10 +3763,17 @@ mod tests {
                 ..
             }
         ));
-        assert_eq!(field_type(&types, "Charge", "code"), &FieldType::JsonObject);
+        assert_eq!(
+            variants(field_type(&types, "Charge", "code")),
+            [
+                ("code", "string"),
+                ("customer", "object"),
+                ("string", "string")
+            ]
+        );
         assert_eq!(
             types["Charge"].union_refs(),
-            BTreeSet::from(["Customer", "Deleted", "Tier"])
+            BTreeSet::from(["Code", "Customer", "Deleted", "Tier"])
         );
         assert!(types["Charge"].referenced_components().is_empty());
         assert_eq!(settle_object_unions(&mut types, false), (0, 1));
@@ -3151,7 +3999,7 @@ mod tests {
             schema(json!({"properties": {"a": {"type": "string"}}})),
         )
         .unwrap();
-        assert!(matches!(ty.data, TypeData::Struct { ref fields } if fields.len() == 1));
+        assert!(matches!(ty.data, TypeData::Struct { ref fields, .. } if fields.len() == 1));
         let ty = Type::from_schema(
             "Mode".into(),
             schema(json!({"anyOf": [{"type": "string", "enum": ["a", "b"]}, {"type": "null"}]})),
@@ -3177,13 +4025,9 @@ mod tests {
             ["schemas `Issue` and `issue` both become the type `Issue`"]
         );
         let errors = clashing_identifiers(&types);
-        assert_eq!(errors.len(), 2, "{errors:?}");
+        assert_eq!(errors.len(), 1, "{errors:?}");
         assert!(
-            errors[0].starts_with("schema `Issue`: `a-b` and `a_b`"),
-            "{errors:?}"
-        );
-        assert!(
-            errors[1].starts_with("schema `issue`: `@type` and `type`"),
+            errors[0].starts_with("schema `issue`: `@type` and `type`"),
             "{errors:?}"
         );
     }
@@ -3208,28 +4052,22 @@ mod tests {
     }
 
     #[test]
-    fn enums_whose_values_clash_are_strings_and_duplicates_are_dropped() {
-        let mut types = types_from(json!({
+    fn enums_whose_values_clash_stay_typed_and_duplicates_are_dropped() {
+        let types = types_from(json!({
             "Unit": {"type": "string", "enum": ["bps", "Bps"]},
-            "Zone": {"type": "string", "enum": ["Etc/GMT-0", "Etc/GMT0"]},
-            "Operator": {"type": "string", "enum": ["lt", "gt", "lt"]},
-            "Reading": {"type": "object", "properties": {"unit": {"$ref": "#/components/schemas/Unit"}}}
+            "Operator": {"type": "string", "enum": ["lt", "gt", "lt"]}
         }));
-        untype_clashing_enums(&mut types);
-        assert_eq!(types["Unit"].data, TypeData::StringAlias);
-        assert_eq!(types["Zone"].data, TypeData::StringAlias);
+        assert_eq!(
+            types["Unit"].data,
+            TypeData::StringEnum {
+                values: vec!["bps".into(), "Bps".into()]
+            }
+        );
         assert_eq!(
             types["Operator"].data,
             TypeData::StringEnum {
                 values: vec!["lt".into(), "gt".into()]
             }
-        );
-        let FieldType::SchemaRef { inner, .. } = field_type(&types, "Reading", "unit") else {
-            panic!("a reference")
-        };
-        assert_eq!(
-            inner.as_ref().map(|t| &t.data),
-            Some(&TypeData::StringAlias)
         );
     }
 
@@ -3250,7 +4088,7 @@ mod tests {
         }));
         relax_access_modes(&mut types, ["Account"], ["Account", "Receipt"]);
         let required = |types: &Types, ty: &str, name: &str| {
-            let TypeData::Struct { fields } = &types[ty].data else {
+            let TypeData::Struct { fields, .. } = &types[ty].data else {
                 panic!("a struct")
             };
             fields.iter().find(|f| f.name == name).unwrap().required
@@ -3290,7 +4128,7 @@ mod tests {
             })),
         )
         .unwrap();
-        let TypeData::Struct { fields } = &ty.data else {
+        let TypeData::Struct { fields, .. } = &ty.data else {
             panic!("not a struct");
         };
         let fields: Vec<_> = fields
@@ -3324,7 +4162,7 @@ mod tests {
             types.insert(name.into(), Type::from_schema(name.into(), schema).unwrap());
         }
         inline_flattened_fields(&mut types).unwrap();
-        let TypeData::Struct { fields } = &types["Composed"].data else {
+        let TypeData::Struct { fields, .. } = &types["Composed"].data else {
             panic!("not a struct");
         };
         let fields: Vec<_> = fields
@@ -3335,5 +4173,98 @@ mod tests {
             fields,
             [("id", FieldType::String), ("note", FieldType::Int64)]
         );
+    }
+}
+
+#[cfg(test)]
+mod nullable_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn parse(value: serde_json::Value) -> FieldType {
+        FieldType::from_schema_object_nullable(serde_json::from_value(value).unwrap()).unwrap()
+    }
+
+    fn nullable(inner: FieldType) -> FieldType {
+        FieldType::Nullable {
+            inner: Arc::new(inner),
+        }
+    }
+
+    fn list(inner: FieldType) -> FieldType {
+        FieldType::List {
+            inner: Arc::new(inner),
+        }
+    }
+
+    #[test]
+    fn nullable_items_and_values_are_kept() {
+        let items = parse(json!({"type": "array", "items": {"type": ["string", "null"]}}));
+        assert_eq!(items, list(nullable(FieldType::String)));
+        let values = parse(json!({
+            "type": "object", "additionalProperties": {"type": ["integer", "null"]}
+        }));
+        assert_eq!(
+            values,
+            FieldType::Map {
+                value_ty: Arc::new(nullable(FieldType::Int64))
+            }
+        );
+    }
+
+    #[test]
+    fn nullable_one_of_items_keep_their_reference() {
+        let widget = FieldType::SchemaRef {
+            name: "Widget".into(),
+            inner: None,
+        };
+        let items = parse(json!({
+            "type": "array",
+            "items": {"oneOf": [{"$ref": "#/components/schemas/Widget"}, {"type": "null"}]}
+        }));
+        assert_eq!(items, list(nullable(widget)));
+        assert_eq!(items.referenced_schema(), Some("Widget"));
+    }
+
+    #[test]
+    fn non_nullable_items_are_unchanged() {
+        let items = parse(json!({"type": "array", "items": {"type": "string"}}));
+        assert_eq!(items, list(FieldType::String));
+        // A nullable list is the field's `nullable`, not a type wrapper.
+        let field = Field::from_schema(
+            "tags".into(),
+            serde_json::from_value(json!({"type": ["array", "null"], "items": {"type": "string"}}))
+                .unwrap(),
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            (field.r#type, field.nullable),
+            (list(FieldType::String), true)
+        );
+    }
+
+    #[test]
+    fn nullable_types_are_named_in_every_language() {
+        let ty = list(nullable(FieldType::String));
+        assert_eq!(ty.to_rust_typename(), "Vec<Option<String>>");
+        assert_eq!(ty.to_js_typename(), "(string | null)[]");
+        assert_eq!(ty.to_go_typename(), "[]*string");
+        assert_eq!(ty.to_python_typename(), "t.List[t.Optional[str]]");
+        assert_eq!(ty.to_java_typename(), "List<String>");
+        assert_eq!(ty.to_csharp_typename(), "List<string?>");
+        assert_eq!(ty.to_kotlin_typename(), "List<String?>");
+        // Slices are nil already.
+        let nested = list(nullable(list(FieldType::Int32)));
+        assert_eq!(nested.to_go_typename(), "[][]int32");
+    }
+
+    #[test]
+    fn nullable_wrappers_do_not_nest_and_can_be_dropped() {
+        let ty = nullable(nullable(FieldType::Bool));
+        assert_eq!(ty.clone().nullable_if(true), ty);
+        assert_eq!(FieldType::Bool.nullable_if(false), FieldType::Bool);
+        let dropped = list(nullable(FieldType::Bool)).without_nullable();
+        assert_eq!(dropped, list(FieldType::Bool));
     }
 }

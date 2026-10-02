@@ -184,7 +184,7 @@ fn fields<'a>(
             None => {}
         }
         let fields = match types.get(schema).map(|t: &Type| &t.data) {
-            Some(TypeData::Struct { fields }) => fields,
+            Some(TypeData::Struct { fields, .. }) => fields,
             _ => bail!("`{schema}` is not an object schema"),
         };
         along.push(

@@ -8,8 +8,9 @@
 {% macro params(resource, op) -%}
     {%- set prefix = (resource.name | to_upper_camel_case) ~ (op.name | to_upper_camel_case) -%}
     {%- set args = namespace(list=[]) -%}
-    {%- for p in op.path_params %}{% set args.list = args.list + ["string " ~ m.param(p)] %}{% endfor -%}
-    {%- set body_type = m.body_type(op) | replace("Models.", "") -%}
+    {%- set styles = op.path_styles | default({}) -%}
+    {%- for p in op.path_params %}{% set args.list = args.list + [(styles[p].type.to_csharp() if p in styles and styles[p].type is defined else "string") ~ " " ~ m.param(p)] %}{% endfor -%}
+    {%- set body_type = m.body_type(op, api.types) | replace("Models.", "") -%}
     {%- if op.request_body_kind == "binary" %}{% set body_type = "Upload" %}{% elif op.request_body_kind == "multipart" %}{% set body_type = prefix ~ "Body" %}{% endif -%}
     {%- if body_type -%}
         {%- set body = m.param(op.request_body_schema_name | default("body")) -%}
@@ -22,20 +23,20 @@
     ({{ args.list | join(", ") }})
 {%- endmacro -%}
 {% macro returned(op) -%}
-    {%- if op.response_is_event_stream %}EventStream{% if op.event_schema_name is defined %}<{{ docs.model_name(op.event_schema_name) }}>{% endif %}
+    {%- if op.response_is_event_stream %}EventStream{% if op.event_json_type is defined %}<{{ m.event_type(op, api.types) | replace("Models.", "") }}>{% elif op.event_schema_name is defined %}<{{ docs.model_name(op.event_schema_name) }}>{% endif %}
     {%- elif op.response_is_binary %}byte[]
     {%- elif op.response_is_text %}string
     {%- else -%}
-        {%- set body = m.response_type(op) | replace("Models.", "") -%}
+        {%- set body = m.response_type(op, api.types) | replace("Models.", "") -%}
         {{ body ~ ("?" if body and op.response_may_be_empty | default(false) and op.pagination is not defined) }}
     {%- endif -%}
 {%- endmacro -%}
 {% macro returns(op) -%}
-    {%- if op.response_is_event_stream %}{% if op.event_schema_name is defined %}stream of {{ model(op.event_schema_name) }}{% else %}event stream{% endif %}
+    {%- if op.response_is_event_stream %}{% if op.event_json_type is defined %}stream of `{{ m.event_type(op, api.types) | replace("Models.", "") }}`{% elif op.event_schema_name is defined %}stream of {{ model(op.event_schema_name) }}{% else %}event stream{% endif %}
     {%- elif op.response_is_binary %}bytes
     {%- elif op.response_is_text %}text
     {%- elif op.response_body_schema_name is defined %}{{ model(op.response_body_schema_name) }}{% if op.response_body_is_list %} list{% endif %}
-    {%- elif op.response_body_json_type is defined %}`{{ op.response_body_json_type.to_csharp() }}`
+    {%- elif op.response_body_json_type is defined %}`{{ m.response_type(op, api.types) | replace("Models.", "") }}`
     {%- else %}nothing{% endif -%}
 {%- endmacro -%}
 {% macro table(resource) -%}

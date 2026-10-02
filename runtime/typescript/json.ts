@@ -5,22 +5,31 @@ const INT64 = "@@INT64@@" as "number" | "bigint" | "string";
 
 const TOKEN = /"(?:[^"\\]|\\.)*"|-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?/g;
 const BIGINT_MARK = "\u0000bigint:";
+/** `BIGINT_MARK` escaped for a JSON string. */
+const BIGINT_MARK_JSON = "\\u0000bigint:";
 const BIGINT_MARKED = /"\\u0000bigint:(-?\d+)"/g;
 
 /**
  * `JSON.parse`, except that when int64 values are `bigint` or `string`, integers beyond
- * `Number.MAX_SAFE_INTEGER` are read as strings so that the models keep every digit.
+ * `Number.MAX_SAFE_INTEGER` keep every digit: read as `bigint` values in `bigint` mode (so that
+ * they stay apart from strings), as strings in `string` mode.
  */
 export function parseJson(text: string): any {
   if (INT64 === "number" || !/\d{16}/.test(text)) {
     return JSON.parse(text);
   }
-  return JSON.parse(
-    text.replace(TOKEN, (token) =>
-      token[0] !== '"' && /^-?\d+$/.test(token) && !Number.isSafeInteger(Number(token))
-        ? `"${token}"`
-        : token
-    )
+  const marked = text.replace(TOKEN, (token) =>
+    token[0] !== '"' && /^-?\d+$/.test(token) && !Number.isSafeInteger(Number(token))
+      ? INT64 === "bigint"
+        ? `"${BIGINT_MARK_JSON}${token}"`
+        : `"${token}"`
+      : token
+  );
+  if (INT64 !== "bigint") {
+    return JSON.parse(marked);
+  }
+  return JSON.parse(marked, (_key, item) =>
+    typeof item === "string" && item.startsWith(BIGINT_MARK) ? BigInt(item.slice(BIGINT_MARK.length)) : item
   );
 }
 
@@ -48,13 +57,19 @@ export function isJsonObject<T>(
 
 /**
  * @internal The properties of `object` other than `known` (property names): those the API
- * sends or accepts that this SDK version does not know, kept as they are.
+ * sends or accepts that this SDK version does not know, kept as they are, or converted by
+ * `convert` when the schema types its `additionalProperties`.
  */
-export function extraProperties(object: unknown, known: readonly string[]): object {
+export function extraProperties(
+  object: unknown,
+  known: readonly string[],
+  convert?: (value: any) => unknown
+): object {
   const extra = {};
   if (isJsonObject(object)) {
-    for (const [key, value] of Object.entries(object as Record<string, unknown>)) {
+    for (const [key, item] of Object.entries(object as Record<string, unknown>)) {
       if (!known.includes(key)) {
+        const value = convert && item !== undefined ? convert(item) : item;
         Object.defineProperty(extra, key, { value, enumerable: true, writable: true, configurable: true });
       }
     }

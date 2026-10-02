@@ -298,10 +298,10 @@ pub enum Int64 {
 #[serde(rename_all = "kebab-case")]
 pub enum UntaggedUnions {
     /// Untyped JSON.
-    #[default]
     Json,
     /// The variant whose required properties are all present and which knows the most
     /// properties, the first declared on ties.
+    #[default]
     BestMatch,
 }
 
@@ -367,7 +367,9 @@ fn client_name<'de, D: serde::Deserializer<'de>>(d: D) -> Result<String, D::Erro
     match camel.starts_with(|c: char| c.is_ascii_alphabetic())
         && camel.chars().all(|c| c.is_ascii_alphanumeric())
     {
-        true => Ok(camel),
+        true => crate::client_name::check(&camel)
+            .map(|()| camel)
+            .map_err(serde::de::Error::custom),
         false => Err(serde::de::Error::custom(format!(
             "`name = {name:?}` must start with a letter and hold ASCII letters, digits, spaces, `-` or `_`"
         ))),
@@ -543,7 +545,7 @@ impl Config {
     pub fn filters_for(&self, sdk: &Sdk) -> Filters {
         let mut filters = self.filters();
         filters.excluded.extend(sdk.target.exclude.iter().cloned());
-        filters.reserved = reserved_type_names(sdk.language, &self.name);
+        filters.reserved = crate::reserved::type_names(sdk.language, &self.name);
         filters.names.extend(sdk.target.names.clone());
         filters
     }
@@ -841,225 +843,6 @@ fn csproj_version(dir: &Path) -> Option<String> {
             let end = start + text[start..].find("</Version>")?;
             Some(text[start..end].trim().to_owned())
         })
-}
-
-/// Type names that generated code uses unqualified next to the models, per language.
-fn reserved_type_names(language: &str, client: &str) -> BTreeSet<String> {
-    let names: &[&str] = match language {
-        "rust" => &["Box", "Option", "Result", "String", "Vec"],
-        "python" => &[
-            "ApiBaseAsync",
-            "ApiBaseSync",
-            "ApiRequest",
-            "AsyncEventStream",
-            "AsyncPage",
-            "AsyncPaginator",
-            "AsyncStream",
-            "BaseModel",
-            "Decimal",
-            "Discriminator",
-            "EventStream",
-            "FileInput",
-            "ObjectUnion",
-            "Paging",
-            "Stream",
-            "SyncPage",
-            "TaggedUnionModel",
-            "Timeout",
-            "UnknownVariant",
-            "Unset",
-            "Upload",
-            "UploadContent",
-        ],
-        "typescript" => &[
-            "Array",
-            "Blob",
-            "Date",
-            "EventStream",
-            "Headers",
-            "Map",
-            "Middleware",
-            "MultipartBody",
-            "Promise",
-            "Record",
-            "RequestOptions",
-            "Security",
-            "SecurityScheme",
-            "Set",
-            "Uint8Array",
-            "Upload",
-            "UploadBody",
-            "XOR",
-        ],
-        // Go declares everything in one directory, where file names count too.
-        "go" => &[
-            "ApiError",
-            "AutoPager",
-            "BasicAuth",
-            "Client",
-            "Collections",
-            "DecodeError",
-            "Errors",
-            "EventStream",
-            "ExtraFields",
-            "Middleware",
-            "Nullable",
-            "Options",
-            "Page",
-            "Request",
-            "RequestAuth",
-            "RequestError",
-            "RequestOption",
-            "RequestPager",
-            "RequestStreaming",
-            "RequiredMap",
-            "RequiredSlice",
-            "RoundTripperFunc",
-            "SdkError",
-            "SseEvent",
-            "Stream",
-            "TimeoutError",
-            "TransportError",
-            "UnionError",
-            "Upload",
-            "Version",
-            "Webhooks",
-        ],
-        "java" => &[
-            "ApiException",
-            "ArrayList",
-            "BigDecimal",
-            "Boolean",
-            "Builder",
-            "Collections",
-            "CompletableFuture",
-            "Double",
-            "EventStream",
-            "Float",
-            "HashMap",
-            "Headers",
-            "HttpUrl",
-            "IOException",
-            "Integer",
-            "JsonAnyGetter",
-            "JsonAnySetter",
-            "JsonNode",
-            "LinkedHashMap",
-            "LinkedHashSet",
-            "List",
-            "Long",
-            "Map",
-            "Multipart",
-            "Object",
-            "Objects",
-            "OffsetDateTime",
-            "Optional",
-            "Override",
-            "Paginator",
-            "Set",
-            "String",
-            "TypeReference",
-            "URI",
-            "Upload",
-            "Utils",
-            "Void",
-        ],
-        // Ours, and those of the namespaces resources import, which would become ambiguous.
-        "csharp" => &[
-            "Action",
-            "ApiAuth",
-            "ApiException",
-            "ApiRequest",
-            "ApiTransport",
-            "Array",
-            "Attribute",
-            "Barrier",
-            "BasicCredentials",
-            "Buffer",
-            "CancellationToken",
-            "Comparer",
-            "Console",
-            "Convert",
-            "Credentials",
-            "DateTime",
-            "DateTimeOffset",
-            "Default",
-            "Delegate",
-            "Dictionary",
-            "Enum",
-            "Environment",
-            "EventStream",
-            "Exception",
-            "Func",
-            "Guid",
-            "HashSet",
-            "HttpClient",
-            "HttpContent",
-            "HttpMethod",
-            "HttpRequestMessage",
-            "HttpResponseMessage",
-            "Index",
-            "Interlocked",
-            "Json",
-            "JsonArray",
-            "JsonNode",
-            "JsonObject",
-            "JsonValue",
-            "KeyValuePair",
-            "Lazy",
-            "LinkedList",
-            "List",
-            "Lock",
-            "Math",
-            "MaybeUnset",
-            "Monitor",
-            "MultipartBody",
-            "Mutex",
-            "Nullable",
-            "Object",
-            "Options",
-            "Pagination",
-            "Paginator",
-            "Parallel",
-            "Queue",
-            "Random",
-            "Range",
-            "RequestOptions",
-            "SecurityScheme",
-            "Semaphore",
-            "SortedSet",
-            "SseEvent",
-            "Stack",
-            "String",
-            "StringContent",
-            "Task",
-            "Thread",
-            "TimeSpan",
-            "Timer",
-            "Tuple",
-            "Type",
-            "Unrecognized",
-            "Upload",
-            "Uri",
-            "ValueTask",
-            "Version",
-            "Volatile",
-            "Webhook",
-        ],
-        _ => &[],
-    };
-    let own: &[&str] = match language {
-        "typescript" => &["Request", "RequestContext"],
-        "java" => &["HttpClient", "Options"],
-        "csharp" => &["Client", "ClientOptions", "JsonContext"],
-        "go" => &[""],
-        _ => &[],
-    };
-    names
-        .iter()
-        .map(|n| (*n).to_owned())
-        .chain(own.iter().map(|suffix| format!("{client}{suffix}")))
-        .collect()
 }
 
 #[cfg(test)]

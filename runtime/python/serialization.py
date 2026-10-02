@@ -11,6 +11,8 @@ and dependency free.
   A required field is always sent.
 * JSON properties, enum values and union variants added to the API after
   this SDK was generated are kept as received, and sent back unchanged.
+  Models whose schema types its ``additionalProperties`` decode the
+  properties they do not declare into that type, in ``extra_fields``.
 * ``Decimal`` values travel as JSON strings, ``datetime`` values as RFC 3339
   strings. Only finite decimals are valid: ``NaN`` and ``Infinity`` are
   rejected in both directions.
@@ -209,7 +211,7 @@ def to_json_value(value: t.Any, annotation: t.Any = t.Any) -> t.Any:
         members = [a for a in t.get_args(annotation) if a not in (_NoneType, Unset)]
         if len(members) == 1:
             return to_json_value(value, members[0])
-        return to_json_value(value, _union_member(members, _value_kind(value)) or t.Any)
+        return to_json_value(value, _union_member(members, value) or t.Any)
     if isinstance(value, enum.Enum):
         return to_json_value(value.value)
     if value is None or isinstance(value, (str, int, float, bool)):
@@ -366,10 +368,20 @@ def _from_json_value(annotation: t.Any, value: t.Any, ctx: str) -> t.Any:
         members = [a for a in args if a not in (_NoneType, Unset)]
         if len(members) == 1:
             return _from_json_value(members[0], value, ctx)
-        member = _union_member(members, _value_kind(value))
-        if member is None:
+        candidates = _union_candidates(members, _value_kind(value))
+        if not candidates:
             raise ModelParseError(f"{ctx}: {value!r} matches no member of {annotation!r}")
-        return _from_json_value(member, value, ctx)
+        # Members sharing a JSON type (`str | list[str] | list[int]`, `datetime | str`) are tried
+        # in order: the first that decodes the value wins.
+        failure: ModelParseError | None = None
+        for member in candidates:
+            if t.get_origin(member) is t.Literal and value not in t.get_args(member):
+                continue
+            try:
+                return _from_json_value(member, value, ctx)
+            except ModelParseError as exc:
+                failure = exc
+        raise failure or ModelParseError(f"{ctx}: {value!r} matches no member of {annotation!r}")
 
     if origin in (list, set, frozenset, tuple):
         inner = args[0] if args else t.Any
@@ -474,19 +486,58 @@ def _value_kind(value: t.Any) -> str | None:
     return None
 
 
-def _union_member(members: list[t.Any], kind: str | None) -> t.Any:
-    """The member of an untagged union whose JSON type is ``kind``.
+def _union_candidates(members: list[t.Any], kind: str | None) -> list[t.Any]:
+    """The members of an untagged union whose JSON type is ``kind``, in declaration order.
 
-    Such unions are only generated when every member has a distinct JSON type.
+    The members that take any JSON value come last, as a fallback.
     """
-    fallback = None
+    exact: list[t.Any] = []
+    fallback: list[t.Any] = []
     for member in members:
         member_kind = _json_kind(member)
         if member_kind == kind:
+            exact.append(member)
+        elif member_kind is None:
+            fallback.append(member)
+    return exact + fallback
+
+
+def _fits(annotation: t.Any, value: t.Any) -> bool:
+    """Whether ``value``, a value held by the caller, is of ``annotation``, looking at the
+    first item of a list: how members sharing a JSON type are told apart."""
+    origin = t.get_origin(annotation)
+    args = t.get_args(annotation)
+    if annotation is t.Any:
+        return True
+    if origin is t.Annotated:
+        return _fits(args[0], value)
+    if origin in _UNION_TYPES:
+        return any(_fits(a, value) for a in args)
+    if origin is t.Literal:
+        return value in args
+    if origin in (list, set, frozenset, tuple):
+        if not isinstance(value, (list, tuple, set, frozenset)):
+            return False
+        first = next(iter(value), None)
+        return first is None or not args or _fits(args[0], first)
+    if origin is dict:
+        return isinstance(value, (t.Mapping, BaseModel))
+    if isinstance(annotation, type):
+        if annotation is float:
+            return isinstance(value, (int, float)) and not isinstance(value, bool)
+        if annotation is int:
+            return isinstance(value, int) and not isinstance(value, bool)
+        return isinstance(value, annotation)
+    return True
+
+
+def _union_member(members: list[t.Any], value: t.Any) -> t.Any:
+    """The member of an untagged union that ``value``, held by the caller, is an instance of."""
+    candidates = _union_candidates(members, _value_kind(value))
+    for member in candidates:
+        if _fits(member, value):
             return member
-        if member_kind is None:
-            fallback = member
-    return fallback
+    return candidates[0] if candidates else None
 
 
 # --------------------------------------------------------------------------
@@ -509,10 +560,21 @@ class BaseModel:
     _JSON_KEYS: t.ClassVar[t.Mapping[str, str]] = {}
     #: Attribute names whose (model) value is merged into the parent object.
     _FLATTENED: t.ClassVar[tuple[str, ...]] = ()
+    # A model whose schema types its `additionalProperties` declares the annotation of
+    # `extra_fields` as `_EXTRA_FIELDS: t.ClassVar[dict[str, Value]]`, without a value.
 
     @classmethod
     def _json_key(cls, name: str) -> str:
         return cls._JSON_KEYS.get(name, name)
+
+    @classmethod
+    def _extra_type(cls) -> t.Any:
+        """The annotation of :attr:`extra_fields`, ``t.Any`` when the schema does not type it."""
+        hint = _type_hints(cls).get("_EXTRA_FIELDS", t.Any)
+        if t.get_origin(hint) is t.ClassVar:
+            args = t.get_args(hint)
+            hint = args[0] if args else t.Any
+        return hint
 
     @property
     def extra_fields(self) -> dict[str, t.Any]:
@@ -556,8 +618,15 @@ class BaseModel:
             keys |= inner
         return frozenset(keys)
 
-    def _keep_extra(self, data: t.Mapping[str, t.Any], known: frozenset[str] | None) -> None:
+    def _keep_extra(
+        self, data: t.Mapping[str, t.Any], known: frozenset[str] | None, decoded: bool = False
+    ) -> None:
+        """Keeps the keys of ``data`` outside ``known``, decoded unless ``decoded`` already."""
         extra = {k: v for k, v in data.items() if known is not None and k not in known}
+        annotation = type(self)._extra_type()
+        if extra and not decoded and annotation is not t.Any:
+            ctx = f"{type(self).__name__}.extra_fields"
+            extra = dict(_from_json_value(annotation, extra, ctx))
         if extra or "_extra" in self.__dict__:
             self.__dict__["_extra"] = extra
 
@@ -575,6 +644,10 @@ class BaseModel:
 
     def _with_extra(self, out: dict[str, t.Any]) -> dict[str, t.Any]:
         extra: dict[str, t.Any] = self.__dict__.get("_extra") or {}
+        if extra:
+            # Entries may hold models, enums or datetimes, set by the caller or typed by
+            # `additionalProperties`.
+            extra = to_json_value(extra, type(self)._extra_type())
         for key, value in extra.items():
             out.setdefault(key, value)
         return out
@@ -773,7 +846,7 @@ class TaggedUnionModel(BaseModel):
         if union._CONTENT_KEY is not None:
             model._keep_extra(data, known)
         elif isinstance(content, BaseModel) and known is not None:
-            content._keep_extra(content.__dict__.get("_extra") or {}, known)
+            content._keep_extra(content.__dict__.get("_extra") or {}, known, decoded=True)
         return model
 
 

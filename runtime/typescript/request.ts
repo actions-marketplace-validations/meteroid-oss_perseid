@@ -8,7 +8,15 @@ import {
   apiError,
 } from "./apiErrors.js";
 import { APIPromise } from "./apiPromise.js";
-import { applyAuth, type Credentials, type Security, type SecurityScheme } from "./auth.js";
+import {
+  applyAuth,
+  basicAuthorization,
+  type Credentials,
+  type OAuthGrant,
+  type OAuthToken,
+  type Security,
+  type SecurityScheme,
+} from "./auth.js";
 import { parseJson, stringifyJson } from "./json.js";
 import { type Middleware, withMiddleware } from "./middleware.js";
 import { EventStream, type MultipartBody, Stream, type UploadBody } from "./streaming.js";
@@ -26,9 +34,10 @@ const IDEMPOTENT_METHODS: ReadonlySet<HttpMethod> = new Set([
   "PUT",
   "DELETE",
   "OPTIONS",
+  "TRACE",
 ]);
 
-export type HttpMethod = "GET" | "HEAD" | "POST" | "PUT" | "DELETE" | "OPTIONS" | "PATCH";
+export type HttpMethod = "GET" | "HEAD" | "POST" | "PUT" | "DELETE" | "OPTIONS" | "PATCH" | "TRACE";
 
 /** Options for a single call, the last argument of every API method. */
 export interface RequestOptions {
@@ -67,6 +76,35 @@ export interface @@CLIENT_NAME@@RequestContext extends Credentials {
   maxRetries?: number | undefined;
   defaultHeaders?: Record<string, string | null | undefined> | undefined;
   defaultQuery?: Record<string, string | undefined> | undefined;
+}
+
+/**
+ * @internal Fetches an access token with the client credentials grant. The request goes through
+ * the client's middleware, timeout and retries like any other.
+ */
+export async function fetchOAuthToken(ctx: @@CLIENT_NAME@@RequestContext, grant: OAuthGrant): Promise<OAuthToken> {
+  const absolute = /^[a-z][a-z0-9+.-]*:\/\//i.test(grant.tokenUrl);
+  const request = new @@CLIENT_NAME@@Request("POST", absolute || grant.tokenUrl.startsWith("/") ? grant.tokenUrl : `/${grant.tokenUrl}`);
+  const form: Record<string, string> = { grant_type: "client_credentials" };
+  if (grant.scope !== "") {
+    form.scope = grant.scope;
+  }
+  if (grant.clientAuth === "body") {
+    form.client_id = grant.clientId;
+    form.client_secret = grant.clientSecret;
+  } else {
+    request.setHeaderParam("authorization", basicAuthorization(grant.clientId, grant.clientSecret));
+  }
+  request.setSecurity([]);
+  request.setFormBody(form);
+  return await request.send(ctx, (json: any): OAuthToken => {
+    const token = json?.access_token;
+    if (typeof token !== "string" || token === "") {
+      throw new @@CLIENT_NAME@@Error("the token endpoint answered without an access_token");
+    }
+    const expiresIn = Number(json.expires_in ?? Number.NaN);
+    return { accessToken: token, expiresIn: Number.isNaN(expiresIn) ? undefined : expiresIn };
+  });
 }
 
 /** @internal The variable `name` of the environment, in Node.js, Deno or Bun; none in browsers. */
@@ -135,6 +173,78 @@ function flattenParam(prefix: string, value: unknown, out: [string, string][]) {
   }
 }
 
+/** Percent-encodes everything but the unreserved characters, so that `,` `.` `;` `=` stay structural. */
+function encodeUnreserved(text: string): string {
+  return encodeURIComponent(text).replace(
+    /[!'()*]/g,
+    (char) => `%${char.charCodeAt(0).toString(16).toUpperCase()}`
+  );
+}
+
+function pathParamText(value: unknown): string {
+  if (value === undefined || value === null) {
+    return "";
+  }
+  if (value instanceof Date) {
+    return value.toISOString();
+  }
+  return isNested(value) ? stringifyJson(value) : String(value);
+}
+
+function flatPairs(pairs: [string, string][]): string {
+  return pairs.map(([field, item]) => `${field},${item}`).join(",");
+}
+
+/**
+ * A path parameter in its OpenAPI `style` (`simple`, `label`, `matrix`; `json` for `content`),
+ * each part percent-encoded.
+ */
+function encodePathParam(name: string, value: unknown, style: string, explode: boolean): string {
+  if (style === "json") {
+    return encodeUnreserved(stringifyJson(value) ?? "");
+  }
+  const encode = (item: unknown) => encodeUnreserved(pathParamText(item));
+  const separator = style === "label" ? "." : style === "matrix" ? ";" : ",";
+  const head = style === "label" ? "." : style === "matrix" ? ";" : "";
+  const key = encodeUnreserved(name);
+  if (Array.isArray(value)) {
+    const values = value.map(encode);
+    if (style === "matrix") {
+      return explode ? values.map((item) => `;${key}=${item}`).join("") : `;${key}=${values.join(",")}`;
+    }
+    return head + values.join(explode ? separator : ",");
+  }
+  if (isNested(value)) {
+    const pairs = Object.entries(value).map(([field, item]): [string, string] => [encodeUnreserved(field), encode(item)]);
+    if (style === "matrix") {
+      return explode
+        ? pairs.map(([field, item]) => `;${field}=${item}`).join("")
+        : `;${key}=${flatPairs(pairs)}`;
+    }
+    return head + (explode ? pairs.map(([field, item]) => `${field}=${item}`).join(separator) : flatPairs(pairs));
+  }
+  const text = encode(value);
+  if (style === "label") {
+    return `.${text}`;
+  }
+  if (style === "matrix") {
+    return text === "" ? `;${key}` : `;${key}=${text}`;
+  }
+  return text;
+}
+
+/** URLs resolve `.` and `..` segments, even percent-encoded, so a value of either cannot be sent. */
+function checkedPath(name: string, path: string): string {
+  const query = path.indexOf("?");
+  const dotSegment = (query === -1 ? path : path.slice(0, query))
+    .split("/")
+    .some((segment) => segment === "." || segment === "..");
+  if (dotSegment) {
+    throw new @@CLIENT_NAME@@Error(`path parameter ${name} cannot be "." or ".."`);
+  }
+  return path;
+}
+
 /** @internal */
 export class @@CLIENT_NAME@@Request {
   private body?: BodyInit;
@@ -143,6 +253,7 @@ export class @@CLIENT_NAME@@Request {
   private errors?: ErrorParsers;
   private readonly queryParams: [string, string][] = [];
   private readonly headers: Record<string, string> = {};
+  private readonly cookieParams: string[] = [];
 
   constructor(
     private readonly method: HttpMethod,
@@ -156,7 +267,16 @@ export class @@CLIENT_NAME@@Request {
     if (this.path === newPath) {
       throw new @@CLIENT_NAME@@Error(`path parameter ${name} not found`);
     }
-    this.path = newPath;
+    this.path = checkedPath(name, newPath);
+  }
+
+  /** Substitutes a path parameter serialized by its OpenAPI `style`. */
+  public setStyledPathParam(name: string, value: unknown, style: string, explode: boolean) {
+    const newPath = this.path.replace(`{${name}}`, encodePathParam(name, value, style, explode));
+    if (this.path === newPath) {
+      throw new @@CLIENT_NAME@@Error(`path parameter ${name} not found`);
+    }
+    this.path = checkedPath(name, newPath);
   }
 
   /** Array values are comma-joined (OpenAPI `style: form, explode: false`). */
@@ -183,6 +303,23 @@ export class @@CLIENT_NAME@@Request {
     encodeParam(name, value, deepObject, explode, this.queryParams);
   }
 
+  /** Sends the items of a list joined by `delimiter` (`pipeDelimited`, `spaceDelimited`). */
+  public setDelimitedQueryParam(name: string, value: unknown, delimiter: string) {
+    if (Array.isArray(value)) {
+      const texts = value.filter((item) => item != null).map((item) => encodeScalar(item as Scalar));
+      if (texts.length > 0) {
+        this.queryParams.push([name, texts.join(delimiter)]);
+      }
+    }
+  }
+
+  /** Sends a `content: application/json` parameter as compact JSON text. */
+  public setJsonQueryParam(name: string, value: unknown) {
+    if (value !== undefined) {
+      this.queryParams.push([name, stringifyJson(value)]);
+    }
+  }
+
   /** Overrides the API-wide security requirement for this operation. */
   public setSecurity(security: Security) {
     this.security = security;
@@ -199,6 +336,21 @@ export class @@CLIENT_NAME@@Request {
       this.headers[name.toLowerCase()] = Array.isArray(value)
         ? value.map(encodeScalar).join(",")
         : encodeScalar(value);
+    }
+  }
+
+  /** A `content: application/json` header, sent as compact JSON text. */
+  public setJsonHeaderParam(name: string, value: unknown) {
+    if (value !== undefined) {
+      this.headers[name.toLowerCase()] = stringifyJson(value);
+    }
+  }
+
+  /** Sets a cookie parameter; a list is comma-separated (OpenAPI `style: form, explode: false`). */
+  public setCookieParam(name: string, value: Scalar | Scalar[] | null | undefined) {
+    if (value !== undefined && value !== null) {
+      const text = Array.isArray(value) ? value.map(encodeScalar).join(",") : encodeScalar(value);
+      this.cookieParams.push(`${name}=${encodeURIComponent(text)}`);
     }
   }
 
@@ -234,8 +386,8 @@ export class @@CLIENT_NAME@@Request {
   }
 
   /**
-   * Sends the request and parses the JSON response body; an empty body (`204`) gives
-   * `undefined`.
+   * Sends the request and parses the JSON response body; a `204` gives `undefined`, any other
+   * empty body an `APIDecodeError`.
    *
    * A non-2xx response throws an `APIError`, of a subclass such as `NotFoundError` for common
    * statuses; no response an `APIConnectionError`, or `APIConnectionTimeoutError` once the
@@ -250,7 +402,7 @@ export class @@CLIENT_NAME@@Request {
   ): APIPromise<R> {
     return new APIPromise(this.sendInner(ctx, options), async (response) => {
       const text = await read(response, (r) => r.text(), options?.signal);
-      if (response.status === 204 || text === "") {
+      if (response.status === 204) {
         return undefined as R;
       }
       let json: unknown;
@@ -260,6 +412,30 @@ export class @@CLIENT_NAME@@Request {
         throw new APIDecodeError("The response body is not valid JSON.", text, { cause: error });
       }
       return parse(json);
+    });
+  }
+
+  /**
+   * Same as `send`, for a response that may come without a value: an empty body (`204`,
+   * `205`) or a JSON `null` both give `undefined`.
+   */
+  public sendOptional<R>(
+    ctx: @@CLIENT_NAME@@RequestContext,
+    parse: (json: any) => R,
+    options?: RequestOptions
+  ): APIPromise<R | undefined> {
+    return new APIPromise(this.sendInner(ctx, options), async (response) => {
+      const text = await read(response, (r) => r.text(), options?.signal);
+      if (response.status === 204 || response.status === 205 || text.trim() === "") {
+        return undefined;
+      }
+      let json: unknown;
+      try {
+        json = parseJson(text);
+      } catch (error) {
+        throw new APIDecodeError("The response body is not valid JSON.", text, { cause: error });
+      }
+      return json === null || json === undefined ? undefined : parse(json);
     });
   }
 
@@ -318,7 +494,7 @@ export class @@CLIENT_NAME@@Request {
     options: RequestOptions = {},
     stream = false
   ): Promise<Response> {
-    const url = new URL(ctx.baseUrl + this.path);
+    const url = new URL(/^[a-z][a-z0-9+.-]*:\/\//i.test(this.path) ? this.path : ctx.baseUrl + this.path);
     const baseName = (name: string) => name.split("[")[0] ?? name;
     const overrides = options.query ?? {};
     const overridden = (name: string) => Object.prototype.hasOwnProperty.call(overrides, name);
@@ -337,7 +513,7 @@ export class @@CLIENT_NAME@@Request {
     }
 
     const authHeaders: Record<string, string> = {};
-    await applyAuth(ctx.auth.schemes, this.security ?? ctx.auth.security, ctx, authHeaders, url);
+    let oauthUse = await applyAuth(ctx.auth.schemes, this.security ?? ctx.auth.security, ctx, authHeaders, url);
 
     const headers: Record<string, string> = {
       accept: "application/json, */*;q=0.8",
@@ -351,6 +527,12 @@ export class @@CLIENT_NAME@@Request {
       headers["idempotency-key"] = options.idempotencyKey;
     }
     mergeHeaders(headers, options.headers);
+    // Cookie parameters, the API key cookie and a `Cookie` header of the call share one header.
+    const cookies = [...this.cookieParams];
+    if (authHeaders.cookie) cookies.push(authHeaders.cookie);
+    if (headers.cookie && headers.cookie !== authHeaders.cookie) cookies.push(headers.cookie);
+    delete headers.cookie;
+    if (cookies.length > 0) headers.cookie = cookies.join("; ");
     if (this.method === "POST" && headers["idempotency-key"] === undefined) {
       headers["idempotency-key"] = `auto_${randomUUID()}`;
     }
@@ -371,6 +553,8 @@ export class @@CLIENT_NAME@@Request {
       }
     };
 
+    // An access token the API rejects is replaced once, without using up a retry.
+    let renewed = false;
     for (let attempt = 0; ; attempt++) {
       if (attempt > 0) {
         headers["@@HEADER_PREFIX@@-retry-count"] = attempt.toString();
@@ -414,6 +598,24 @@ export class @@CLIENT_NAME@@Request {
         log(`-> ${response.status}`);
         if (response.status < 300) {
           return response;
+        }
+        if (
+          response.status === 401 &&
+          oauthUse !== undefined &&
+          !renewed &&
+          !this.oneShot &&
+          headers.authorization === authHeaders.authorization
+        ) {
+          renewed = true;
+          ctx.oauth?.invalidate(oauthUse.name, oauthUse.token);
+          response.body?.cancel().catch(() => {});
+          const fresh: Record<string, string> = {};
+          oauthUse = await applyAuth(ctx.auth.schemes, this.security ?? ctx.auth.security, ctx, fresh, url);
+          if (fresh.authorization !== undefined) {
+            headers.authorization = authHeaders.authorization = fresh.authorization;
+          }
+          attempt--;
+          continue;
         }
         if (attempt >= maxRetries || !shouldRetry(response.status, retryable)) {
           throw await this.error(ctx, response, options.signal);

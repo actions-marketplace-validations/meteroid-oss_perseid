@@ -1472,17 +1472,12 @@ fn real_world_constructs_generate_every_language() {
     let dir = project_from("realworld.yaml", &langs);
     let (ok, out) = perseid(dir.path(), &["generate", "--no-format"]);
     assert!(ok, "{out}");
-    for warning in [
-        "schema `Timezone`: `Etc/GMT-0` and `Etc/GMT0` both become the identifier `EtcGmt0`, so \
-         the enum is typed as a string",
-        "schema `PaymentMethodData`: inline schema in oneOf must have discriminator enum value, \
-         so the schema is typed as an untyped JSON value",
-    ] {
-        assert!(out.contains(warning), "missing `{warning}` in:\n{out}");
-    }
+    let warning = "schema `PaymentMethodData`: inline schema in oneOf must have discriminator enum value, \
+                   so the schema is typed as an untyped JSON value";
+    assert!(out.contains(warning), "missing `{warning}` in:\n{out}");
     let charge = fs::read_to_string(dir.path().join("go/charge.go")).unwrap();
     assert!(
-        charge.contains("u.Customer != nil && u.Customer.ID != nil"),
+        charge.contains("u.OfCustomer != nil && u.OfCustomer.ID != nil"),
         "a read-only id is optional in requests, so a pointer: {charge}"
     );
 
@@ -1549,10 +1544,10 @@ fn unions_of_objects_follow_untagged_unions_and_x_perseid_union() {
     };
     let out = generate();
     assert!(
-        out.contains("decoded as their best-matching variant: 1"),
+        out.contains("decoded as their best-matching variant: 3"),
         "{out}"
     );
-    assert!(out.contains("left as untyped JSON: 1"), "{out}");
+    assert!(!out.contains("left as untyped JSON"), "{out}");
     let unions = read("object_unions");
     for text in [
         "pubenumObjectUnionsAccount",
@@ -1562,23 +1557,23 @@ fn unions_of_objects_follow_untagged_unions_and_x_perseid_union() {
     ] {
         assert!(unions.contains(text), "no `{text}` in {unions}");
     }
-    assert!(read("document").contains("pubtypeDocument=serde_json::Value;"));
+    assert!(read("document").contains("ranked(&value,"));
 
     edit_config(dir.path(), |text| {
-        format!("untagged_unions = \"best-match\"\n{text}")
+        format!("untagged_unions = \"json\"\n{text}")
     });
     let out = generate();
     assert!(
-        out.contains("decoded as their best-matching variant: 2"),
+        out.contains("decoded as their best-matching variant: 1"),
         "{out}"
     );
-    assert!(!out.contains("left as untyped JSON"), "{out}");
-    assert!(read("document").contains("best_match(&value,"));
+    assert!(out.contains("left as untyped JSON: 2"), "{out}");
+    assert!(read("document").contains("pubtypeDocument=serde_json::Value;"));
 
     edit_config(dir.path(), |text| {
-        text.replace("[rust]\n", "[rust]\nuntagged_unions = \"json\"\n")
+        text.replace("[rust]\n", "[rust]\nuntagged_unions = \"best-match\"\n")
     });
-    assert!(generate().contains("left as untyped JSON: 1"));
+    assert!(generate().contains("decoded as their best-matching variant: 3"));
 
     edit_config(dir.path(), |text| text.replace("\"json\"", "\"guess\""));
     let (ok, out) = perseid(dir.path(), &["generate", "--no-format"]);
@@ -1592,9 +1587,14 @@ fn torture_fixture_generates_every_language() {
     let (ok, out) = perseid(dir.path(), &["generate", "--no-format"]);
     assert!(ok, "{out}");
     assert_eq!(
-        out.matches("schema `MapOrAddress`: `oneOf`").count(),
+        out.matches("decoded as their best-matching variant")
+            .count(),
         1,
         "warnings are printed once for all languages: {out}"
+    );
+    assert!(
+        !out.contains("MapOrAddress"),
+        "a map or an object is a typed union: {out}"
     );
 
     let (ok, model) = perseid(dir.path(), &["inspect"]);
@@ -1732,7 +1732,7 @@ paths:
     get:
       operationId: search
       parameters:
-        - { name: ids, in: query, style: pipeDelimited, schema: { type: array, items: { type: string } } }
+        - { name: ids, in: query, style: pipeDelimited, explode: false, schema: { type: array, items: { type: string } } }
         - { name: session, in: cookie, schema: { type: string } }
       responses: { "204": { description: ok } }
   /render/{spec}:
@@ -1758,13 +1758,8 @@ components:
     let (ok, out) = perseid(dir.path(), &["generate", "--no-format"]);
     assert!(!ok);
     assert!(!out.contains("panicked"), "{out}");
-    for line in [
-        "operation `search` (GET /search): query parameter `ids`: style \"pipeDelimited\" is not supported",
-        "operation `post_render_by_spec` (POST /render/{spec}): path parameter `spec`: only scalar values are supported, not type `object`",
-        "schema `Clash`: `@type` and `type` both become the identifier `type`",
-    ] {
-        assert!(out.contains(line), "missing `{line}` in:\n{out}");
-    }
+    let line = "schema `Clash`: `@type` and `type` both become the identifier `type`";
+    assert!(out.contains(line), "missing `{line}` in:\n{out}");
 }
 
 #[test]
@@ -2185,7 +2180,7 @@ fn typescript_types_unions_errors_and_the_default_timeout() {
     let index = read("index.ts");
     for text in [
         "const DEFAULT_TIMEOUT_MS = 15000;",
-        "parseError: ErrorSerializer.parse,",
+        "parseError: ErrorModelSerializer.parse,",
         "export type RealWorldErrorBody =",
         "NotFoundError,",
         "static readonly NotFoundError = NotFoundError;",
@@ -2384,19 +2379,35 @@ fn api_md_lists_every_operation_and_readmes_call_real_ones() {
             "csharp",
             "client.Pets.RetrieveAsync(\"pet_id\")",
         ),
-        ("features.yaml", "rust", "client.gadgets().list_iter(None)"),
-        ("features.yaml", "typescript", "client.gadgets.list()"),
-        ("features.yaml", "python", "client.gadgets.list()"),
+        (
+            "features.yaml",
+            "rust",
+            "client.errors().list_scenarios_pages_iter(None)",
+        ),
+        (
+            "features.yaml",
+            "typescript",
+            "client.errors.listScenariosPages()",
+        ),
+        (
+            "features.yaml",
+            "python",
+            "client.errors.list_scenarios_pages()",
+        ),
         (
             "features.yaml",
             "go",
-            "client.Gadgets().ListAutoPaging(ctx, nil)",
+            "client.ErrorsAPI().ListScenariosPagesAutoPaging(ctx, nil)",
         ),
-        ("features.yaml", "java", "client.gadgets().listIter()"),
+        (
+            "features.yaml",
+            "java",
+            "client.errors().listScenariosPagesIter()",
+        ),
         (
             "features.yaml",
             "csharp",
-            "client.Gadgets.ListAutoPagingAsync()",
+            "client.Errors.ListScenariosPagesAutoPagingAsync()",
         ),
         (
             "features.yaml",
@@ -2515,4 +2526,997 @@ fn csharp_types_unions_errors_and_timeout() {
             .contains("public static Models.Error? GetError(this ApiException exception)")
     );
     assert!(read("RealWorldClientOptions.cs").contains("TimeSpan.FromSeconds(15)"));
+}
+
+#[test]
+fn schema_names_that_collide_or_start_with_a_digit_are_renamed() {
+    let dir = project_from("petstore.yaml", &["rust", "go", "python", "java", "csharp"]);
+    let schema =
+        |name: &str| format!("    {name}: {{type: object, properties: {{v: {{type: string}}}}}}\n");
+    let names = [
+        "3DModel",
+        "Self",
+        "Codec",
+        "UnionRules",
+        "Serialize",
+        "ApiError",
+        "Ptr",
+        "ErrorStatus",
+        "None",
+        "IntEnum",
+        "BaseModel",
+        "JsonProperty",
+        "Short",
+        "Deprecated",
+        "IStringEnum",
+    ];
+    let fields: String = names
+        .iter()
+        .enumerate()
+        .map(|(i, n)| format!("        f{i}: {{$ref: '#/components/schemas/{n}'}}\n"))
+        .collect();
+    let spec = format!(
+        "openapi: 3.1.0\ninfo: {{title: Names, version: 1.0.0}}\nservers: [{{url: https://x.example.com}}]\n\
+         paths:\n  /echo:\n    post:\n      operationId: echo\n      tags: [echo]\n      requestBody:\n        required: true\n        \
+         content: {{application/json: {{schema: {{$ref: '#/components/schemas/Holder'}}}}}}\n      responses:\n        '200': {{description: ok}}\n\
+         components:\n  schemas:\n{}    Holder:\n      type: object\n      properties:\n{fields}",
+        names.iter().map(|n| schema(n)).collect::<String>()
+    );
+    fs::write(dir.path().join("openapi.yaml"), spec).unwrap();
+    for language in ["rust", "go", "python", "java", "csharp"] {
+        let (ok, out) = perseid(dir.path(), &["inspect", language]);
+        assert!(ok, "{language}: {out}");
+        let api: Value = serde_json::from_str(&out).unwrap();
+        let types = api["types"].as_object().unwrap();
+        assert!(types.contains_key("N3dModel"), "{language}: {out}");
+        assert!(!types.contains_key("3DModel"), "{language}: {out}");
+        if language == "python" {
+            assert!(types.contains_key("NoneModel") && types.contains_key("IntEnumModel"));
+        }
+        if language == "go" {
+            assert!(types.contains_key("ErrorStatusModel") && types.contains_key("PtrModel"));
+        }
+        if language == "rust" {
+            assert!(types.contains_key("SelfModel") && types.contains_key("CodecModel"));
+        }
+        if language == "java" {
+            assert!(types.contains_key("ShortModel") && types.contains_key("DeprecatedModel"));
+        }
+    }
+}
+
+/// Every generated file of `language` under `dir`, concatenated.
+fn generated_text(dir: &Path, language: &str) -> String {
+    fn walk(path: &Path, out: &mut String) {
+        for entry in fs::read_dir(path).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                walk(&path, out);
+            } else if let Ok(text) = fs::read_to_string(&path) {
+                out.push_str(&text);
+            }
+        }
+    }
+    let mut out = String::new();
+    walk(&dir.join(language), &mut out);
+    out
+}
+
+#[test]
+fn nullable_items_values_and_optional_responses_are_typed_in_every_language() {
+    let languages = ["rust", "typescript", "python", "go", "java", "csharp"];
+    let dir = project_from("petstore.yaml", &languages);
+    let spec = "openapi: 3.1.0\ninfo: {title: Nullables, version: 1.0.0}\n\
+        servers: [{url: https://x.example.com}]\n\
+        paths:\n\
+        \x20 /echo:\n    post:\n      operationId: echo\n      tags: [echo]\n      requestBody:\n        required: true\n        \
+        content: {application/json: {schema: {$ref: '#/components/schemas/Holder'}}}\n      responses:\n        \
+        '200': {description: ok, content: {application/json: {schema: {$ref: '#/components/schemas/Holder'}}}}\n\
+        \x20 /maybe:\n    get:\n      operationId: get_maybe\n      tags: [echo]\n      responses:\n        \
+        '200': {description: ok, content: {application/json: {schema: {oneOf: [{$ref: '#/components/schemas/Holder'}, {type: 'null'}]}}}}\n\
+        \x20 /gone:\n    get:\n      operationId: get_gone\n      tags: [echo]\n      responses:\n        \
+        '200': {description: ok, content: {application/json: {schema: {$ref: '#/components/schemas/Holder'}}}}\n        \
+        '204': {description: gone}\n\
+        components:\n  schemas:\n    Holder:\n      type: object\n      properties:\n        \
+        tags: {type: array, items: {type: [string, 'null']}}\n        \
+        labels: {type: object, additionalProperties: {type: [string, 'null']}}\n";
+    fs::write(dir.path().join("openapi.yaml"), spec).unwrap();
+    let (ok, out) = perseid(dir.path(), &["generate", "--no-format"]);
+    assert!(ok, "{out}");
+    let expected: [(&str, &[&str]); 6] = [
+        (
+            "rust",
+            &[
+                "Vec<Option<String>>",
+                "HashMap<String, Option<String>>",
+                "Option<crate::models::Holder>",
+                "json_or_none(",
+            ],
+        ),
+        (
+            "typescript",
+            &["(string | null)[]", "sendOptional(", "| undefined>"],
+        ),
+        (
+            "python",
+            &[
+                "list[str | None]",
+                "dict[str, str | None]",
+                "Holder | None",
+                "(204, 205)",
+            ],
+        ),
+        (
+            "go",
+            &["[]*string", "map[string]*string", "(*Holder, error)"],
+        ),
+        ("java", &["Optional<Holder>"]),
+        (
+            "csharp",
+            &[
+                "List<string?>",
+                "Dictionary<string, string?>",
+                "Task<Holder?>",
+                "SendJsonOrDefaultAsync<Holder, Holder?>",
+            ],
+        ),
+    ];
+    for (language, needles) in expected {
+        let text = generated_text(dir.path(), language);
+        for needle in needles {
+            assert!(text.contains(needle), "{language}: missing `{needle}`");
+        }
+    }
+}
+
+#[test]
+fn cookie_parameters_are_sent_in_the_cookie_header_in_every_language() {
+    let languages = ["rust", "typescript", "python", "go", "java", "csharp"];
+    let dir = project_from("petstore.yaml", &languages);
+    let spec = "openapi: 3.1.0\ninfo: {title: Cookies, version: 1.0.0}\n\
+        servers: [{url: https://x.example.com}]\n\
+        paths:\n\
+        \x20 /x:\n    get:\n      operationId: get_x\n      tags: [x]\n      parameters:\n        \
+        - {name: sid, in: cookie, required: true, schema: {type: string}}\n        \
+        - {name: sid, in: query, schema: {type: string}}\n      responses:\n        '204': {description: ok}\n\
+        components:\n  securitySchemes:\n    session: {type: apiKey, in: cookie, name: auth}\n\
+        security: [{session: []}]\n";
+    fs::write(dir.path().join("openapi.yaml"), spec).unwrap();
+    let (ok, out) = perseid(dir.path(), &["generate", "--no-format"]);
+    assert!(ok, "{out}");
+    let expected: [(&str, &str); 6] = [
+        ("rust", "with_cookie_param(\"sid\""),
+        ("typescript", "setCookieParam(\"sid\""),
+        ("python", "cookie_params="),
+        ("go", "SetCookie(\"sid\""),
+        ("java", "Utils.cookiePair(\"sid\""),
+        ("csharp", "SetCookie(\"sid\""),
+    ];
+    for (language, needle) in expected {
+        let text = generated_text(dir.path(), language);
+        assert!(text.contains(needle), "{language}: missing `{needle}`");
+    }
+}
+
+#[test]
+fn any_json_body_and_multipart_file_lists_are_generated_in_every_language() {
+    let languages = ["rust", "typescript", "python", "go", "java", "csharp"];
+    let dir = project_from("petstore.yaml", &languages);
+    let spec = "openapi: 3.1.0\ninfo: {title: Shapes, version: 1.0.0}\n\
+        servers: [{url: https://x.example.com}]\n\
+        paths:\n\
+        \x20 /any:\n    get:\n      operationId: get_any\n      tags: [x]\n      responses:\n        \
+        '200': {description: ok, content: {application/json: {}}}\n\
+        \x20 /map:\n    get:\n      operationId: get_map\n      tags: [x]\n      responses:\n        \
+        '200': {description: ok, content: {application/json: {schema: {type: object, additionalProperties: {$ref: '#/components/schemas/V'}}}}}\n\
+        \x20 /text:\n    get:\n      operationId: get_text\n      tags: [x]\n      responses:\n        \
+        '200': {description: ok, content: {text/plain: {schema: {type: string}}}}\n\
+        \x20 /upload:\n    post:\n      operationId: upload\n      tags: [x]\n      requestBody:\n        \
+        content:\n          multipart/form-data:\n            schema:\n              type: object\n              \
+        properties:\n                files: {type: array, items: {type: string, format: binary}}\n            \
+        encoding:\n              files: {contentType: image/png}\n      responses:\n        '204': {description: ok}\n\
+        components:\n  schemas:\n    V: {type: object, properties: {v: {type: string}}}\n";
+    fs::write(dir.path().join("openapi.yaml"), spec).unwrap();
+    let (ok, out) = perseid(dir.path(), &["generate", "--no-format"]);
+    assert!(ok, "{out}");
+    assert!(!out.contains("skipping the operation"), "{out}");
+    let expected: [(&str, &[&str]); 6] = [
+        (
+            "rust",
+            &["HashMap<String, V>", "Vec<crate::api::Upload>", "file_as("],
+        ),
+        (
+            "typescript",
+            &["{ [key: string]: V }", "Upload[]", "\"image/png\""],
+        ),
+        (
+            "python",
+            &["dict[str, V]", "list[FileInput]", "\"image/png\""],
+        ),
+        (
+            "go",
+            &["map[string]V", "[]Upload", "contentType: \"image/png\""],
+        ),
+        (
+            "java",
+            &[
+                "Map<String,V>",
+                "List<Upload>",
+                "\"image/png\"",
+                "returningText()",
+            ],
+        ),
+        (
+            "csharp",
+            &["Dictionary<string, V>", "List<Upload>", "\"image/png\""],
+        ),
+    ];
+    for (language, needles) in expected {
+        let text = generated_text(dir.path(), language);
+        for needle in needles {
+            assert!(text.contains(needle), "{language}: missing `{needle}`");
+        }
+    }
+}
+
+#[test]
+fn parameter_styles_and_content_are_generated_in_every_language() {
+    let languages = ["rust", "typescript", "python", "go", "java", "csharp"];
+    let dir = project_from("petstore.yaml", &languages);
+    let spec = r##"
+openapi: 3.1.0
+info: { title: Styles, version: "1.0.0" }
+servers: [{ url: "https://x.example.com" }]
+paths:
+  /search:
+    get:
+      operationId: search
+      tags: [x]
+      parameters:
+        - { name: ids, in: query, style: pipeDelimited, explode: false, schema: { type: array, items: { type: string } } }
+        - { name: words, in: query, style: spaceDelimited, explode: false, schema: { type: array, items: { type: string } } }
+        - name: filter
+          in: query
+          content: { application/json: { schema: { type: object, properties: { a: { type: string } } } } }
+        - name: X-Filter
+          in: header
+          content: { application/json: { schema: { type: object, properties: { b: { type: string } } } } }
+      responses: { "204": { description: ok } }
+  /items/{tags}/{color}/{point}:
+    get:
+      operationId: get_item
+      tags: [x]
+      parameters:
+        - { name: tags, in: path, required: true, style: label, explode: true, schema: { type: array, items: { type: string } } }
+        - { name: color, in: path, required: true, style: matrix, schema: { type: string } }
+        - { name: point, in: path, required: true, schema: { type: object, properties: { x: { type: integer } } } }
+      responses: { "204": { description: ok } }
+  /blobs/{spec}:
+    get:
+      operationId: get_blob
+      tags: [x]
+      parameters:
+        - name: spec
+          in: path
+          required: true
+          content: { application/json: { schema: { type: object, properties: { a: { type: string } } } } }
+      responses: { "204": { description: ok } }
+"##;
+    fs::write(dir.path().join("openapi.yaml"), spec).unwrap();
+    let (ok, out) = perseid(dir.path(), &["generate", "--no-format"]);
+    assert!(ok, "{out}");
+    assert!(!out.contains("skipping the operation"), "{out}");
+    let expected: [(&str, &[&str]); 6] = [
+        (
+            "rust",
+            &[
+                "with_delimited_query_param(\"ids\"",
+                "with_json_query_param(\"filter\"",
+                "with_json_header_param(\"X-Filter\"",
+                "with_styled_path_param(\"spec\"",
+                "\"matrix\"",
+            ],
+        ),
+        (
+            "typescript",
+            &[
+                "setDelimitedQueryParam(\"ids\"",
+                "setJsonQueryParam(\"filter\"",
+                "setJsonHeaderParam(\"X-Filter\"",
+                "setStyledPathParam(\"tags\"",
+            ],
+        ),
+        (
+            "python",
+            &[
+                "delimited={\"ids\": \"|\"",
+                "json_params=(\"filter\"",
+                "json_header(",
+                "encode_path_param(\"spec\"",
+            ],
+        ),
+        (
+            "go",
+            &[
+                "AddDelimitedQueryParam(\"ids\"",
+                "AddJSONQueryParam(\"filter\"",
+                "SetJSONHeader(\"X-Filter\"",
+                "SetStyledPathParam(\"tags\"",
+            ],
+        ),
+        (
+            "java",
+            &[
+                "addDelimitedQueryParameter(url, \"ids\"",
+                "addJsonQueryParameter(url, \"filter\"",
+                "Utils.encodePathParam(\"spec\"",
+                "addEncodedPathSegment",
+            ],
+        ),
+        (
+            "csharp",
+            &[
+                "AddDelimitedQuery(\"ids\"",
+                "AddJsonQuery(\"filter\"",
+                "SetJsonHeader(\"X-Filter\"",
+                "ApiRequest.EncodePathParam(\"color\"",
+            ],
+        ),
+    ];
+    for (language, needles) in expected {
+        let text = generated_text(dir.path(), language);
+        for needle in needles {
+            assert!(text.contains(needle), "{language}: missing `{needle}`");
+        }
+    }
+}
+
+#[test]
+fn unsupported_operations_are_skipped_with_a_warning() {
+    let dir = project_from("petstore.yaml", &["rust"]);
+    let spec = r##"
+openapi: 3.1.0
+info: { title: Skips, version: "1.0.0" }
+servers: [{ url: "https://x.example.com" }]
+paths:
+  /ok:
+    get:
+      operationId: get_ok
+      tags: [x]
+      responses: { "204": { description: ok } }
+  /bad:
+    get:
+      operationId: get_bad
+      tags: [x]
+      parameters:
+        - name: q
+          in: query
+          content: { text/csv: { schema: { type: string } } }
+      responses: { "204": { description: ok } }
+"##;
+    fs::write(dir.path().join("openapi.yaml"), spec).unwrap();
+    let (ok, out) = perseid(dir.path(), &["generate", "--no-format"]);
+    assert!(ok, "{out}");
+    assert!(out.contains("skipping the operation"), "{out}");
+    assert!(out.contains("get_bad"), "{out}");
+    let text = generated_text(dir.path(), "rust");
+    assert!(text.contains("\"/ok\"") && !text.contains("/bad"), "{text}");
+}
+
+#[test]
+fn models_with_extra_properties_keep_them_in_every_language() {
+    let dir = project_from(
+        "petstore.yaml",
+        &["rust", "typescript", "python", "go", "java", "csharp"],
+    );
+    let spec = r##"
+openapi: 3.1.0
+info: { title: Extras, version: "1.0.0" }
+servers: [{ url: "https://x.example.com" }]
+paths:
+  /things:
+    get:
+      operationId: get_thing
+      tags: [x]
+      responses:
+        "200":
+          description: ok
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Thing" }
+components:
+  schemas:
+    Thing:
+      type: object
+      properties:
+        name: { type: string }
+      additionalProperties: { type: integer }
+"##;
+    fs::write(dir.path().join("openapi.yaml"), spec).unwrap();
+    let (ok, out) = perseid(dir.path(), &["generate", "--no-format"]);
+    assert!(ok, "{out}");
+    assert!(!out.contains("dropped when decoding"), "{out}");
+    let expected: &[(&str, &[&str])] = &[
+        (
+            "rust",
+            &[
+                "#[serde(flatten)]",
+                ": std::collections::HashMap<String, i64>,",
+            ],
+        ),
+        ("typescript", &["...extraProperties(json, [\"name\"])"]),
+        ("python", &["_EXTRA_FIELDS: t.ClassVar[dict[str, int]]"]),
+        ("go", &["ExtraFields map[string]int64", "typedExtraFields("]),
+        (
+            "java",
+            &[
+                "@JsonAnyGetter",
+                "@JsonAnySetter",
+                "Map<String, Long> typedAdditionalProperties()",
+            ],
+        ),
+        (
+            "csharp",
+            &[
+                "[JsonExtensionData]",
+                "Dictionary<string, JsonElement>? AdditionalProperties",
+            ],
+        ),
+    ];
+    for (language, needles) in expected {
+        let text = generated_text(dir.path(), language);
+        for needle in *needles {
+            assert!(text.contains(needle), "{language}: missing `{needle}`");
+        }
+    }
+}
+
+#[test]
+fn unsupported_constructs_warn_with_names_and_stay_typed_where_possible() {
+    let dir = project_from(
+        "petstore.yaml",
+        &["rust", "typescript", "python", "go", "java", "csharp"],
+    );
+    let spec = r##"
+openapi: 3.1.0
+info: { title: Polish, version: "1.0.0" }
+servers: [{ url: "https://x.example.com" }]
+components:
+  securitySchemes:
+    digest: { type: http, scheme: digest }
+    key: { type: apiKey, in: header, name: X-Key }
+  schemas:
+    Symbols:
+      type: string
+      enum: ["-", "*", "a-b", "a_b", "Active", "active"]
+    Negated: { not: { type: string } }
+    Pair:
+      type: array
+      prefixItems: [{ type: string }, { type: integer }]
+paths:
+  /things:
+    get:
+      operationId: get_thing
+      tags: [x]
+      security: [{ digest: [] }]
+      servers: [{ url: "https://other.example.com" }]
+      responses:
+        "200":
+          description: ok
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  symbols: { $ref: "#/components/schemas/Symbols" }
+                  negated: { $ref: "#/components/schemas/Negated" }
+                  pair: { $ref: "#/components/schemas/Pair" }
+"##;
+    fs::write(dir.path().join("openapi.yaml"), spec).unwrap();
+    let (ok, out) = perseid(dir.path(), &["generate", "--no-format"]);
+    assert!(ok, "{out}");
+    for warning in [
+        "unsupported http auth scheme `digest`",
+        "operation `get_thing`",
+        "declares its own `servers`",
+        "is only a `not`",
+        "tuple array in schema `Pair`",
+    ] {
+        assert!(out.contains(warning), "missing `{warning}` in:\n{out}");
+    }
+    assert!(!out.contains("typed as a string"), "{out}");
+    let rust = generated_text(dir.path(), "rust");
+    for needle in ["Minus", "Star", "\"a_b\" => Self::AB2"] {
+        assert!(rust.contains(needle), "missing `{needle}`");
+    }
+}
+
+fn run_samples(dir: &Path, extra: &[&str]) -> serde_json::Value {
+    let mut args = vec!["samples", "--out", "samples.json"];
+    args.extend_from_slice(extra);
+    let (ok, out) = perseid(dir, &args);
+    assert!(ok, "{out}");
+    serde_json::from_str(&fs::read_to_string(dir.join("samples.json")).unwrap()).unwrap()
+}
+
+fn sample<'a>(model: &'a serde_json::Value, name: &str) -> Option<&'a serde_json::Value> {
+    model["samples"]
+        .as_array()?
+        .iter()
+        .find(|s| s["name"] == name)
+        .map(|s| &s["json"])
+}
+
+fn contains_null(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Null => true,
+        serde_json::Value::Array(items) => items.iter().any(contains_null),
+        serde_json::Value::Object(map) => map.values().any(contains_null),
+        _ => false,
+    }
+}
+
+#[test]
+fn samples_cover_every_model_of_the_torture_fixture() {
+    let dir = project_from("torture.yaml", &["rust", "typescript", "go"]);
+    let samples = run_samples(dir.path(), &[]);
+    let (ok, model) = perseid(dir.path(), &["inspect"]);
+    assert!(ok, "{model}");
+    let model: serde_json::Value = serde_json::from_str(&model).unwrap();
+    let types = model["types"].as_object().unwrap();
+    assert!(!types.is_empty());
+    for name in types.keys() {
+        let entry = &samples[name];
+        assert!(entry.is_object(), "no samples of `{name}`");
+        assert!(
+            ["struct", "enum", "union", "alias"].contains(&entry["kind"].as_str().unwrap()),
+            "{name}: {entry}"
+        );
+        assert!(entry["type_name"].is_string(), "{name}");
+        for language in ["rust", "typescript", "go"] {
+            assert!(entry["names"][language].is_string(), "{name} in {language}");
+        }
+        assert!(sample(entry, "full").is_some(), "{name} has no full sample");
+        assert!(
+            sample(entry, "minimal").is_some(),
+            "{name} has no minimal sample"
+        );
+    }
+    assert_eq!(samples.as_object().unwrap().len(), types.len());
+}
+
+#[test]
+fn samples_tag_every_variant_of_a_union_with_its_discriminator() {
+    let dir = project_from("torture.yaml", &["rust"]);
+    let samples = run_samples(dir.path(), &[]);
+    for (name, tag) in [("Shape", "type"), ("Pet", "pet_type")] {
+        let union = &samples[name];
+        assert_eq!(union["kind"], "union", "{name}");
+        let variants: Vec<&serde_json::Value> = union["samples"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|s| s["name"].as_str().unwrap().starts_with("variant_"))
+            .collect();
+        assert_eq!(variants.len(), 2, "{name}: {union}");
+        for variant in variants {
+            let expected = variant["name"]
+                .as_str()
+                .unwrap()
+                .trim_start_matches("variant_");
+            assert_eq!(variant["json"][tag], expected, "{name}: {variant}");
+        }
+    }
+    let shape = &samples["Shape"];
+    assert_eq!(sample(shape, "variant_circle").unwrap()["type"], "circle");
+    assert_eq!(sample(shape, "variant_square").unwrap()["type"], "square");
+}
+
+#[test]
+fn samples_set_nullable_values_to_null_and_leave_optional_ones_out_of_minimal() {
+    let dir = project_from("torture.yaml", &["rust"]);
+    let samples = run_samples(dir.path(), &[]);
+    let mut with_nulls = 0;
+    for (name, entry) in samples.as_object().unwrap() {
+        if let Some(nulls) = sample(entry, "nulls") {
+            with_nulls += 1;
+            assert!(contains_null(nulls), "{name}: {nulls}");
+        }
+        for s in entry["samples"].as_array().unwrap() {
+            let sample_name = s["name"].as_str().unwrap();
+            if sample_name == "full" || sample_name == "minimal" {
+                continue;
+            }
+            assert!(
+                sample_name.starts_with("variant_")
+                    || sample_name.starts_with("value_")
+                    || sample_name.starts_with("full_pick_")
+                    || sample_name.starts_with("nulls"),
+                "{name}: unexpected sample `{sample_name}`"
+            );
+        }
+    }
+    assert!(with_nulls > 0, "no model has a nulls sample");
+    // Every sample is valid JSON of the model: objects carry their required properties, so
+    // `minimal` is never larger than `full`.
+    for (name, entry) in samples.as_object().unwrap() {
+        let (full, minimal) = (
+            sample(entry, "full").unwrap(),
+            sample(entry, "minimal").unwrap(),
+        );
+        if let (Some(full), Some(minimal)) = (full.as_object(), minimal.as_object()) {
+            assert!(
+                minimal.len() <= full.len(),
+                "{name}: {minimal:?} vs {full:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn samples_are_deterministic_and_need_no_project_file() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::copy(
+        "tests/fixtures/torture.yaml",
+        dir.path().join("openapi.yaml"),
+    )
+    .unwrap();
+    let first = run_samples(dir.path(), &["--spec", "openapi.yaml"]);
+    let text = fs::read_to_string(dir.path().join("samples.json")).unwrap();
+    let second = run_samples(dir.path(), &["--spec", "openapi.yaml"]);
+    assert_eq!(first, second);
+    assert_eq!(
+        text,
+        fs::read_to_string(dir.path().join("samples.json")).unwrap()
+    );
+    for language in ["rust", "typescript", "python", "go", "java", "csharp"] {
+        assert!(first["Shape"]["names"][language].is_string(), "{language}");
+    }
+    let (ok, out) = perseid(dir.path(), &["samples", "--out", "x.json"]);
+    assert!(!ok, "without a spec or a project file: {out}");
+}
+
+#[test]
+fn samples_command_is_hidden_from_help() {
+    let dir = tempfile::tempdir().unwrap();
+    let (ok, out) = perseid(dir.path(), &["--help"]);
+    assert!(ok, "{out}");
+    assert!(
+        !out.lines().any(|l| l.trim_start().starts_with("samples")),
+        "{out}"
+    );
+}
+
+#[test]
+fn adjacent_unions_repeating_the_discriminator_generate_and_stay_typed_in_go() {
+    let dir = project_from("petstore.yaml", &["python", "go"]);
+    let spec = r##"
+openapi: 3.1.0
+info: { title: Adjacent, version: "1.0.0" }
+servers: [{ url: "https://x.example.com" }]
+paths:
+  /events:
+    get:
+      operationId: get_event
+      tags: [x]
+      responses:
+        "200":
+          description: ok
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Event" }
+components:
+  schemas:
+    Event:
+      type: object
+      required: [kind]
+      properties:
+        kind: { type: string }
+        at: { type: string }
+      oneOf:
+        - type: object
+          required: [kind, data]
+          properties:
+            kind: { type: string, enum: [created] }
+            data: { type: object, properties: { id: { type: string } } }
+        - type: object
+          required: [kind]
+          properties:
+            kind: { type: string, enum: [ping] }
+"##;
+    fs::write(dir.path().join("openapi.yaml"), spec).unwrap();
+    let (ok, out) = perseid(dir.path(), &["generate", "--no-format"]);
+    assert!(ok, "{out}");
+    assert!(!out.contains("untyped JSON"), "{out}");
+    assert!(generated_text(dir.path(), "python").contains("class Event"));
+    assert!(generated_text(dir.path(), "go").contains("func NewEventPing() Event"));
+}
+
+#[test]
+fn operation_ids_colliding_once_snake_cased_are_resolved_by_x_perseid_name() {
+    let dir = project_from("petstore.yaml", &["rust"]);
+    let spec = r##"
+openapi: 3.1.0
+info: { title: Collide, version: "1.0.0" }
+servers: [{ url: "https://x.example.com" }]
+paths:
+  /a/{id}:
+    get:
+      operationId: getThing
+      tags: [things]
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      responses: { "204": { description: ok } }
+  /b/{id}:
+    get:
+      operationId: get_thing
+      x-perseid-name: get_other_thing
+      tags: [things]
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      responses: { "204": { description: ok } }
+"##;
+    fs::write(dir.path().join("openapi.yaml"), spec).unwrap();
+    let (ok, out) = perseid(dir.path(), &["generate", "--no-format"]);
+    assert!(ok, "{out}");
+    let rust = generated_text(dir.path(), "rust");
+    assert!(
+        rust.contains("fn retrieve(") && rust.contains("fn get_other_thing("),
+        "{rust}"
+    );
+}
+
+#[test]
+fn unions_sharing_json_types_and_union_bodies_stay_typed() {
+    let dir = project_from("petstore.yaml", &["python"]);
+    let spec = r##"
+openapi: 3.1.0
+info: { title: Unions, version: "1.0.0" }
+servers: [{ url: "https://x.example.com" }]
+paths:
+  /completions:
+    post:
+      operationId: createCompletion
+      tags: [completions]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CompletionRequest" }
+      responses: { "204": { description: ok } }
+  /transcriptions:
+    post:
+      operationId: createTranscription
+      tags: [transcriptions]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - { $ref: "#/components/schemas/Plain" }
+                - { type: string }
+      responses:
+        "200":
+          description: ok
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - { $ref: "#/components/schemas/Plain" }
+                  - { $ref: "#/components/schemas/Verbose" }
+components:
+  schemas:
+    CompletionRequest:
+      type: object
+      required: [prompt]
+      properties:
+        prompt:
+          anyOf:
+            - { type: string }
+            - { type: array, items: { type: string } }
+            - { type: array, items: { type: integer } }
+            - { type: array, items: { type: array, items: { type: integer } } }
+    Plain:
+      type: object
+      required: [text]
+      properties: { text: { type: string } }
+    Verbose:
+      type: object
+      required: [text, segments]
+      properties:
+        text: { type: string }
+        segments: { type: array, items: { type: string } }
+"##;
+    fs::write(dir.path().join("openapi.yaml"), spec).unwrap();
+    let (ok, model) = perseid(dir.path(), &["inspect"]);
+    assert!(ok, "{model}");
+    let model: serde_json::Value = serde_json::from_str(&model).unwrap();
+    let fields = model["types"]["CompletionRequest"]["fields"]
+        .as_array()
+        .unwrap();
+    let prompt = &fields[0]["type"];
+    assert_eq!(prompt["id"], "Union");
+    assert_eq!(prompt["decode"], "try");
+    let names: Vec<_> = prompt["variants"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        names,
+        [
+            "string",
+            "array_of_strings",
+            "array_of_integers",
+            "array_of_integer_arrays"
+        ]
+    );
+    assert_eq!(prompt["variants"][2]["items"]["json_type"], "integer");
+    assert_eq!(
+        prompt["variants"][3]["items"]["items"]["json_type"],
+        "integer"
+    );
+
+    // Inline body unions are named after the operation, and stay typed unions.
+    let transcription = operation(&model, "createTranscription");
+    assert_eq!(
+        transcription["request_body_schema_name"],
+        "CreateTranscriptionRequest"
+    );
+    let request = &model["types"]["CreateTranscriptionRequest"]["target"];
+    assert_eq!(request["id"], "Union");
+    assert_eq!(
+        transcription["response_body_schema_name"],
+        "CreateTranscriptionResponse"
+    );
+    let response = &model["types"]["CreateTranscriptionResponse"]["target"];
+    assert_eq!(response["id"], "Union");
+    assert_eq!(response["mode"], "rules");
+    assert!(model["types"].get("Verbose").is_some());
+
+    let (ok, out) = perseid(dir.path(), &["generate", "--no-format"]);
+    assert!(ok, "{out}");
+    let python = generated_text(dir.path(), "python");
+    assert!(
+        python.contains("decode_response(response, CreateTranscriptionResponse)"),
+        "{python}"
+    );
+}
+
+#[test]
+fn oauth2_client_credentials_clients_get_the_credentials_options_and_the_token_url() {
+    let dir = project_from("oauth.yaml", &LANGUAGES);
+    let (ok, out) = perseid(dir.path(), &["generate", "--no-format"]);
+    assert!(ok, "{out}");
+    for language in LANGUAGES {
+        let sources = files(&dir.path().join(language));
+        let all: String = sources.iter().map(|(_, text)| text.as_str()).collect();
+        assert!(all.contains("/oauth/token"), "{language}: no token URL");
+        assert!(
+            all.contains("secrets.read secrets.write"),
+            "{language}: the scopes of the requirements are not asked for"
+        );
+        assert!(
+            all.contains("VAULT_CLIENT_ID") && all.contains("VAULT_CLIENT_SECRET"),
+            "{language}: the client credentials are not read from the environment"
+        );
+    }
+}
+
+#[test]
+fn specs_without_a_client_credentials_flow_get_no_credentials_options() {
+    let dir = project_from("petstore.yaml", &["typescript", "python", "rust", "csharp"]);
+    let (ok, out) = perseid(dir.path(), &["generate", "--no-format"]);
+    assert!(ok, "{out}");
+    for language in ["typescript", "python", "rust", "csharp"] {
+        for (name, text) in files(&dir.path().join(language)) {
+            assert!(
+                !text.contains("PETSTORE_CLIENT_ID"),
+                "{language}/{name} reads a client id"
+            );
+        }
+    }
+}
+
+#[test]
+fn go_types_adjacently_tagged_unions_and_hoists_inline_variants() {
+    let dir = project_from("petstore.yaml", &["go"]);
+    let spec = r##"
+openapi: 3.1.0
+info: { title: Tagged, version: "1.0.0" }
+servers: [{ url: "https://x.example.com" }]
+paths:
+  /events/{id}:
+    get:
+      operationId: getEvent
+      tags: [events]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        "200":
+          description: ok
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Event" }
+  /parts:
+    post:
+      operationId: createPart
+      tags: [events]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/Part" }
+      responses:
+        "200":
+          description: ok
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Part" }
+components:
+  schemas:
+    Event:
+      type: object
+      required: [type]
+      properties:
+        type: { type: string }
+        at: { type: string }
+      oneOf:
+        - type: object
+          required: [type, data]
+          properties:
+            type: { type: string, enum: [created] }
+            data: { $ref: "#/components/schemas/Thing" }
+        - type: object
+          required: [type, data]
+          properties:
+            type: { type: string, enum: [renamed] }
+            data:
+              type: object
+              required: [name]
+              properties: { name: { type: string } }
+        - type: object
+          required: [type]
+          properties:
+            type: { type: string, enum: [ping] }
+    Thing:
+      type: object
+      required: [id]
+      properties: { id: { type: string } }
+    Part:
+      oneOf:
+        - type: object
+          required: [type, text]
+          properties:
+            type: { type: string, enum: [text] }
+            text: { type: string }
+        - type: object
+          required: [type, url]
+          properties:
+            type: { type: string, enum: [link] }
+            url: { type: string }
+      discriminator: { propertyName: type }
+"##;
+    fs::write(dir.path().join("openapi.yaml"), spec).unwrap();
+    let (ok, out) = perseid(dir.path(), &["generate", "--no-format"]);
+    assert!(ok, "{out}");
+    assert!(!out.contains("untyped JSON value"), "{out}");
+    let sources = files(&dir.path().join("go"));
+    let source = |name: &str| {
+        sources
+            .iter()
+            .find(|(path, _)| path.ends_with(name))
+            .unwrap_or_else(|| panic!("no {name} in {sources:?}"))
+            .1
+            .clone()
+    };
+    let event = source("event.go");
+    assert!(
+        event.contains("unmarshalAdjacentContent(data, \"data\""),
+        "{event}"
+    );
+    assert!(event.contains("func NewEventPing() Event"), "{event}");
+    assert!(source("event_data.go").contains("type EventData struct"));
+    assert!(source("part_text_variant.go").contains("type PartTextVariant struct"));
+    assert!(source("part.go").contains("marshalUnionVariant("));
 }

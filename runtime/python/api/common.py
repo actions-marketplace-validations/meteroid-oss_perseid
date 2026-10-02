@@ -6,7 +6,7 @@ exponential backoff, per-request timeouts and headers, and typed errors.
 
 Retries: a request is retried on connection errors, timeouts, 408, 429 and 5xx
 responses, honouring ``Retry-After`` (or ``retry-after-ms``) up to a minute,
-but only when replaying it is safe: for GET, HEAD, OPTIONS, PUT and DELETE, and
+but only when replaying it is safe: for GET, HEAD, OPTIONS, TRACE, PUT and DELETE, and
 for any request carrying an ``idempotency-key``, which every POST gets
 automatically. A timed-out request can therefore take up to
 ``timeout * (1 + max_retries)`` plus the backoff delays before
@@ -20,6 +20,7 @@ import dataclasses
 import datetime as _datetime
 import email.utils
 import enum
+import json
 import random
 import time
 import typing as t
@@ -41,6 +42,7 @@ from ..serialization import (
     to_json_value,
 )
 from ._auth import (
+    OAuthTokens,
     Security,
     SecurityScheme,
     TokenProvider,
@@ -48,7 +50,9 @@ from ._auth import (
     async_token,
     chosen_schemes,
     needs_token_provider,
+    oauth_scheme,
     sync_token,
+    token_url,
 )
 from ._errors import error_class
 from ._response import capture_response
@@ -72,11 +76,14 @@ __all__ = [
     "ApiBaseSync",
     "ApiRequest",
     "Configuration",
+    "EncodedPathParam",
     "ErrorTypes",
     "QueryParams",
     "Timeout",
     "decode_optional_response",
     "decode_response",
+    "encode_path_param",
+    "json_header",
     "serialize_form_body",
     "serialize_query_params",
 ]
@@ -87,7 +94,7 @@ INITIAL_RETRY_DELAY = 0.5
 """Seconds before the first retry, doubling for each next one up to :data:`MAX_RETRY_DELAY`."""
 MAX_RETRY_DELAY = 8.0
 _MAX_RETRY_AFTER = 60.0
-_REPLAYABLE_METHODS = frozenset({"GET", "HEAD", "OPTIONS", "PUT", "DELETE"})
+_REPLAYABLE_METHODS = frozenset({"GET", "HEAD", "OPTIONS", "TRACE", "PUT", "DELETE"})
 
 QueryParams: t.TypeAlias = "list[tuple[str, str]]"
 Timeout: t.TypeAlias = "float | httpx.Timeout | None"
@@ -115,19 +122,29 @@ def serialize_query_params(
     comma_joined: t.Collection[str] = (),
     structured: t.Collection[str] = (),
     deep_object: t.Collection[str] = (),
+    delimited: t.Mapping[str, str] | None = None,
+    json_params: t.Collection[str] = (),
 ) -> QueryParams:
     """Render query parameters, dropping the ones left unset.
 
     List values are exploded into repeated parameters (OpenAPI ``explode=true``)
     unless their name is listed in ``comma_joined``. ``structured`` ones are sent
     from their JSON value, objects as ``name[key]=value``, and ``deep_object``
-    lists as ``name[]=item``.
+    lists as ``name[]=item``. ``delimited`` lists are joined by their delimiter
+    (``pipeDelimited``, ``spaceDelimited``) and ``json_params`` are sent as
+    compact JSON text (``content: application/json``).
     """
     out: QueryParams = []
     for key, value in params.items():
         if value is None or value is UNSET:
             continue
-        if key in structured:
+        if key in json_params:
+            out.append((key, _compact_json(to_json_value(value))))
+        elif delimited and key in delimited:
+            items = [_serialize_scalar(v) for v in to_json_value(value) if v is not None]
+            if items:
+                out.append((key, delimited[key].join(items)))
+        elif key in structured:
             explode = key not in comma_joined
             encode_param(key, to_json_value(value), key in deep_object, explode, out)
         elif isinstance(value, (list, tuple, set, frozenset)):
@@ -139,6 +156,75 @@ def serialize_query_params(
         else:
             out.append((key, _serialize_scalar(value)))
     return out
+
+
+def _compact_json(value: t.Any) -> str:
+    return json.dumps(value, separators=(",", ":"), ensure_ascii=False)
+
+
+def json_header(value: t.Any) -> str | None:
+    """A ``content: application/json`` header value as compact JSON text."""
+    if value is None or value is UNSET:
+        return None
+    return _compact_json(to_json_value(value))
+
+
+class EncodedPathParam(str):
+    """A path parameter serialized and percent-encoded by its OpenAPI style."""
+
+
+def _quote_unreserved(text: str) -> str:
+    quoted = urllib.parse.quote(text, safe="")
+    # A `.` or `..` segment would be resolved away by the URL, leaving the resource path.
+    return quoted.replace(".", "%2E") if quoted in (".", "..") else quoted
+
+
+def _path_text(value: t.Any) -> str:
+    if value is None:
+        return ""
+    if _nested(value):
+        return _compact_json(value)
+    return _serialize_scalar(value)
+
+
+def encode_path_param(name: str, value: t.Any, style: str, explode: bool) -> EncodedPathParam:
+    """A path parameter in its OpenAPI ``style`` (``simple``, ``label``, ``matrix``).
+
+    ``json`` is for ``content: application/json`` values. Every part is
+    percent-encoded, so that ``,`` ``.`` ``;`` and ``=`` are structural.
+    """
+    value = to_json_value(value)
+    if style == "json":
+        return EncodedPathParam(_quote_unreserved(_compact_json(value)))
+
+    def quote(item: t.Any) -> str:
+        return _quote_unreserved(_path_text(item))
+
+    head, separator = {"label": (".", "."), "matrix": (";", ";")}.get(style, ("", ","))
+    key = _quote_unreserved(name)
+    if isinstance(value, list):
+        values = [quote(item) for item in value]
+        if style == "matrix":
+            if explode:
+                return EncodedPathParam("".join(f";{key}={item}" for item in values))
+            return EncodedPathParam(f";{key}=" + ",".join(values))
+        return EncodedPathParam(head + (separator if explode else ",").join(values))
+    if isinstance(value, dict):
+        pairs = [(_quote_unreserved(field), quote(item)) for field, item in value.items()]
+        flat = ",".join(part for pair in pairs for part in pair)
+        if style == "matrix":
+            if explode:
+                return EncodedPathParam("".join(f";{field}={item}" for field, item in pairs))
+            return EncodedPathParam(f";{key}={flat}")
+        if explode:
+            return EncodedPathParam(head + separator.join(f"{f}={i}" for f, i in pairs))
+        return EncodedPathParam(head + flat)
+    text = quote(value)
+    if style == "label":
+        return EncodedPathParam(f".{text}")
+    if style == "matrix":
+        return EncodedPathParam(f";{key}" if text == "" else f";{key}={text}")
+    return EncodedPathParam(text)
 
 
 def serialize_form_body(
@@ -199,6 +285,7 @@ class Configuration:
     bearer_access_token: str | None = None
     token_provider: TokenProvider | None = None
     basic_auth: tuple[str, str] | None = None
+    oauth: OAuthTokens | None = None
     api_keys: t.Mapping[str, str] = dataclasses.field(default_factory=dict[str, str])
     security_schemes: t.Mapping[str, SecurityScheme] = dataclasses.field(
         default_factory=dict[str, SecurityScheme]
@@ -230,6 +317,7 @@ class ApiRequest:
     path_params: t.Mapping[str, str] | None = None
     query_params: QueryParams | None = None
     header_params: t.Mapping[str, str | None] | None = None
+    cookie_params: t.Mapping[str, str | None] | None = None
     json_body: object = None
     form_body: QueryParams | None = None
     upload_body: UploadContent | None = None
@@ -260,7 +348,7 @@ def _with_extra_body(
             encode_param(key, value, False, True, form)
         return None, form, None
     if spec.multipart is not None:
-        return None, None, [*spec.multipart, *((key, value, False) for key, value in extra.items())]
+        return None, None, [*spec.multipart, *((key, value, False, None) for key, value in extra.items())]
     if spec.upload_body is not None:
         raise TypeError("extra_body needs a JSON, form or multipart request body")
     if spec.json_body is None:
@@ -325,8 +413,9 @@ def decode_optional_response(response: httpx.Response, type_: object) -> t.Any: 
 
 
 def decode_optional_response(response: httpx.Response, type_: object) -> object:
-    """Like :func:`decode_response`, but ``None`` for a 2xx without a body, such as a 204."""
-    if not response.content:
+    """Like :func:`decode_response`, but ``None`` for a 2xx without a body, such as a 204,
+    or with a JSON ``null`` body."""
+    if response.status_code in (204, 205) or response.content.strip() in (b"", b"null"):
         return None
     return decode_response(response, type_)
 
@@ -373,7 +462,9 @@ class ApiBase:
         if spec.path_params:
             path = path.format(
                 **{
-                    key: urllib.parse.quote(str(value), safe="")
+                    key: value
+                    if isinstance(value, EncodedPathParam)
+                    else _quote_unreserved(str(value))
                     for key, value in spec.path_params.items()
                 }
             )
@@ -384,6 +475,18 @@ class ApiBase:
             if value is not None:
                 headers[key] = value
         headers.update(spec.extra_headers or {})
+        # Cookie parameters share one `Cookie` header with the cookie of a call's own headers
+        # and, once authenticated, with the API key cookie.
+        cookies = [
+            f"{key}={urllib.parse.quote(value, safe='')}"
+            for key, value in (spec.cookie_params or {}).items()
+            if value is not None
+        ]
+        if cookies:
+            previous = headers.get("cookie")
+            if previous is not None:
+                cookies.append(previous)
+            headers["cookie"] = "; ".join(cookies)
         method = spec.method.upper()
         if method == "POST" and "idempotency-key" not in headers:
             headers["idempotency-key"] = f"auto_{uuid.uuid4()}"
@@ -433,7 +536,7 @@ class ApiBase:
             )
         request = client.build_request(
             method,
-            f"{self._cfg.base_path}{path}",
+            path if "://" in path else f"{self._cfg.base_path}{path}",
             params=tuple(params) or None,
             headers=headers,
             content=content,
@@ -447,6 +550,59 @@ class ApiBase:
     def _needs_token(self, spec: ApiRequest) -> bool:
         security = self._cfg.security if spec.security is None else spec.security
         return needs_token_provider(self._cfg, chosen_schemes(self._cfg, security))
+
+    def _oauth_scheme(self, spec: ApiRequest) -> SecurityScheme | None:
+        """The OAuth2 scheme whose access token this client fetches for ``spec``, if any."""
+        security = self._cfg.security if spec.security is None else spec.security
+        return oauth_scheme(self._cfg, chosen_schemes(self._cfg, security))
+
+    def _token_request(self, scheme: SecurityScheme) -> tuple[str, ApiRequest]:
+        """The URL of the token endpoint of ``scheme`` and the client credentials request to it."""
+        oauth = self._cfg.oauth
+        assert oauth is not None
+        url = token_url(self._cfg.base_path, scheme.token_url)
+        form, headers = oauth.request_parts(scheme.scope)
+        return url, ApiRequest(
+            "POST", url, form_body=form, security=(), extra_headers=headers
+        )
+
+    def _rejected_token(
+        self,
+        response: httpx.Response,
+        request: httpx.Request,
+        used: tuple[str, str] | None,
+        renewed: bool,
+        replayable: bool,
+    ) -> bool:
+        """Whether ``response`` rejects the OAuth2 access token ``used`` (its token URL and
+        value) that the request carried, which is then forgotten."""
+        oauth = self._cfg.oauth
+        if (
+            oauth is None
+            or used is None
+            or renewed
+            or not replayable
+            or response.status_code != 401
+            or request.headers.get("authorization") != f"Bearer {used[1]}"
+        ):
+            return False
+        oauth.invalidate(*used)
+        return True
+
+    @staticmethod
+    def _parse_token(response: httpx.Response) -> tuple[str, float | None]:
+        """The access token and its lifetime in seconds of a token endpoint response."""
+        try:
+            body = response.json()
+            token = body["access_token"]
+            if not isinstance(token, str) or not token:
+                raise ValueError("access_token is not a string")
+            expires = body.get("expires_in")
+            return token, None if expires is None else float(expires)
+        except (ValueError, TypeError, KeyError, AttributeError) as exc:
+            raise APIResponseValidationError(
+                response, f"the token endpoint response has no usable access_token: {exc}"
+            ) from exc
 
     def _retry_delay(
         self, spec: ApiRequest, attempt: int, replayable: bool, response: httpx.Response | None
@@ -488,10 +644,28 @@ class ApiBaseSync(ApiBase):
             response.read()
         return response
 
+    def _oauth_token(self, scheme: SecurityScheme) -> tuple[str, str]:
+        """The access token of ``scheme`` with its token URL: the cached one, else a new one.
+        Concurrent callers share one token request."""
+        oauth = self._cfg.oauth
+        assert oauth is not None
+        url, spec = self._token_request(scheme)
+        with oauth.lock:
+            token = oauth.cached(url)
+            if token is None:
+                token = oauth.store(url, *self._parse_token(self._request(spec)))
+        return url, token
+
     def _request(self, spec: ApiRequest) -> httpx.Response:
         token = sync_token(self._cfg) if self._needs_token(spec) else None
+        scheme = self._oauth_scheme(spec)
+        used: tuple[str, str] | None = None
+        if scheme is not None:
+            used = self._oauth_token(scheme)
+            token = used[1]
         request, replayable = self._build(self._httpx_client, spec, token)
         attempt = 0
+        renewed = False
         while True:
             try:
                 response = self._send(request, spec.stream)
@@ -500,6 +674,16 @@ class ApiBaseSync(ApiBase):
                 if delay is None:
                     raise connection_error(exc) from exc
             else:
+                if scheme is not None and self._rejected_token(
+                    response, request, used, renewed, replayable
+                ):
+                    # The API rejected the access token: one request with a new one, which
+                    # does not use up a retry.
+                    renewed = True
+                    response.close()
+                    used = self._oauth_token(scheme)
+                    request.headers["authorization"] = f"Bearer {used[1]}"
+                    continue
                 delay = self._retry_delay(spec, attempt, replayable, response)
                 if delay is None:
                     try:
@@ -531,10 +715,28 @@ class ApiBaseAsync(ApiBase):
             await response.aread()
         return response
 
+    async def _oauth_token(self, scheme: SecurityScheme) -> tuple[str, str]:
+        """The access token of ``scheme`` with its token URL: the cached one, else a new one.
+        Concurrent callers share one token request."""
+        oauth = self._cfg.oauth
+        assert oauth is not None
+        url, spec = self._token_request(scheme)
+        async with oauth.async_lock():
+            token = oauth.cached(url)
+            if token is None:
+                token = oauth.store(url, *self._parse_token(await self._request(spec)))
+        return url, token
+
     async def _request(self, spec: ApiRequest) -> httpx.Response:
         token = await async_token(self._cfg) if self._needs_token(spec) else None
+        scheme = self._oauth_scheme(spec)
+        used: tuple[str, str] | None = None
+        if scheme is not None:
+            used = await self._oauth_token(scheme)
+            token = used[1]
         request, replayable = self._build(self._httpx_client, spec, token)
         attempt = 0
+        renewed = False
         while True:
             try:
                 response = await self._send(request, spec.stream)
@@ -543,6 +745,16 @@ class ApiBaseAsync(ApiBase):
                 if delay is None:
                     raise connection_error(exc) from exc
             else:
+                if scheme is not None and self._rejected_token(
+                    response, request, used, renewed, replayable
+                ):
+                    # The API rejected the access token: one request with a new one, which
+                    # does not use up a retry.
+                    renewed = True
+                    await response.aclose()
+                    used = await self._oauth_token(scheme)
+                    request.headers["authorization"] = f"Bearer {used[1]}"
+                    continue
                 delay = self._retry_delay(spec, attempt, replayable, response)
                 if delay is None:
                     try:

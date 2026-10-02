@@ -2,9 +2,15 @@
 {% set type_name = go_ident(type.name) -%}
 {% set patch = patch_body -%}
 {% macro field_type(field) %}{{ go_field_type(field, patch, go_union_name(type.name, field.name, field.type, type_names)) }}{% endmacro -%}
+{#- A declared `additionalProperties` (always a map type) types the values of the extra map. -#}
+{% set has_extra = type.additional_properties is defined -%}
+{% set extra_field = {"name": "additional_properties", "type": type.additional_properties, "required": false, "nullable": false} if has_extra else none -%}
+{% set extra_union = go_union_name(type.name, "additional_properties", type.additional_properties, type_names) if has_extra else "" -%}
 {% set unions %}{% for field in type.fields %}{% set union = go_union_name(type.name, field.name, field.type, type_names) %}{% if union %}
 {{ go_union(union, field.type) }}
-{% endif %}{% endfor %}{% endset -%}
+{% endif %}{% endfor %}{% if extra_union %}
+{{ go_union(extra_union, type.additional_properties) }}
+{% endif %}{% endset -%}
 {% set defaults = type.discriminator_defaults | default({}) -%}
 {% set ns = namespace(defaulted=[], names=[]) -%}
 {% for field in type.fields -%}
@@ -13,7 +19,11 @@
 {% endfor -%}
 {% set defaulted = ns.defaulted -%}
 {% set extra = "ExtraFields" if "ExtraFields" not in ns.names else "ExtraProperties" -%}
-{% set rendered_types %}{% for field in type.fields %}{{ field_type(field) }} {% endfor %}{{ unions }}{% endset -%}
+{% set extra_type = (go_field_type(extra_field, patch, extra_union) | trim) if has_extra else "map[string]json.RawMessage" -%}
+{% set typed_extra = extra_type != "map[string]json.RawMessage" -%}
+{#- Fields whose JSON name a struct tag cannot carry are encoded by MarshalJSON/UnmarshalJSON. -#}
+{% set untagged = type.fields | rejectattr("name", "go_taggable") | list -%}
+{% set rendered_types %}{% for field in type.fields %}{{ field_type(field) }} {% endfor %}{{ extra_type }} {{ unions }}{% endset -%}
 package {{ sdk.package_name }}
 {% if "time.Time" in rendered_types %}
 import (
@@ -35,11 +45,13 @@ import "encoding/json"
 {% endif %}{% if field.type.is_datetime() %}// RFC 3339 timestamp.
 {% endif %}{% if field.deprecated %}{% if field.description is defined or field in defaulted or field.type.is_datetime() %}//
 {% endif %}{{ go_deprecated("field") }}
-{% endif %}{{ go_export(field.name) }} {{ field_type(field) }} {{ go_json_tag(field) }}
+{% endif %}{{ go_export(field.name) }} {{ field_type(field) }} {% if field in untagged %}`json:"-"`{% else %}{{ go_json_tag(field) }}{% endif %}
 
-{% endfor %}// {{ extra }} holds the properties this SDK version does not know, as
+{% endfor %}{% if has_extra %}// {{ extra }} holds the properties beyond the declared ones (the schema's
+// additionalProperties), as decoded, and sends them along when encoding.
+{% else %}// {{ extra }} holds the properties this SDK version does not know, as
 // decoded, and sends them along when encoding.
-{{ extra }} map[string]json.RawMessage `json:"-"`
+{% endif %}{{ extra }} {{ extra_type }} `json:"-"`
 }
 
 // UnmarshalJSON implements json.Unmarshaler, keeping unknown properties in {{ extra }}.
@@ -48,9 +60,15 @@ func (v *{{ type_name }}) UnmarshalJSON(data []byte) error {
 	if err := json.Unmarshal(data, (*plain)(v)); err != nil {
 		return err
 	}
-	v.{{ extra }} = extraFields(data{% for field in type.fields %}, {{ field.name | tojson }}{% endfor %})
+{% if untagged %}	if err := unmarshalFields(data, map[string]any{
+{% for field in untagged %}		{{ field.name | tojson }}: &v.{{ go_export(field.name) }},
+{% endfor %}	}); err != nil {
+		return err
+	}
+{% endif %}{% if typed_extra %}	return typedExtraFields(&v.{{ extra }}, data{% for field in type.fields %}, {{ field.name | tojson }}{% endfor %})
+{% else %}	v.{{ extra }} = extraFields(data{% for field in type.fields %}, {{ field.name | tojson }}{% endfor %})
 	return nil
-}
+{% endif %}}
 
 // MarshalJSON implements json.Marshaler, sending {{ extra }} along{% if defaulted %} and filling in the discriminator{% endif %}.
 func (v {{ type_name }}) MarshalJSON() ([]byte, error) {
@@ -61,6 +79,13 @@ func (v {{ type_name }}) MarshalJSON() ([]byte, error) {
 {% else %}	if v.{{ go_export(field.name) }} == "" {
 		v.{{ go_export(field.name) }} = {{ value }}
 	}
-{% endif %}{% endfor %}	return marshalWithExtra(plain(v), v.{{ extra }})
-}
+{% endif %}{% endfor %}{% if untagged %}	data, err := marshalWithFields(plain(v), []jsonField{
+{% for field in untagged %}		{Name: {{ field.name | tojson }}, Value: v.{{ go_export(field.name) }}{% if not field.required %}, Omit: {% if field_type(field) is startingwith("*") %}v.{{ go_export(field.name) }} == nil{% else %}len(v.{{ go_export(field.name) }}) == 0{% endif %}{% endif %}},
+{% endfor %}	})
+	if err != nil {
+		return nil, err
+	}
+	return appendExtra(data, v.{{ extra }})
+{% else %}	return marshalWithExtra(plain(v), v.{{ extra }})
+{% endif %}}
 {{ unions }}

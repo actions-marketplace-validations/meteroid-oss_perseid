@@ -46,6 +46,22 @@ public final class Utils {
     private Utils() {}
 
     /**
+     * A {@code name=value} cookie pair, its value percent-encoded to stay RFC 6265 safe.
+     *
+     * @param name the cookie name
+     * @param value the cookie value
+     * @return the pair
+     */
+    public static String cookiePair(String name, String value) {
+        String encoded =
+                java.net.URLEncoder.encode(value, java.nio.charset.StandardCharsets.UTF_8)
+                        .replace("+", "%20")
+                        .replace("*", "%2A")
+                        .replace("%7E", "~");
+        return name + "=" + encoded;
+    }
+
+    /**
      * The value of a required property, which a response may still leave out.
      *
      * @param <T> the property type
@@ -234,6 +250,39 @@ public final class Utils {
     }
 
     /**
+     * Append the items of a list joined by {@code delimiter} ({@code pipeDelimited}, {@code
+     * spaceDelimited}).
+     *
+     * @param url the URL builder
+     * @param name the parameter name
+     * @param value the list
+     * @param delimiter the text between items
+     */
+    public static void addDelimitedQueryParameter(
+            HttpUrl.Builder url, String name, Object value, String delimiter) {
+        List<String> texts = new ArrayList<>();
+        for (JsonNode item : MAPPER.valueToTree(value)) {
+            if (!item.isNull()) {
+                texts.add(item.asText());
+            }
+        }
+        if (!texts.isEmpty()) {
+            url.addQueryParameter(name, String.join(delimiter, texts));
+        }
+    }
+
+    /**
+     * Append a {@code content: application/json} parameter as compact JSON text.
+     *
+     * @param url the URL builder
+     * @param name the parameter name
+     * @param value the value
+     */
+    public static void addJsonQueryParameter(HttpUrl.Builder url, String name, Object value) {
+        url.addQueryParameter(name, json(value));
+    }
+
+    /**
      * One JSON value as query or form pairs, nested values the way Stripe-style APIs read them:
      * {@code name[key]=value}, {@code name[]=item} for lists of scalars and {@code
      * name[0][key]=value} for lists of objects. Top-level lists of scalars repeat {@code name}
@@ -307,6 +356,112 @@ public final class Utils {
         return segment;
     }
 
+    /** Percent-encodes everything but the unreserved characters. */
+    private static String escapeUnreserved(String text) {
+        return java.net.URLEncoder.encode(text, java.nio.charset.StandardCharsets.UTF_8)
+                .replace("+", "%20")
+                .replace("*", "%2A")
+                .replace("%7E", "~");
+    }
+
+    private static String pathText(JsonNode node) {
+        if (node == null || node.isNull() || node.isMissingNode()) {
+            return "";
+        }
+        return node.isContainerNode() ? node.toString() : node.asText();
+    }
+
+    /**
+     * A plain path parameter inside a segment that also holds styled ones, percent-encoded, for
+     * {@code addEncodedPathSegment}.
+     *
+     * @param name the parameter name
+     * @param value the value
+     * @return the encoded text
+     */
+    public static String encodePathValue(String name, Object value) {
+        String segment = value == null ? "" : serializeQueryParam(value);
+        if (segment.isEmpty()) {
+            throw new IllegalArgumentException("invalid path parameter `" + name + "`: \"\"");
+        }
+        return escapeUnreserved(segment);
+    }
+
+    /**
+     * A path segment built from encoded parts: dot segments would change the request path.
+     *
+     * @param name the parameter name
+     * @param segment the encoded segment
+     * @return the segment
+     */
+    public static String encodedPathSegment(String name, String segment) {
+        if (segment.isEmpty() || segment.equals(".") || segment.equals("..")) {
+            throw new IllegalArgumentException(
+                    "invalid path parameter `" + name + "`: \"" + segment + "\"");
+        }
+        return segment;
+    }
+
+    /**
+     * A path parameter in its OpenAPI {@code style} ({@code simple}, {@code label}, {@code
+     * matrix}; {@code json} for {@code content} values), each part percent-encoded.
+     *
+     * @param name the parameter name
+     * @param value the value
+     * @param style the style
+     * @param explode whether lists and objects are exploded
+     * @return the encoded text
+     */
+    public static String encodePathParam(String name, Object value, String style, boolean explode) {
+        JsonNode node = MAPPER.valueToTree(value);
+        if (style.equals("json")) {
+            return escapeUnreserved(node == null ? "" : node.toString());
+        }
+        String head = style.equals("label") ? "." : style.equals("matrix") ? ";" : "";
+        String separator = style.equals("label") ? "." : style.equals("matrix") ? ";" : ",";
+        String key = escapeUnreserved(name);
+        if (node != null && node.isArray()) {
+            List<String> values = new ArrayList<>();
+            for (JsonNode item : node) {
+                values.add(escapeUnreserved(pathText(item)));
+            }
+            if (style.equals("matrix")) {
+                if (!explode) {
+                    return ";" + key + "=" + String.join(",", values);
+                }
+                StringBuilder out = new StringBuilder();
+                values.forEach(item -> out.append(';').append(key).append('=').append(item));
+                return out.toString();
+            }
+            return head + String.join(explode ? separator : ",", values);
+        }
+        if (node != null && node.isObject()) {
+            List<String> pairs = new ArrayList<>();
+            List<String> flat = new ArrayList<>();
+            Iterator<Map.Entry<String, JsonNode>> fields = node.fields();
+            while (fields.hasNext()) {
+                Map.Entry<String, JsonNode> field = fields.next();
+                String fieldName = escapeUnreserved(field.getKey());
+                String text = escapeUnreserved(pathText(field.getValue()));
+                pairs.add(fieldName + "=" + text);
+                flat.add(fieldName);
+                flat.add(text);
+            }
+            if (style.equals("matrix")) {
+                return explode ? ";" + String.join(";", pairs) : ";" + key + "=" + String.join(",", flat);
+            }
+            return head + (explode ? String.join(separator, pairs) : String.join(",", flat));
+        }
+        String text = escapeUnreserved(pathText(node));
+        if (style.equals("label")) {
+            return "." + text;
+        }
+        if (style.equals("matrix")) {
+            return text.isEmpty() ? ";" + key : ";" + key + "=" + text;
+        }
+        return text;
+    }
+
     /** A value with its own query string form. */
     public interface ToQueryParam {
         /**
@@ -372,7 +527,11 @@ public final class Utils {
         mapper.enable(JsonParser.Feature.INCLUDE_SOURCE_IN_LOCATION);
         mapper.registerModule(new JavaTimeModule());
         mapper.registerModule(new Jdk8Module());
-        mapper.registerModule(new SimpleModule().addSerializer(new DecimalSerializer()));
+        mapper.registerModule(
+                new SimpleModule()
+                        .addSerializer(new DecimalSerializer())
+                        // A set keeps the order of its JSON array, as the builders' sets do.
+                        .addAbstractTypeMapping(Set.class, LinkedHashSet.class));
         return mapper;
     }
 
