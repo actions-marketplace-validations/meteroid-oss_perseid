@@ -196,7 +196,13 @@ def encode_path_param(name: str, value: t.Any, style: str, explode: bool) -> Enc
     value = to_json_value(value)
     if style == "json":
         return EncodedPathParam(_quote_unreserved(_compact_json(value)))
+    result = _encode_styled_path_param(name, value, style, explode)
+    # A whole segment of dots, plain or percent-encoded, would be resolved away by the URL.
+    dots = result.replace("%2E", ".")
+    return EncodedPathParam("%2E" * len(dots) if dots in (".", "..") else result)
 
+
+def _encode_styled_path_param(name: str, value: t.Any, style: str, explode: bool) -> str:
     def quote(item: t.Any) -> str:
         return _quote_unreserved(_path_text(item))
 
@@ -206,25 +212,25 @@ def encode_path_param(name: str, value: t.Any, style: str, explode: bool) -> Enc
         values = [quote(item) for item in value]
         if style == "matrix":
             if explode:
-                return EncodedPathParam("".join(f";{key}={item}" for item in values))
-            return EncodedPathParam(f";{key}=" + ",".join(values))
-        return EncodedPathParam(head + (separator if explode else ",").join(values))
+                return "".join(f";{key}={item}" for item in values)
+            return f";{key}=" + ",".join(values)
+        return head + (separator if explode else ",").join(values)
     if isinstance(value, dict):
         pairs = [(_quote_unreserved(field), quote(item)) for field, item in value.items()]
         flat = ",".join(part for pair in pairs for part in pair)
         if style == "matrix":
             if explode:
-                return EncodedPathParam("".join(f";{field}={item}" for field, item in pairs))
-            return EncodedPathParam(f";{key}={flat}")
+                return "".join(f";{field}={item}" for field, item in pairs)
+            return f";{key}={flat}"
         if explode:
-            return EncodedPathParam(head + separator.join(f"{f}={i}" for f, i in pairs))
-        return EncodedPathParam(head + flat)
+            return head + separator.join(f"{f}={i}" for f, i in pairs)
+        return head + flat
     text = quote(value)
     if style == "label":
-        return EncodedPathParam(f".{text}")
+        return f".{text}"
     if style == "matrix":
-        return EncodedPathParam(f";{key}" if text == "" else f";{key}={text}")
-    return EncodedPathParam(text)
+        return f";{key}" if text == "" else f";{key}={text}"
+    return text
 
 
 def serialize_form_body(
@@ -574,7 +580,7 @@ class ApiBase:
         renewed: bool,
         replayable: bool,
     ) -> bool:
-        """Whether ``response`` rejects the OAuth2 access token ``used`` (its token URL and
+        """Whether ``response`` rejects the OAuth2 access token ``used`` (its cache key and
         value) that the request carried, which is then forgotten."""
         oauth = self._cfg.oauth
         if (
@@ -645,16 +651,17 @@ class ApiBaseSync(ApiBase):
         return response
 
     def _oauth_token(self, scheme: SecurityScheme) -> tuple[str, str]:
-        """The access token of ``scheme`` with its token URL: the cached one, else a new one.
+        """The access token of ``scheme`` with its cache key (token URL and scope): the cached one, else a new one.
         Concurrent callers share one token request."""
         oauth = self._cfg.oauth
         assert oauth is not None
         url, spec = self._token_request(scheme)
+        key = f"{url}\n{scheme.scope}"
         with oauth.lock:
-            token = oauth.cached(url)
+            token = oauth.cached(key)
             if token is None:
-                token = oauth.store(url, *self._parse_token(self._request(spec)))
-        return url, token
+                token = oauth.store(key, *self._parse_token(self._request(spec)))
+        return key, token
 
     def _request(self, spec: ApiRequest) -> httpx.Response:
         token = sync_token(self._cfg) if self._needs_token(spec) else None
@@ -716,16 +723,17 @@ class ApiBaseAsync(ApiBase):
         return response
 
     async def _oauth_token(self, scheme: SecurityScheme) -> tuple[str, str]:
-        """The access token of ``scheme`` with its token URL: the cached one, else a new one.
+        """The access token of ``scheme`` with its cache key (token URL and scope): the cached one, else a new one.
         Concurrent callers share one token request."""
         oauth = self._cfg.oauth
         assert oauth is not None
         url, spec = self._token_request(scheme)
+        key = f"{url}\n{scheme.scope}"
         async with oauth.async_lock():
-            token = oauth.cached(url)
+            token = oauth.cached(key)
             if token is None:
-                token = oauth.store(url, *self._parse_token(await self._request(spec)))
-        return url, token
+                token = oauth.store(key, *self._parse_token(await self._request(spec)))
+        return key, token
 
     async def _request(self, spec: ApiRequest) -> httpx.Response:
         token = await async_token(self._cfg) if self._needs_token(spec) else None
