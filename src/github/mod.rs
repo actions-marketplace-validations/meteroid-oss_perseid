@@ -99,6 +99,21 @@ impl Ui {
         }
     }
 
+    /// A line typed by the user, empty when they just press enter.
+    pub fn line(&self, question: &str) -> Result<String> {
+        if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+            return crate::prompt::line(question);
+        }
+        print!("? {question} ");
+        std::io::stdout().flush()?;
+        let mut line = String::new();
+        if std::io::stdin().lock().read_line(&mut line)? == 0 {
+            bail!("no answer to \"{question}\": stdin is closed");
+        }
+        println!();
+        Ok(line.trim().to_owned())
+    }
+
     pub fn pause(&self, message: &str) -> Result<()> {
         print!("  {message} ");
         std::io::stdout().flush()?;
@@ -171,37 +186,20 @@ pub fn app(config_path: &Path, options: &Options) -> Result<ExitCode> {
 }
 
 fn credentials(api: &GitHub, app: &app::App, hub: &str, repos: &[String], ui: &Ui) -> Result<()> {
-    let mut keyless = Vec::new();
     for repo in repos {
         secrets::set_variable(api, repo, "SDK_APP_ID", &app.id)?;
-        match &app.pem {
-            Some(pem) => secrets::set_secret(api, repo, "SDK_APP_PRIVATE_KEY", pem)?,
-            None if !secrets::has_secret(api, repo, "SDK_APP_PRIVATE_KEY")? => {
-                keyless.push(repo.as_str())
-            }
-            None => {}
+        if let Some(pem) = &app.pem {
+            secrets::set_secret(api, repo, "SDK_APP_PRIVATE_KEY", pem)?;
         }
     }
     if let Some(slug) = &app.slug {
         secrets::set_variable(api, hub, "SDK_APP_SLUG", slug)?;
     }
-    let done: Vec<&str> = repos
-        .iter()
-        .map(String::as_str)
-        .filter(|r| !keyless.contains(r))
-        .collect();
-    if !done.is_empty() {
-        ui.ok(&format!(
-            "SDK_APP_ID and SDK_APP_PRIVATE_KEY are set on {}",
-            done.join(", ")
-        ));
-    }
-    if !keyless.is_empty() {
-        ui.warn(&format!(
-            "Add a private key of the App (generated on its settings page) as the SDK_APP_PRIVATE_KEY secret of {}",
-            keyless.join(", ")
-        ));
-    }
+    let set = match app.pem {
+        Some(_) => "SDK_APP_ID and SDK_APP_PRIVATE_KEY are",
+        None => "SDK_APP_ID is",
+    };
+    ui.ok(&format!("{set} set on {}", repos.join(", ")));
     Ok(())
 }
 
@@ -326,22 +324,21 @@ pub fn publishing(config: &Config, hub: &str) -> Result<Vec<String>> {
         let repo = sdk.remote().unwrap_or(hub);
         let context = config.context(&sdk, Path::new("/nonexistent"));
         let text = |key: &str| context[key].as_str().unwrap_or_default().to_owned();
-        let publisher = format!("repository {repo}, workflow sdk-release.yml, environment release");
         steps.push(match sdk.language {
             "typescript" => {
                 let name = text("npm_package");
                 format!(
-                    "npm: publish {name} once with an NPM_TOKEN secret on {repo}, then add a trusted publisher ({publisher}) at https://www.npmjs.com/package/{name}/access and delete the token"
+                    "npm: publish {name} once with an NPM_TOKEN secret on {repo}, then add {repo} as its trusted publisher at https://www.npmjs.com/package/{name}/access and delete the token"
                 )
             }
             "python" => format!(
-                "PyPI: add a pending publisher for {} ({publisher}) at https://pypi.org/manage/account/publishing/",
+                "PyPI: add {repo} as the pending publisher of {} at https://pypi.org/manage/account/publishing/",
                 text("package_name")
             ),
             "rust" => {
                 let name = text("rust_crate");
                 format!(
-                    "crates.io: publish {name} once with a CARGO_REGISTRY_TOKEN secret on {repo}, then add a trusted publisher ({publisher}) at https://crates.io/crates/{name}/settings and delete the token"
+                    "crates.io: publish {name} once with a CARGO_REGISTRY_TOKEN secret on {repo}, then add {repo} as its trusted publisher at https://crates.io/crates/{name}/settings and delete the token"
                 )
             }
             "java" => format!(
@@ -351,7 +348,7 @@ pub fn publishing(config: &Config, hub: &str) -> Result<Vec<String>> {
             "csharp" => format!(
                 "NuGet: add a NUGET_API_KEY secret to {repo}, from https://www.nuget.org/account/apikeys"
             ),
-            _ => format!("Go: nothing to set up, {repo} tags publish through the module proxy"),
+            _ => format!("Go: nothing, the tags of {repo} publish through the module proxy"),
         });
     }
     Ok(steps)

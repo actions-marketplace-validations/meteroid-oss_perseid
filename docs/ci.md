@@ -77,6 +77,24 @@ You need:
 - For `perseid connect`: admin rights on the API repository, and ideally on the SDKs repository.
 - An account on each registry you publish to: npm, PyPI, crates.io, Maven Central, NuGet.
 
+### Who can write where
+
+Each workflow gets a credential reaching only the repositories it writes to. The credential is
+stored in the repository the workflow runs in.
+
+| Workflow | Runs in | Writes to | Credential |
+|---|---|---|---|
+| `sdks.yml`, `sdk-release.yml` | the repository holding `perseid.toml`, each SDK repository | those repositories: contents, pull requests, workflows | the [`perseid app`](#perseid-app) App, else [`PERSEID_TOKEN`](#tokens) |
+| `perseid-push.yml` | the API repository | the SDKs repository: contents | a deploy key, else a token or an App, see [`--auth`](#perseid-connect) |
+| the publish job of `sdk-release.yml` | the SDK repository, `release` environment | the registries | [trusted publishing](#publishing), else a registry token |
+
+- Anyone who can run workflows in a repository can use its secrets: `connect` gives the API
+  repository a key to the SDKs repository only, never one to the SDK repositories.
+- The `perseid app` App can push the spec too (`connect --auth app` with its ID and a new key).
+  Its key then reaches every SDK repository from the API repository: protect their default
+  branch and require a review on their `release` environment, or use a separate App installed on
+  the SDKs repository only.
+
 ### `perseid init`
 
 `init` works in your clone only. It finds the spec (a tracked `openapi` or `swagger` file, JSON or
@@ -92,8 +110,11 @@ their release files in their first pull request.
 - Run `init` again after editing `perseid.toml`. It rewrites the workflows it wrote, except one
   whose first line, ``# Written by `perseid init` ``, you removed.
 - Without a terminal, pass `--sdks`, and optionally `--repo`, `--spec`, `--name` and `--base-url`.
-- Without a spec in the repository, `spec` defaults to `openapi.json`, where `perseid connect`
-  pushes it. `perseid generate --spec <path|url>` previews the SDKs meanwhile.
+- Without a spec in the repository, it asks where the spec is: at a URL, in a file, or in another
+  repository. For the last, `spec` defaults to `openapi.json`, where `perseid connect` pushes it.
+  `perseid generate --spec <path|url> --out /tmp/sdks` previews the SDKs meanwhile.
+- It ends with the next steps: SDK repositories to create, a GitHub App or a token, the
+  `perseid connect` to run, and what each registry needs before the first release.
 
 ### `perseid generate`
 
@@ -156,8 +177,10 @@ and asks first. If you decline, it prints the steps to do it by hand:
 | `--yes` | Applies without asking |
 | `--no-browser` | Prints URLs instead of opening them |
 
-Run `perseid app` again after adding an SDK repository: it installs the App there too. All SDK
-repositories must belong to one account.
+Run `perseid app` again after adding an SDK repository: it installs the App there too. GitHub
+shows a private key only once, so it asks you to generate a new one on the App's settings page,
+checks it belongs to the App, stores it on the repositories lacking one, and offers to delete the
+downloaded file. All SDK repositories must belong to one account.
 
 ### The default `GITHUB_TOKEN`
 
