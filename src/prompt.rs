@@ -48,6 +48,10 @@ pub fn line(question: &str) -> Result<String> {
     Ok(cliclack::input(question).required(false).interact()?)
 }
 
+pub fn password(question: &str) -> Result<String> {
+    Ok(cliclack::password(question).mask('▪').interact()?)
+}
+
 pub fn confirm(question: &str, default: bool) -> Result<bool> {
     Ok(cliclack::confirm(question)
         .initial_value(default)
