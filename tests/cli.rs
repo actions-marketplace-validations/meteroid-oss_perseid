@@ -331,6 +331,41 @@ fn webhooks_verifier_is_opt_in() {
 }
 
 #[test]
+fn tests_are_generated_unless_left_out() {
+    let dir = project_from("petstore.yaml", &["go", "java", "csharp"]);
+    let (ok, out) = perseid(dir.path(), &["generate", "--no-format"]);
+    assert!(ok, "{out}");
+    for path in [
+        "go/pets_test.go",
+        "go/perseid_mock_test.go",
+        "java/src/test/java/com/petstore/api/PetsTest.java",
+        "csharp/Petstore.Tests/PetsTests.cs",
+    ] {
+        assert!(dir.path().join(path).exists(), "{path}");
+    }
+    let go = fs::read_to_string(dir.path().join("go/pets_test.go")).unwrap();
+    assert!(
+        go.contains(r#"expect(t, requests, "DELETE /pets/pet_id")"#),
+        "{go}"
+    );
+
+    edit_config(dir.path(), |text| {
+        text.replacen("[go]", "[go]\ntests = false", 1)
+    });
+    let (ok, out) = perseid(dir.path(), &["generate", "--no-format"]);
+    assert!(ok, "{out}");
+    assert!(
+        !dir.path().join("go/pets_test.go").exists(),
+        "stale tests are removed"
+    );
+    assert!(
+        dir.path()
+            .join("csharp/Petstore.Tests/PetsTests.cs")
+            .exists()
+    );
+}
+
+#[test]
 fn handwritten_files_are_never_overwritten() {
     let dir = project();
     let (ok, out) = perseid(dir.path(), &["generate", "--no-format"]);
