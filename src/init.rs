@@ -95,10 +95,11 @@ pub fn run(init: Init, root: &Path) -> Result<()> {
             name_from_title(&json!({ "info": { "title": fallback } }))
         });
     let name = match (&init.name, interactive) {
-        (Some(name), _) => name.clone(),
-        (None, true) => crate::prompt::text(
-            "Client name, which the SDKs' class names start with",
+        (Some(name), _) => crate::client_name::parse(name).map_err(anyhow::Error::msg)?,
+        (None, true) => crate::prompt::text_as(
+            "API name, in any case: the SDKs' classes and packages are named after it",
             &derived,
+            crate::client_name::parse,
         )?,
         (None, false) => derived,
     };
@@ -264,7 +265,7 @@ fn next_steps(config: &Config, root: &Path) {
     });
     if let Some(file) = awaited {
         steps.push(format!(
-            "In the repository holding the spec, run `npx perseid connect {hub}`: it writes a workflow pushing the spec here as {file}, with a deploy key that can write to {hub} only"
+            "In the repository holding the spec, run `npx perseid connect {hub}`: it writes a workflow pushing the spec here as {file}, as the GitHub App above or with a token"
         ));
     }
     steps.push("`perseid status` checks the setup on GitHub".to_owned());

@@ -23,6 +23,19 @@ pub fn text(question: &str, default: &str) -> Result<String> {
         .interact()?)
 }
 
+/// An answer `check` accepts, as it returns it.
+pub fn text_as(
+    question: &str,
+    default: &str,
+    check: fn(&str) -> Result<String, String>,
+) -> Result<String> {
+    let answer: String = cliclack::input(question)
+        .default_input(default)
+        .validate(move |input: &String| check(input).map(|_| ()))
+        .interact()?;
+    check(&answer).map_err(anyhow::Error::msg)
+}
+
 /// A free answer, with `placeholder` as an example rather than a default.
 pub fn ask(question: &str, placeholder: &str) -> Result<String> {
     Ok(cliclack::input(question)
@@ -33,6 +46,10 @@ pub fn ask(question: &str, placeholder: &str) -> Result<String> {
 /// A free answer, empty when the user just presses enter.
 pub fn line(question: &str) -> Result<String> {
     Ok(cliclack::input(question).required(false).interact()?)
+}
+
+pub fn password(question: &str) -> Result<String> {
+    Ok(cliclack::password(question).mask('▪').interact()?)
 }
 
 pub fn confirm(question: &str, default: bool) -> Result<bool> {
