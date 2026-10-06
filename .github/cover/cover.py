@@ -15,7 +15,7 @@ LANGUAGES = [
     ("C#", "#b07ce8"),
 ]
 TAGLINE = "OpenAPI in, idiomatic SDKs out."
-SUBLINE = "Always in sync with your spec. No cloud, no subscription."
+SUBLINE = "Always in sync with your spec, all in your CI."
 COMMAND = "npx perseid init"
 
 W, H = 1280, 640

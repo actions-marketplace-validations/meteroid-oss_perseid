@@ -1,5 +1,5 @@
 name: Perseid OpenAPI SDK Generator
-description: Generate idiomatic Rust, TypeScript, Python, Go, Java and C# SDKs from OpenAPI and open pull requests. No cloud, no subscription.
+description: Generate idiomatic Rust, TypeScript, Python, Go, Java and C# SDKs from OpenAPI and open pull requests.
 branding:
   icon: package
   color: purple
