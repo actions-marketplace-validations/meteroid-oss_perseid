@@ -36,6 +36,26 @@ See [features](features.md) for auth, pagination and encoding, and
 | Java | Java 11+ | `new Acme(AcmeOptions...)` | `AcmeException` | `listIter()` | `client.withRawResponse()` |
 | C# | .NET 8 | `new AcmeClient(token)` | `AcmeException` | `ListAutoPagingAsync()` | `.WithRawResponse` |
 
+## Formats
+
+A string `format` types the value wherever it appears: fields, list items, parameters, bodies,
+and named schemas of it.
+
+| `format` | Rust | TypeScript | Python | Go | Java | C# |
+|---|---|---|---|---|---|---|
+| `date-time` | `chrono::DateTime<Utc>` | `Date` | `datetime` | `time.Time` | `OffsetDateTime` | `DateTimeOffset` |
+| `date` | `chrono::NaiveDate` | `string` | `date` | `Date` | `LocalDate` | `DateOnly` |
+| `decimal` | `rust_decimal::Decimal` | `string` | `Decimal` | `string` | `BigDecimal` | `decimal` |
+| `uuid` | `uuid::Uuid` | `string` | `UUID` | `uuid.UUID` | `UUID` | `Guid` |
+| `uri` | `String` | `string` | `str` | `string` | `URI` | `string` |
+
+- TypeScript keeps dates as `"2024-01-31"` strings: a `Date` is an instant, which time zones
+  would shift to another day.
+- `uuid` is `github.com/google/uuid` in Go. `[types] uuid = "string"` in
+  [perseid.toml](configuration.md#sdk-defaults) keeps UUIDs strings everywhere.
+- Go's `Date` (`Year`, `Month`, `Day`) is in the SDK package: `DateOf(t)` and `ParseDate(s)`
+  build one, `In(loc)` turns it back into a `time.Time`.
+
 ## Tests
 
 Each operation gets a test calling it with sample arguments. A mock transport answers it in
@@ -272,7 +292,8 @@ Methods return an `APIPromise`. `.withResponse()` gives `{ data, response, reque
 
 - Models are plain objects with camelCase properties.
 - `CustomerSerializer.parse(json)` and `.serialize(value)` convert them, keeping unknown
-  properties under their JSON names.
+  properties under their JSON names. A typed `additionalProperties` gives the model an index
+  signature.
 - With a non-default `int64`, `parseJson` and `stringifyJson` do the same for webhook payloads.
 - Enums are `const` objects with a union type of their values.
 - Tagged unions are unions of interfaces keyed by the discriminator.
@@ -684,10 +705,12 @@ with `StatusCode`, `Headers`, `RequestId` and `Value`.
 ### Models and unions
 
 - Models are `sealed record`s with `init` properties and read-only collections, compared by
-  value. Unknown properties are kept in `AdditionalProperties`.
+  value. Unknown properties are kept in `AdditionalProperties`, and read as the values a typed
+  `additionalProperties` declares with `TypedAdditionalProperties()`.
+- Dates are `DateTimeOffset`s (`DateOnly` for `format: date`): fractions beyond 100 nanoseconds
+  are rounded.
 - Nullable optional PATCH fields are `MaybeUnset<T>`: assign `null` to send `null`, leave unset
   to omit.
-- Dates are `DateTimeOffset`s: fractions beyond 100 nanoseconds are rounded.
 - Enums expose `IsKnown`. Known values are static properties (`Status.Active`) and constants in
   `Status.Values`, to `switch` on `status.Value`. A string converts to any value.
 - A union is an abstract record with a nested record per variant (`StringValue`, `Customer`,

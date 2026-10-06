@@ -26,6 +26,7 @@ const PROPERTY_ANNOTATIONS: [&str; 5] = [
 
 pub(super) fn normalize(doc: &mut Value) -> Result<()> {
     trim_descriptions(doc);
+    upgrade::each_schema(doc, &mut binary_content);
     let renames = canonicalize_refs(doc);
     upgrade::type_unions(doc);
     let root = doc.clone();
@@ -40,6 +41,26 @@ pub(super) fn normalize(doc: &mut Value) -> Result<()> {
     let tags = renames.into_iter().map(|(old, new)| (new, old)).collect();
     pin_implicit_tags(doc, &tags);
     Ok(())
+}
+
+/// Gives `format: binary` to the strings of a binary `contentMediaType` without a
+/// `contentEncoding`, or of `contentEncoding: binary` (OpenAPI 3.1 files), as 3.0 spells them.
+fn binary_content(schema: &mut Map<String, Value>) {
+    let media = schema.get("contentMediaType").and_then(Value::as_str);
+    let encoding = schema.get("contentEncoding").and_then(Value::as_str);
+    let binary_media = media.is_some_and(|media| {
+        let media = media.to_ascii_lowercase();
+        let essence = media.split(';').next().unwrap_or_default().trim();
+        !essence.starts_with("text/")
+            && !["json", "xml"]
+                .iter()
+                .any(|t| essence.ends_with(&format!("/{t}")) || essence.ends_with(&format!("+{t}")))
+    });
+    let string = schema.get("type").is_none_or(|t| t == "string");
+    let binary = encoding == Some("binary") || (binary_media && encoding.is_none());
+    if binary && string && !schema.contains_key("format") {
+        schema.insert("format".into(), "binary".into());
+    }
 }
 
 /// Strips the trailing whitespace of each line of the descriptions, which linters reject in
@@ -59,6 +80,27 @@ fn trim_descriptions(value: &mut Value) {
                             .join("\n");
                     }
                     (_, child) => trim_descriptions(child),
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Removes `format: <format>` from every schema, which types its values as plain strings.
+pub(super) fn drop_format(value: &mut Value, format: &str) {
+    match value {
+        Value::Array(items) => items.iter_mut().for_each(|item| drop_format(item, format)),
+        Value::Object(map) => {
+            if map.get("format").and_then(Value::as_str) == Some(format) {
+                map.remove("format");
+            }
+            for (key, child) in map.iter_mut() {
+                if !matches!(
+                    key.as_str(),
+                    "example" | "examples" | "default" | "enum" | "const"
+                ) {
+                    drop_format(child, format);
                 }
             }
         }
@@ -2262,6 +2304,31 @@ mod tests {
     fn normalized(mut doc: Value) -> Value {
         normalize(&mut doc).unwrap();
         doc
+    }
+
+    #[test]
+    fn binary_content_media_types_are_files() {
+        let mut doc = json!({ "properties": {
+            "file": { "type": "string", "contentMediaType": "image/png" },
+            "text": { "type": "string", "contentMediaType": "text/plain" },
+            "b64": { "type": "string", "contentMediaType": "image/png", "contentEncoding": "base64" } } });
+        upgrade::each_schema(&mut doc, &mut binary_content);
+        assert_eq!(doc["properties"]["file"]["format"], "binary");
+        assert!(doc["properties"]["text"].get("format").is_none());
+        assert!(doc["properties"]["b64"].get("format").is_none());
+    }
+
+    #[test]
+    fn dropped_formats_leave_examples_alone() {
+        let mut doc = json!({ "properties": {
+            "id": { "type": "string", "format": "uuid", "example": { "format": "uuid" } },
+            "at": { "type": "string", "format": "date-time" } } });
+        drop_format(&mut doc, "uuid");
+        assert_eq!(
+            doc["properties"]["id"],
+            json!({ "type": "string", "example": { "format": "uuid" } })
+        );
+        assert_eq!(doc["properties"]["at"]["format"], "date-time");
     }
 
     fn op(responses: Value) -> Value {

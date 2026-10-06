@@ -161,14 +161,14 @@
 
 {# Whether the C# type `ty` is a value type, which `?` makes a `Nullable<T>` of. -#}
 {% macro is_value_type(ty) -%}
-{% if ty in ["bool", "int", "long", "short", "ushort", "ulong", "float", "double", "decimal", "DateTimeOffset"] %}yes{% endif %}
+{% if ty in ["bool", "int", "long", "short", "ushort", "ulong", "float", "double", "decimal", "DateTimeOffset", "DateOnly", "Guid"] %}yes{% endif %}
 {%- endmacro %}
 
 {# The kind of the schema the JSON type `ty` names (`struct`, `string_enum`...), empty for other types. -#}
 {% macro schema_kind(ty, types={}) -%}
 {% if ty.is_schema_ref() -%}
 {% set inner = ty.inner_schema_ref_ty() -%}
-{% set target = inner or types[ty.to_csharp()] -%}
+{% set target = inner or types[ty.schema_name()] -%}
 {{ target.kind if target else "" }}
 {%- endif %}
 {%- endmacro %}

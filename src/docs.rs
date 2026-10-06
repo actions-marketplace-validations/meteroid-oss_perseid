@@ -83,11 +83,8 @@ fn example(types: &Value, resource: &str, op: &Value) -> Option<Value> {
     }
     let mut path_args = Vec::new();
     for param in op["typed_path_params"].as_array().into_iter().flatten() {
-        if !matches!(param["type"]["id"].as_str(), Some("String" | "SchemaRef")) {
-            return None;
-        }
         let name = param["name"].as_str()?;
-        path_args.push(literal(name, "string", false, text(name)));
+        path_args.push(path_literal(op, types, name, &param["type"])?);
     }
     let body = match op["request_body_kind"].as_str() {
         Some("none") => Value::Null,
@@ -146,35 +143,74 @@ fn json_body(types: &Value, op: &Value) -> Option<Value> {
         }
         let example = &field["example"];
         let id = field["type"]["id"].as_str()?;
-        let (kind, int64, value) = match id {
+        let value = match id {
             "String" => match example.as_str().filter(|s| plain_text(s)) {
-                Some(example) => ("string", false, json!(example)),
-                None => ("string", false, text(name)),
+                Some(example) => json!(example),
+                None => text(name),
             },
-            id @ ("Int16" | "UInt16" | "Int32" | "Int64" | "UInt64") => {
-                let value = example.as_i64().filter(|n| *n >= 0).unwrap_or(1);
-                ("integer", matches!(id, "Int64" | "UInt64"), json!(value))
+            "Int16" | "UInt16" | "Int32" | "Int64" | "UInt64" => {
+                json!(example.as_i64().filter(|n| *n >= 0).unwrap_or(1))
             }
-            "Bool" => ("boolean", false, json!(example.as_bool().unwrap_or(true))),
+            "Bool" => json!(example.as_bool().unwrap_or(true)),
             _ => return None,
         };
-        let mut lit = literal(name, kind, int64, value);
-        if id == "UInt64" {
-            // Java holds an unsigned 64-bit integer in a `BigInteger`.
-            lit["unsigned64"] = json!(true);
-        }
-        fields.push(lit);
+        fields.push(literal(name, id, value)?);
     }
     Some(json!({ "schema": name, "fields": fields }))
 }
 
-fn literal(name: &str, kind: &str, int64: bool, value: Value) -> Value {
+/// The argument for the path parameter `name` of type `ty`, when every language can write
+/// it as a literal: text, or a scalar sent in the `simple` style, among which the first
+/// value of a string enum of `types`.
+pub(crate) fn path_literal(op: &Value, types: &Value, name: &str, ty: &Value) -> Option<Value> {
+    let style = &op["path_styles"][name];
+    if style["type"].is_object() && style["style"] != "simple" {
+        return None;
+    }
+    let id = ty["id"].as_str()?;
+    let schema = &types[ty["name"].as_str().unwrap_or_default()];
+    let value = match id {
+        "String" | "SchemaRef" if !style["type"].is_object() => text(name),
+        "SchemaRef" if schema["kind"] == "string_enum" => {
+            let value = schema["values"]
+                .get(0)
+                .filter(|v| v.as_str().is_some_and(plain_text))?;
+            let mut lit = literal(name, "Enum", value.clone())?;
+            lit["schema"] = ty["name"].clone();
+            return Some(lit);
+        }
+        "Int16" | "UInt16" | "Int32" | "Int64" | "UInt64" => json!(1),
+        "Float" | "Double" => json!(1.5),
+        "Bool" => json!(true),
+        "Uuid" => json!("3fa85f64-5717-4562-b3fc-2c963f66afa6"),
+        "Date" => json!("2024-01-02"),
+        _ => return None,
+    };
+    literal(name, id, value)
+}
+
+/// `{name, kind, type, int64, unsigned64, value}`: `kind` is the JSON type of `value`, `type`
+/// the `FieldType` id it is passed as.
+pub(crate) fn literal(name: &str, id: &str, value: Value) -> Option<Value> {
+    let kind = match id {
+        "String" | "SchemaRef" => "string",
+        "Int16" | "UInt16" | "Int32" | "Int64" | "UInt64" => "integer",
+        "Float" | "Double" => "number",
+        "Bool" => "boolean",
+        "Uuid" => "uuid",
+        "Date" => "date",
+        "Enum" => "enum",
+        _ => return None,
+    };
     let mut map = Map::new();
     map.insert("name".into(), name.into());
     map.insert("kind".into(), kind.into());
-    map.insert("int64".into(), int64.into());
+    map.insert("type".into(), id.into());
+    map.insert("int64".into(), matches!(id, "Int64" | "UInt64").into());
+    // Java holds an unsigned 64-bit integer in a `BigInteger`.
+    map.insert("unsigned64".into(), (id == "UInt64").into());
     map.insert("value".into(), value);
-    Value::Object(map)
+    Some(Value::Object(map))
 }
 
 /// The example value of a string named `name`: its name, when a literal can hold it as is.
@@ -205,6 +241,7 @@ mod tests {
             pagination: vec![],
             reserved: Default::default(),
             names: Default::default(),
+            uuid_strings: false,
         };
         let api = crate::spec::api(&spec, &filters).unwrap();
         examples(&api)
@@ -239,7 +276,8 @@ mod tests {
         assert_eq!(stream["body"]["schema"], "CompletionRequest");
         assert_eq!(
             stream["body"]["fields"],
-            json!([{ "name": "prompt", "kind": "string", "int64": false, "value": "prompt" }])
+            json!([{ "name": "prompt", "kind": "string", "type": "String", "int64": false,
+                "unsigned64": false, "value": "prompt" }])
         );
     }
 

@@ -60,6 +60,7 @@ import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
+import java.time.LocalDate;
 import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
 import java.util.ArrayList;
@@ -232,7 +233,7 @@ public class Smoke {
                 "application/x-www-form-urlencoded|amount=100&capture=true&codes=c1,c2&expand[]=customer"
                         + "&items[0][price]=p1&items[0][quantity]=2&items[1][price]=p2&metadata[order]=7"
                         + "&shipping[address][city]=Paris&shipping[address][line1]=1 Main&statuses=a&statuses=b");
-        WireBetaSearchOptions beta = WireBetaSearchOptions.builder().limit(2).features("x,y").build();
+        WireBetaSearchOptions beta = WireBetaSearchOptions.builder().limit(2).features(List.of("x", "y")).build();
         expect(client.wire().betaSearch(beta).status(), "beta=true&limit=2|features=x,y");
         expect(client.wire().updateImage("42", Upload.of(bytes("png"))).status(), "42:image/png:png");
     }
@@ -399,12 +400,12 @@ public class Smoke {
         expect(Arrays.equals(Base64.getDecoder().decode(client.encoding().listScenariosBytes().data()), HELLO), true);
         for (ZoneOffset zone : List.of(ZoneOffset.UTC, ZoneOffset.ofHours(2), ZoneOffset.ofHoursMinutes(-5, -30))) {
             OffsetDateTime at = INSTANT.withOffsetSameInstant(zone);
-            DateBox queried = client.encoding().retrieveScenariosDatetime(at, "2024-01-02");
+            DateBox queried = client.encoding().retrieveScenariosDatetime(at, LocalDate.of(2024, 1, 2));
             expect(queried.at().toInstant(), INSTANT.toInstant());
-            expect(queried.day(), "2024-01-02");
-            DateBox posted = client.encoding().scenariosDatetime(DateBox.builder().at(at).day("2024-01-02").build());
+            expect(queried.day(), LocalDate.of(2024, 1, 2));
+            DateBox posted = client.encoding().scenariosDatetime(DateBox.builder().at(at).day(LocalDate.of(2024, 1, 2)).build());
             expect(posted.at().toInstant(), INSTANT.toInstant());
-            expect(posted.day(), "2024-01-02");
+            expect(posted.day(), LocalDate.of(2024, 1, 2));
         }
         for (String value : List.of("plain", "sp ace", "sl/ash", "q?mark", "per%cent", "ha#sh", "lit%25eral", "a+b", "héllo wörld ✓")) {
             expect(client.encoding().retrieveScenarioPath(value).status(), value);
@@ -480,7 +481,7 @@ public class Smoke {
             for (Map.Entry<Integer, Class<? extends ApiException>> entry : statusErrors.entrySet()) {
                 sentRequests.clear();
                 int code = entry.getKey();
-                ApiException error = raises(ApiException.class, () -> counted.errors().retrieveScenarioStatus(String.valueOf(code)));
+                ApiException error = raises(ApiException.class, () -> counted.errors().retrieveScenarioStatus(code));
                 expect(error.getClass(), entry.getValue());
                 expect(error.statusCode(), code);
                 JsonNode body = errorJson(error, true);
@@ -552,9 +553,9 @@ public class Smoke {
             String idempotent = scenarioId("async-idempotent");
             expect(client.retries().scenariosIdempotent(idempotent, "idem-1", Payment.builder().amount(5).build()).get().status(), "attempts=2;key=idem-1");
             expect(serverState(idempotent).get("keys"), MAPPER.readTree("[\"idem-1\",\"idem-1\"]"));
-            expect(asyncCause(client.errors().retrieveScenarioStatus("403")) instanceof PermissionDeniedException, true);
-            expect(asyncCause(client.errors().retrieveScenarioStatus("404")) instanceof NotFoundException, true);
-            expect(asyncCause(client.errors().retrieveScenarioStatus("422")) instanceof UnprocessableEntityException, true);
+            expect(asyncCause(client.errors().retrieveScenarioStatus(403)) instanceof PermissionDeniedException, true);
+            expect(asyncCause(client.errors().retrieveScenarioStatus(404)) instanceof NotFoundException, true);
+            expect(asyncCause(client.errors().retrieveScenarioStatus(422)) instanceof UnprocessableEntityException, true);
             List<String> seen = new ArrayList<>();
             Throwable gone = asyncCause(client.errors().listScenariosPagesIter().forEach(widget -> seen.add(widget.id())));
             expect(gone instanceof ConflictException, true);

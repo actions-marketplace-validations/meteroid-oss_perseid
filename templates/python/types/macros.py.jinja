@@ -159,14 +159,29 @@
     `X | None`, optional nullable `X | None | Unset` in request schemas. `ty` replaces the
     annotation of the value, such as an enum taking its literals too. -#}
 {% macro field_type(field, in_request=true, ty=none) -%}
-    {%- set ty = ty or py_type(field.type) -%}
+    {%- set ty = ty or literal_type(field) or py_type(field.type) -%}
     {%- if ty == "t.Any" or (field.required and not field.nullable) %}{{ ty }}
     {%- elif field.required or not is_tristate(field, in_request) %}{{ ty }} | None
     {%- else %}{{ ty }} | None | Unset{% endif -%}
 {%- endmacro %}
 
+{#- `t.Literal[...]` of a field of one string value, else nothing. -#}
+{% macro literal_type(field) -%}
+    {%- if field.literal is defined %}t.Literal[{{ py_str(field.literal) }}]{% endif -%}
+{%- endmacro %}
+
 {#- The annotation and default of a struct field: optional ones default to `None`, or to
     `UNSET` when `None` sends `null`. -#}
+{#- `annotation` in a class with the attributes `attrs`: an attribute `date` hides the type. -#}
+{% macro in_class(annotation, attrs) -%}
+    {{ annotation | replace_ident("date", "_datetime.date") if "date" in attrs else annotation }}
+{%- endmacro %}
+
+{#- The attribute names of `fields`. -#}
+{% macro attr_names(fields) -%}
+    {%- for field in fields %}{{ field_ident(field) }} {% endfor -%}
+{%- endmacro %}
+
 {% macro field_decl(field, in_request=true, ty=none) -%}
     {{ field_type(field, in_request, ty) }}
     {%- if not field.required %} = {% if is_tristate(field, in_request) %}UNSET{% else %}None{% endif %}{% endif -%}
@@ -210,9 +225,11 @@
 from __future__ import annotations
 
 import dataclasses
+import datetime as _datetime
 import typing as t
-from datetime import datetime
+from datetime import date, datetime
 from decimal import Decimal
+from uuid import UUID
 
 from ..serialization import {{ runtime_names | reject("equalto", "ObjectUnion") | sort | join(", ") }}
 {%- if "ObjectUnion" in runtime_names %}

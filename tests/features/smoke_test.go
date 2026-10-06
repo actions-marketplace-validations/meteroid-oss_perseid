@@ -238,7 +238,7 @@ func TestSmokeWire(t *testing.T) {
 		"application/x-www-form-urlencoded|amount=100&capture=true&codes=c1,c2&expand[]=customer"+
 			"&items[0][price]=p1&items[0][quantity]=2&items[1][price]=p2&metadata[order]=7"+
 			"&shipping[address][city]=Paris&shipping[address][line1]=1 Main&statuses=a&statuses=b")
-	beta := &WireBetaSearchOptions{Limit: Ptr[int32](2), Features: Ptr("x,y")}
+	beta := &WireBetaSearchOptions{Limit: Ptr[int32](2), Features: []string{"x", "y"}}
 	expect(t, status(wire.BetaSearch(ctx, beta)), "beta=true&limit=2|features=x,y")
 	expect(t, status(wire.UpdateImage(ctx, "42", strings.NewReader("png"))), "42:image/png:png")
 }
@@ -466,15 +466,16 @@ func TestScenarioEncoding(t *testing.T) {
 	t.Run("dates and times", func(t *testing.T) {
 		instant := time.Date(2024, 1, 2, 3, 4, 5, 250_000_000, time.UTC)
 		offset := instant.In(time.FixedZone("plus2", 2*3600))
+		day := Date{Year: 2024, Month: time.January, Day: 2}
 		for _, at := range []time.Time{instant, offset} {
-			box, err := encoding.RetrieveScenariosDatetime(ctx, at, "2024-01-02")
+			box, err := encoding.RetrieveScenariosDatetime(ctx, at, day)
 			must(t, err)
 			expect(t, box.At.Equal(instant), true)
-			expect(t, box.Day, "2024-01-02")
-			box, err = encoding.ScenariosDatetime(ctx, DateBox{At: at, Day: "2024-01-02"})
+			expect(t, box.Day, day)
+			box, err = encoding.ScenariosDatetime(ctx, DateBox{At: at, Day: day})
 			must(t, err)
 			expect(t, box.At.Equal(instant), true)
-			expect(t, box.Day, "2024-01-02")
+			expect(t, box.Day, day)
 		}
 	})
 	t.Run("path segments", func(t *testing.T) {
@@ -675,7 +676,7 @@ func TestScenarioErrors(t *testing.T) {
 		for _, code := range []int{400, 401, 403, 404, 409, 422} {
 			var requests atomic.Int32
 			client := scenarioClient(Options{Middleware: []Middleware{countRequests(&requests)}})
-			health, err := client.ErrorsAPI().RetrieveScenarioStatus(ctx, strconv.Itoa(code))
+			health, err := client.ErrorsAPI().RetrieveScenarioStatus(ctx, int32(code))
 			expect(t, health == nil, true)
 			apiErr := apiError(t, err)
 			expect(t, apiErr.StatusCode, code)

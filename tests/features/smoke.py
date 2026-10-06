@@ -7,7 +7,7 @@ import os
 import time
 import urllib.parse
 import urllib.request
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 
 from features import (
     APIConnectionError,
@@ -202,7 +202,7 @@ assert charged.status == (
 assert client.wire.create_charge(amount=1, extra_body={"note": "n"}).status == (
     "application/x-www-form-urlencoded|amount=1&note=n"
 )
-assert client.wire.beta_search(limit=2, features="x,y").status == "beta=true&limit=2|features=x,y"
+assert client.wire.beta_search(limit=2, features=["x", "y"]).status == "beta=true&limit=2|features=x,y"
 assert client.wire.update_image("42", b"png").status == "42:image/png:png"
 
 
@@ -252,10 +252,10 @@ assert raw_bytes(client.encoding.list_scenarios_bytes().data) == HELLO
 INSTANT = datetime(2024, 1, 2, 3, 4, 5, 250000, tzinfo=timezone.utc)
 for zone in (timezone.utc, timezone(timedelta(hours=2)), timezone(timedelta(hours=-5, minutes=-30))):
     at = INSTANT.astimezone(zone)
-    stamped = client.encoding.retrieve_scenarios_datetime(since=at, day="2024-01-02")
-    assert stamped.at == INSTANT and str(stamped.day) == "2024-01-02", (zone, stamped)
-    posted = client.encoding.scenarios_datetime(at=at, day="2024-01-02")
-    assert posted.at == INSTANT and str(posted.day) == "2024-01-02", (zone, posted)
+    stamped = client.encoding.retrieve_scenarios_datetime(since=at, day=date(2024, 1, 2))
+    assert stamped.at == INSTANT and stamped.day == date(2024, 1, 2), (zone, stamped)
+    posted = client.encoding.scenarios_datetime(at=at, day=date(2024, 1, 2))
+    assert posted.at == INSTANT and posted.day == date(2024, 1, 2), (zone, posted)
 for value in ("plain", "sp ace", "sl/ash", "q?mark", "per%cent", "ha#sh", "lit%25eral", "a+b", "héllo wörld ✓"):
     assert client.encoding.retrieve_scenario_path(value).status == value, value
 for value in ("plain", "sp ace", "a&b=c+d", "100%", "slash/qm?", "héllo wörld ✓"):
@@ -341,7 +341,7 @@ def count_requests(request, call_next):
 counted = Features(api_key="tok", base_url=URL, middleware=[count_requests])
 for code, kind in STATUS_ERRORS.items():
     sent.clear()
-    status_error = raises(kind, lambda: counted.errors.retrieve_scenario_status(str(code)))
+    status_error = raises(kind, lambda: counted.errors.retrieve_scenario_status(code))
     assert type(status_error) is kind and status_error.status_code == code, status_error
     assert status_error.body == Error(error=f"status {code}", code=code), status_error.body
     assert status_error.request_id == "req_mock" and len(sent) == 1, (code, len(sent))
@@ -412,7 +412,7 @@ async def main():
         )
         assert created.status == "attempts=2;key=idem-1" and server_state(idempotent)["keys"] == ["idem-1"] * 2
         for code, kind in {403: PermissionDeniedError, 404: NotFoundError, 422: UnprocessableEntityError}.items():
-            status_error = await araises(kind, client.errors.retrieve_scenario_status(str(code)))
+            status_error = await araises(kind, client.errors.retrieve_scenario_status(code))
             assert status_error.status_code == code and field(status_error.body, "code") == code, status_error
         seen = []
         try:
