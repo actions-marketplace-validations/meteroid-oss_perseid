@@ -110,8 +110,10 @@ runs:
       shell: bash
       working-directory: ${{ inputs.path }}
       env:
-        UV_PUBLISH_TOKEN: ${{ inputs.pypi-token }}
+        PYPI_TOKEN: ${{ inputs.pypi-token }}
       run: |
+        # uv skips trusted publishing whenever UV_PUBLISH_TOKEN is set, even to an empty string.
+        if [ -n "$PYPI_TOKEN" ]; then export UV_PUBLISH_TOKEN="$PYPI_TOKEN"; fi
         uv build
         uv publish --trusted-publishing automatic --check-url https://pypi.org/simple/
 
