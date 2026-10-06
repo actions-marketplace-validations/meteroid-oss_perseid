@@ -200,7 +200,7 @@ Equal(
 );
 Equal(
     "beta=true&limit=2|features=x,y",
-    (await client.Wire.BetaSearchAsync(new() { Limit = 2, Features = "x,y" })).Status
+    (await client.Wire.BetaSearchAsync(new() { Limit = 2, Features = ["x", "y"] })).Status
 );
 Equal(
     "42:image/png:png",
@@ -470,12 +470,12 @@ internal static class Scenarios
         };
         foreach (var at in spellings)
         {
-            var queried = await encoding.RetrieveScenariosDatetimeAsync(new() { Since = at, Day = "2024-01-02" });
+            var queried = await encoding.RetrieveScenariosDatetimeAsync(new() { Since = at, Day = new DateOnly(2024, 1, 2) });
             Equal(instant, queried.At);
-            Equal("2024-01-02", queried.Day);
-            var posted = await encoding.ScenariosDatetimeAsync(new DateBox { At = at, Day = "2024-01-02" });
+            Equal(new DateOnly(2024, 1, 2), queried.Day);
+            var posted = await encoding.ScenariosDatetimeAsync(new DateBox { At = at, Day = new DateOnly(2024, 1, 2) });
             Equal(instant, posted.At);
-            Equal("2024-01-02", posted.Day);
+            Equal(new DateOnly(2024, 1, 2), posted.Day);
         }
 
         foreach (
@@ -668,7 +668,7 @@ internal static class Scenarios
         {
             var capture = new Capture();
             using var counted = Make(url, capture);
-            var error = await Throws<ApiException>(() => counted.Errors.RetrieveScenarioStatusAsync($"{code}"));
+            var error = await Throws<ApiException>(() => counted.Errors.RetrieveScenarioStatusAsync(code));
             Equal(kind, error.GetType());
             Equal(code, (int)error.StatusCode);
             var body = Declared(error);

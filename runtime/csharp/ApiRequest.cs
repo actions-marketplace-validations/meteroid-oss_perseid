@@ -204,11 +204,11 @@ internal sealed class ApiRequest(HttpMethod method, string path, string operatio
     /// <summary>The cookie parameters, merged into one <c>Cookie</c> header when sending.</summary>
     public List<string> Cookies { get; } = new();
 
-    public void SetCookie(string name, string? value)
+    public void SetCookie(string name, object? value)
     {
         if (value is not null)
         {
-            Cookies.Add($"{name}={Uri.EscapeDataString(value)}");
+            Cookies.Add($"{name}={Uri.EscapeDataString(HeaderText(value))}");
         }
     }
 
@@ -229,13 +229,22 @@ internal sealed class ApiRequest(HttpMethod method, string path, string operatio
         }
     }
 
-    public void SetHeader(string name, string? value)
+    public void SetHeader(string name, object? value)
     {
         if (value is not null)
         {
-            Headers[name] = value;
+            Headers[name] = HeaderText(value);
         }
     }
+
+    /// <summary>A header or cookie value as text: a list comma-separated.</summary>
+    private static string HeaderText(object value) =>
+        value switch
+        {
+            string text => text,
+            IEnumerable items => string.Join(",", items.Cast<object?>().Where(i => i is not null).Select(i => Format(i!))),
+            _ => Format(value),
+        };
 
     public void SetJsonBody<T>(T body, JsonTypeInfo<T> typeInfo) =>
         _json = JsonSerializer.SerializeToUtf8Bytes(body, typeInfo);
@@ -329,6 +338,7 @@ internal sealed class ApiRequest(HttpMethod method, string path, string operatio
             bool b => b ? "true" : "false",
             DateTimeOffset d => d.ToString("O", CultureInfo.InvariantCulture),
             DateTime d => d.ToString("O", CultureInfo.InvariantCulture),
+            DateOnly d => d.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture),
             IFormattable f => f.ToString(null, CultureInfo.InvariantCulture),
             _ => value.ToString() ?? string.Empty,
         };

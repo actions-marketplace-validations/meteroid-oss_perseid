@@ -1,4 +1,4 @@
-{% from "types/macros.py.jinja" import arg_type, docstring, field_ident, field_type, field_decl, has_object_union, is_flat_union, named_type, py_str, py_field, py_ident, py_type, param_type, resource_module, type_refs, union_refs, union_type -%}
+{% from "types/macros.py.jinja" import arg_type, docstring, in_class, literal_type, field_ident, field_type, field_decl, has_object_union, is_flat_union, named_type, py_str, py_field, py_ident, py_type, param_type, resource_module, type_refs, union_refs, union_type -%}
 # this file is @generated
 {% if resource.subresources | length > 0 -%}
     {{ panic("resource `" ~ resource.name ~ "` has subresources, which the Python templates do not support yet") }}
@@ -73,8 +73,10 @@ import typing as t
 {%- if builtin_names %}
 import builtins
 {%- endif %}
-from datetime import datetime
+import datetime as _datetime
+from datetime import date, datetime
 from decimal import Decimal
+from uuid import UUID
 {%- set error_types = namespace(used=false) %}
 {%- if error_schemas | length > 0 %}
 {%- for op in resource.operations if op.errors | length > 0 or default_error %}
@@ -108,8 +110,11 @@ from .common import (
 {%- if resource.operations | selectattr("path_styles") | list | length > 0 %}
     encode_path_param,
 {%- endif %}
-{%- set uses = namespace(json_header=false) %}
-{%- for op in resource.operations %}{% for p in op.header_params if p.json %}{% set uses.json_header = true %}{% endfor %}{% endfor %}
+{%- set uses = namespace(json_header=false, header_value=false) %}
+{%- for op in resource.operations %}{% for p in op.header_params %}{% if p.json %}{% set uses.json_header = true %}{% else %}{% set uses.header_value = true %}{% endif %}{% endfor %}{% endfor %}
+{%- if uses.header_value %}
+    header_value,
+{%- endif %}
 {%- if uses.json_header %}
     json_header,
 {%- endif %}
@@ -169,7 +174,7 @@ class {{ resource_class_name }}{{ op.name | to_upper_camel_case }}Body:
     """Multipart form fields of `{{ op.name | to_snake_case }}`."""
 {% for required_pass in [true, false] %}
 {%- for field in op.multipart_fields if (field.required and not field.nullable) == required_pass %}
-    {{ py_field(field.name) }}: {% if field.is_file and field.is_file_list %}list[FileInput]{% elif field.is_file %}FileInput{% else %}{{ py_type(field.type) }}{% endif %}{% if not required_pass %} | None = None{% endif %}
+    {{ py_field(field.name) }}: {% if field.is_file and field.is_file_list %}list[FileInput]{% elif field.is_file %}FileInput{% else %}{{ in_class(py_type(field.type), op.multipart_fields | map(attribute="name") | map("ident", "snake", "python_field") | list) }}{% endif %}{% if not required_pass %} | None = None{% endif %}
 {%- if field.description is defined %}
     """{{ field.description }}"""
 {%- endif %}
@@ -275,15 +280,14 @@ class {{ class_name }}({{ base_class }}):
 {#- Required parameters first, for readability: they are all keyword-only. -#}
 {%- for required_pass in [true, false] %}
 {%- for f in flat_fields.list if (f.required and f.name not in defaults) == required_pass %}
-        {{ field_ident(f) }}: {{ unshadow(field_decl(f, true, arg_type(f.type, enums))) }}
+        {{ field_ident(f) }}: {{ unshadow(field_decl(f, true, literal_type(f) or arg_type(f.type, enums))) }}
         {%- if f.required and f.name in defaults %} = {{ py_str(defaults[f.name]) }}{% endif %},
 {%- endfor %}
 {%- for p in op.query_params if p.required == required_pass %}
         {{ py_ident(p.ident) }}: {{ unshadow(param_type(p)) }}{% if not p.required %} | None = None{% endif %},
 {%- endfor %}
 {%- for p in op.header_params if p.required == required_pass %}
-{%- set header_type = unshadow(py_type(p.type)) if p.json else "str" %}
-        {{ py_ident(p.ident) }}: {{ header_type }}{% if not p.required %} | None = None{% endif %},
+        {{ py_ident(p.ident) }}: {{ unshadow(py_type(p.type)) }}{% if not p.required %} | None = None{% endif %},
 {%- endfor %}
 {%- endfor %}
         {{ option("extra_headers") }}: t.Mapping[str, str] | None = None,
@@ -302,10 +306,10 @@ class {{ class_name }}({{ base_class }}):
 {%- set twin = resource.operations | selectattr("name", "equalto", op.name ~ "_stream") | selectattr("stream_property", "defined") | first %}
 {%- set skipped = op.stream_property if op.stream_property is defined else (twin.stream_property if twin else none) %}
 {%- for f in types[op.request_body_schema_name].fields if f.name == skipped and f.required %}{{ field_ident(f) }}={{ "True" if op.stream_property is defined else "False" }}, {% endfor %}){% endset %}
-{%- set json_value = "to_json_value(" ~ body_value ~ ", " ~ body_type ~ ")" %}
+{%- set json_value = "to_json_value(" ~ body_value ~ ", " ~ (body_type | replace_ident("date", "_datetime.date")) ~ ")" %}
 {%- if op.request_body_optional and op.stream_property is not defined %}{% set json_value = json_value ~ " or None" %}{% endif %}
 {%- elif body_param is not none %}
-{%- set json_value = "to_json_value(" ~ body_param ~ ", " ~ body_type ~ ")" %}
+{%- set json_value = "to_json_value(" ~ body_param ~ ", " ~ (body_type | replace_ident("date", "_datetime.date")) ~ ")" %}
 {%- endif %}
 {%- set request %}
             ApiRequest(
@@ -374,14 +378,14 @@ class {{ class_name }}({{ base_class }}):
 {%- if op.header_params | rejectattr("cookie") | list | length > 0 %}
                 header_params={
 {%- for p in op.header_params if not p.cookie %}
-                    {{ py_str(p.name) }}: {% if p.json %}json_header({{ py_ident(p.ident) }}){% else %}{{ py_ident(p.ident) }}{% endif %},
+                    {{ py_str(p.name) }}: {{ "json_header" if p.json else "header_value" }}({{ py_ident(p.ident) }}),
 {%- endfor %}
                 },
 {%- endif %}
 {%- if op.header_params | selectattr("cookie") | list | length > 0 %}
                 cookie_params={
 {%- for p in op.header_params if p.cookie %}
-                    {{ py_str(p.name) }}: {{ py_ident(p.ident) }},
+                    {{ py_str(p.name) }}: header_value({{ py_ident(p.ident) }}),
 {%- endfor %}
                 },
 {%- endif %}
@@ -470,9 +474,9 @@ class {{ class_name }}({{ base_class }}):
         {% if is_async %}async {% endif %}def fetch(page_param: {{ "str" if pg.style == "cursor" else "int" }} | None) -> {{ response_type }}:
             response = {{ await }}self._request({{ request | indent(4) }}
             )
-            return decode_response(response, {{ response_type }})
+            return decode_response(response, {{ response_type | replace_ident("date", "_datetime.date") }})
 
-        paging = {{ pg.style | capitalize }}Paging[{{ response_type }}, {{ item_type }}](
+        paging = {{ pg.style | capitalize }}Paging[{{ response_type | replace_ident("date", "_datetime.date") }}, {{ item_type | replace_ident("date", "_datetime.date") }}](
             items=lambda body: {{ accessor("body", pg["items"]) }},
 {%- if pg.has_more is defined %}
             has_more=lambda body: {{ accessor("body", pg.has_more) }},
@@ -521,10 +525,10 @@ class {{ class_name }}({{ base_class }}):
 {%- set response_schema = types[op.response_body_schema_name] if op.response_body_schema_name is defined else none %}
 {%- if op.response_body_union is defined or (response_schema and (response_schema.kind == "alias" or (response_schema.kind == "struct_enum" and is_flat_union(response_schema)))) %}
         {#- A type alias (such as a union) is not a class, so `decode_response` cannot infer its type. #}
-        decoded: {{ unshadow(return_type) }} = {{ decode }}(response, {{ response_type }})
+        decoded: {{ unshadow(return_type) | replace_ident("date", "_datetime.date") }} = {{ decode }}(response, {{ response_type | replace_ident("date", "_datetime.date") }})
         return decoded
 {%- else %}
-        return {{ decode }}(response, {{ response_type }})
+        return {{ decode }}(response, {{ response_type | replace_ident("date", "_datetime.date") }})
 {%- endif %}
 {%- endif %}
 {%- endif %}

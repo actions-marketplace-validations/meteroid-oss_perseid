@@ -340,8 +340,10 @@ import {{ sdk.java_internal_package }}.Utils;
 import java.math.BigDecimal;
 import java.math.BigInteger;
 import java.net.URI;
+import java.time.LocalDate;
 import java.time.OffsetDateTime;
 import java.util.List;
+import java.util.UUID;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
@@ -431,8 +433,10 @@ import {{ sdk.java_internal_package }}.Utils;
 import java.math.BigDecimal;
 import java.math.BigInteger;
 import java.net.URI;
+import java.time.LocalDate;
 import java.time.OffsetDateTime;
 import java.util.List;
+import java.util.UUID;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
@@ -718,15 +722,15 @@ public final class {{ resource_type_name }} {
         {#- Cookies add up into one `Cookie` header; `content: application/json` headers are JSON text. -#}
         {% set put -%}
             {% if p.cookie -%}
-            headers.add("Cookie", Utils.cookiePair({{ p.name | tojson }}, {% if p.json %}Utils.json({{ var }}){% else %}{{ var }}{% endif %}));
+            headers.add("Cookie", Utils.cookiePair({{ p.name | tojson }}, {% if p.json %}Utils.json({{ var }}){% else %}Utils.serializeQueryParam({{ var }}){% endif %}));
             {%- else -%}
-            headers.set({{ p.name | tojson }}, {% if p.json %}Utils.json({{ var }}){% else %}{{ var }}{% endif %});
+            headers.set({{ p.name | tojson }}, {% if p.json %}Utils.json({{ var }}){% else %}Utils.serializeQueryParam({{ var }}){% endif %});
             {%- endif %}
         {% endset -%}
         {% if p.required -%}
         {{ put | trim }}
         {% else -%}
-        {{ p.type.to_java() if p.json else "String" }} {{ var }} = {{ value }};
+        {{ p.type.to_java() }} {{ var }} = {{ value }};
         if ({{ var }} != null) {
             {{ put | trim }}
         }

@@ -151,8 +151,8 @@ expand[]=a&expand[]=b                         # lists with `style: deepObject`
 | List | Repeated (`?tag=a&tag=b`), comma-separated with `explode: false` |
 | `pipeDelimited`, `spaceDelimited` list | `ids=a\|b\|c`, `ids=a b c`; repeated with `explode` |
 | `content: application/json` (query, path, header) | Typed by its schema, sent as compact JSON, percent-encoded where needed |
+| Header | Typed by its schema like a query parameter: numbers, booleans, dates, enums, lists (comma-separated) |
 | Cookie | Typed like a header, sent in one `Cookie` header, percent-encoded |
-| Header list | As the caller writes it |
 | Form body property | Follows its `encoding` (`style`, `explode`) |
 
 - A path with a query of its own, such as `/responses?beta=true`, keeps it.
@@ -161,7 +161,9 @@ expand[]=a&expand[]=b                         # lists with `style: deepObject`
 
 ### Path parameters
 
-- Plain path parameters are strings. Unions of scalars are accepted.
+- A path parameter is typed like a field of the same schema: integers, numbers, booleans,
+  dates and enums (named or inline) keep their type, so a value read off a response can be
+  passed back as is. Strings and unions of scalars are text.
 - Others follow their `style` and `explode`: `label` (`.a.b`), `matrix` (`;id=a,b`), lists and
   objects (`a,b,c`, `k,v,k2,v2`, or `k=v,k2=v2` exploded).
 - Path variables the path uses without declaring them are strings.
@@ -170,6 +172,10 @@ expand[]=a&expand[]=b                         # lists with `style: deepObject`
 
 - A request body can be any JSON schema: a bare list or scalar, a boolean schema, a recursive
   alias (`Tree: array of Tree`, typed as plain JSON where an SDK cannot spell it).
+- `type: object` without properties is a map of any JSON values (`{ [key: string]: unknown }`,
+  `dict[str, t.Any]`...), `{}` any JSON value.
+- A required property of one value (`const`, or an `enum` of one value) is filled in by the
+  SDKs, and typed as that value in TypeScript (`"chat.completion"`) and Python (`t.Literal`).
 - Nullable items, map values and response bodies stay nullable. A `null` body decodes to the
   language's empty value.
 - An operation declaring both a body and a bodiless 2xx (such as `204`) returns an optional
