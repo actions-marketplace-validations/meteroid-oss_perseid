@@ -21,15 +21,19 @@ GitHub App only lends the workflows short-lived tokens, so no secret is stored.
 
 ## Quick start
 
-In the repository that holds your OpenAPI spec:
+perseid runs from the repository that holds your OpenAPI spec, so every change to the spec
+regenerates the SDKs. The SDKs can live there or in their own repositories.
 
 ```sh
-npx perseid init   # pick the languages and where the SDKs live
+npx perseid init   # pick the languages and where the SDKs live (this repo or others)
 npx perseid sync   # install the perseid App on this repository and the SDK repositories
-git add -A && git commit -m "ci: generate SDKs with perseid" && git push
 ```
 
-The push runs the `SDKs` workflow, which opens a pull request with every SDK.
+Commit and push what perseid wrote: the `SDKs` workflow then opens a pull request with every SDK.
+
+Rather keep perseid out of your API repository? Run it from a
+[separate SDKs repository](docs/ci.md#a-separate-sdks-repository) that your API repo pushes the
+spec to.
 
 The [perseid App](https://github.com/apps/perseid-sdks) has Contents and Pull requests access to
 the repositories you select. Each run
