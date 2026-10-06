@@ -22,26 +22,12 @@ case "$lang" in
   rust)
     export CARGO_TARGET_DIR="$work/target"
     cargo test --features webhooks
-    # Generates the SDK of one fixture, writes the samples of its models (`perseid samples`) and
-    # the registry of their types, then runs `cargo test`: every test of tests/sdk/rust/torture
-    # for the torture fixture, only the sample round trips for the others.
-    rust_samples() (
-      dir="$work/samples/$(basename "$1" .yaml)"
-      mkdir -p "$dir" && cd "$dir"
-      perseid init --sdks rust --spec "$1" > /dev/null && perseid generate rust > /dev/null
-      perseid samples --out samples.json > /dev/null
-      grep -q '"type_name"' samples.json || { echo "$1 has no models"; exit 0; }
-      mkdir -p rust/tests
-      python3 "$here/rust/torture/samples_registry.py" samples.json rust
-      if [ "$(basename "$1")" = torture.yaml ]; then
-        cp "$here/rust/torture/"*.rs rust/tests/ && (cd rust && cargo test)
-      else
-        cp "$here/rust/torture/samples.rs" rust/tests/ && (cd rust && cargo test --test samples)
-      fi
-    )
-    for spec in "$here/../fixtures/torture.yaml" "$here"/../fixtures/edge-*.yaml; do
-      rust_samples "$spec"
-    done
+    # The tests of tests/sdk/rust/torture run on the SDK of tests/fixtures/torture.yaml.
+    (mkdir "$work/torture" && cd "$work/torture" \
+      && perseid init --sdks rust --spec "$here/../fixtures/torture.yaml" > /dev/null \
+      && perseid generate rust > /dev/null \
+      && mkdir -p rust/tests && cp "$here/rust/torture/"*.rs rust/tests/ \
+      && cd rust && cargo test)
     # The OAuth2 client credentials tests run on the SDK of tests/fixtures/oauth.yaml.
     (mkdir "$work/oauth" && cd "$work/oauth" \
       && perseid init --sdks rust --spec "$here/../fixtures/oauth.yaml" > /dev/null \
@@ -56,37 +42,23 @@ case "$lang" in
       && mkdir -p rust/tests && cp "$here/rust/unions/"*.rs rust/tests/ \
       && cd rust && cargo test --test models --test client) ;;
   typescript)
-    # The tests generate more SDKs themselves (features, torture, realworld and, with their
-    # `perseid samples`, the sample round trips of torture and every edge fixture).
+    # The tests generate more SDKs themselves (features, torture, realworld and, with
+    # `int64 = "bigint"` and `"string"`, the round trips of torture and every edge fixture).
     npm install --no-audit --no-fund && npm run build
     FIXTURES="$here/../fixtures" node --test test/*.test.mjs ;;
   python)
     # The tests generate more SDKs themselves, with the `perseid` binary of the PATH: the torture
-    # fixture, the features fixture (client behavior) and, with their `perseid samples`, the
-    # sample round trips of torture and every edge fixture.
+    # fixture and the features fixture (client behavior).
     uv venv -q && uv pip install -q -e .
     FIXTURES="$here/../fixtures" .venv/bin/python -m unittest discover -s tests -v ;;
   go)
     go vet ./... && go test ./...
-    # Generates the SDK of one fixture, writes the samples of its models (`perseid samples`) and
-    # the registry of their types, then runs `go test`: every test of tests/sdk/go/_torture for
-    # the torture fixture, only the sample round trips for the others.
-    go_samples() (
-      dir="$work/samples/$(basename "$1" .yaml)"
-      mkdir -p "$dir" && cd "$dir"
-      perseid init --sdks go --spec "$1" > /dev/null && perseid generate go > /dev/null
-      perseid samples --out samples.json > /dev/null
-      grep -q '"type_name"' samples.json || { echo "$1 has no models"; exit 0; }
-      python3 "$here/go/_samples/samples_registry.py" samples.json go
-      if [ "$(basename "$1")" = torture.yaml ]; then
-        cp "$here/go/_torture/"*_test.go go/ && (cd go && go vet ./... && go test ./...)
-      else
-        (cd go && go test -run TestSamplesRoundTrip ./...)
-      fi
-    )
-    for spec in "$here/../fixtures/torture.yaml" "$here"/../fixtures/edge-*.yaml; do
-      go_samples "$spec"
-    done
+    # The tests of tests/sdk/go/_torture run on the SDK of tests/fixtures/torture.yaml.
+    (mkdir "$work/torture" && cd "$work/torture" \
+      && perseid init --sdks go --spec "$here/../fixtures/torture.yaml" > /dev/null \
+      && perseid generate go > /dev/null \
+      && cp "$here/go/_torture/"*_test.go go/ \
+      && cd go && go vet ./... && go test ./...)
     # The OAuth2 client credentials tests run on the SDK of tests/fixtures/oauth.yaml.
     (mkdir "$work/oauth" && cd "$work/oauth" \
       && perseid init --sdks go --spec "$here/../fixtures/oauth.yaml" > /dev/null \
@@ -111,30 +83,13 @@ test { useJUnitPlatform(); testLogging { events "passed", "skipped", "failed"; e
 GRADLE
       gradle test --no-daemon
     }
-    rm -rf _torture _samples _oauth _unions && gradle_test
+    rm -rf _torture _oauth _unions && gradle_test
     mkdir "$work/torture" && cp "$here/../fixtures/torture.yaml" "$work/torture/openapi.yaml"
     # Without servers, the client has no default base URL.
     sed -i '/^servers:/,/^paths:/{/^paths:/!d}' "$work/torture/openapi.yaml"
-    # The tests of tests/sdk/java/_torture and the sample round trips of _samples: `perseid samples`
-    # writes samples.json, which SamplesRoundTripTest decodes and encodes with the generated
-    # classes of every model.
+    # The tests of tests/sdk/java/_torture.
     (cd "$work/torture" && perseid init --sdks java && perseid generate java \
-      && perseid samples --out samples.json > /dev/null \
-      && cp -r "$here/java/_torture/." java/ && cp -r "$here/java/_samples/." java/ \
-      && cp samples.json java/ && cd java && gradle_test)
-    # Generates the SDK of one edge fixture, writes the samples of its models and runs only the
-    # sample round trips on it.
-    java_samples() (
-      dir="$work/samples/$(basename "$1" .yaml)"
-      mkdir -p "$dir" && cd "$dir"
-      perseid init --sdks java --spec "$1" > /dev/null && perseid generate java > /dev/null
-      perseid samples --out samples.json > /dev/null
-      grep -q '"type_name"' samples.json || { echo "$1 has no models"; exit 0; }
-      cp -r "$here/java/_samples/." java/ && cp samples.json java/ && cd java && gradle_test
-    )
-    for spec in "$here"/../fixtures/edge-*.yaml; do
-      java_samples "$spec"
-    done
+      && cp -r "$here/java/_torture/." java/ && cd java && gradle_test)
     # The OAuth2 client credentials tests run on the SDK of tests/fixtures/oauth.yaml.
     (mkdir "$work/oauth" && cd "$work/oauth" \
       && perseid init --sdks java --spec "$here/../fixtures/oauth.yaml" > /dev/null \
@@ -147,53 +102,14 @@ GRADLE
       && perseid generate java > /dev/null \
       && cp -r "$here/java/_unions/." java/ && cd java && gradle_test) ;;
   csharp)
-    rm -rf _torture _samples _oauth _unions && dotnet test Tests
-    # Generates the SDK of one fixture, writes the samples of its models (`perseid samples`) and runs
-    # `dotnet test` on it: every test of tests/sdk/csharp/_torture for the torture fixture, only the
-    # sample round trips for the others.
-    csharp_samples() (
-      name=$(basename "$1" .yaml)
-      dir="$work/samples/$name"
-      mkdir -p "$dir" && cd "$dir"
-      perseid init --sdks csharp --spec "$1" > /dev/null
-      # Without servers, the client has no default base URL.
-      if [ "$name" = torture ]; then sed -i '/^base_url/d' perseid.toml; fi
-      perseid generate csharp > /dev/null
-      perseid samples --out samples.json > /dev/null
-      grep -q '"type_name"' samples.json || { echo "$1 has no models"; exit 0; }
-      sdk=$(basename "$(ls csharp/*/*.csproj | grep -v '\.Tests/' | head -n 1)" .csproj)
-      if [ "$name" = torture ]; then
-        cp -r "$here/csharp/_torture/." csharp/
-      else
-        mkdir csharp/Tests
-        cat > csharp/Tests/Tests.csproj <<CSPROJ
-<Project Sdk="Microsoft.NET.Sdk">
-  <PropertyGroup>
-    <TargetFramework>net8.0</TargetFramework>
-    <Nullable>enable</Nullable>
-    <ImplicitUsings>enable</ImplicitUsings>
-    <IsPackable>false</IsPackable>
-    <IsTestProject>true</IsTestProject>
-    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
-  </PropertyGroup>
-  <ItemGroup>
-    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.8.0" />
-    <PackageReference Include="xunit" Version="2.5.3" />
-    <PackageReference Include="xunit.runner.visualstudio" Version="2.5.3" />
-  </ItemGroup>
-  <ItemGroup>
-    <Using Include="Xunit" />
-    <ProjectReference Include="../$sdk/$sdk.csproj" />
-  </ItemGroup>
-</Project>
-CSPROJ
-      fi
-      cp "$here/csharp/_samples/SamplesTests.cs" csharp/Tests/
-      cd csharp && PERSEID_SAMPLES="$dir/samples.json" PERSEID_SDK="$sdk" dotnet test Tests
-    )
-    for spec in "$here/../fixtures/torture.yaml" "$here"/../fixtures/edge-*.yaml; do
-      csharp_samples "$spec"
-    done
+    rm -rf _torture _oauth _unions && dotnet test Tests
+    # The tests of tests/sdk/csharp/_torture run on the SDK of tests/fixtures/torture.yaml, with no
+    # default base URL.
+    (mkdir "$work/torture" && cd "$work/torture" \
+      && perseid init --sdks csharp --spec "$here/../fixtures/torture.yaml" > /dev/null \
+      && sed -i '/^base_url/d' perseid.toml \
+      && perseid generate csharp > /dev/null \
+      && cp -r "$here/csharp/_torture/." csharp/ && cd csharp && dotnet test Tests)
     # The OAuth2 client credentials tests run on the SDK of tests/fixtures/oauth.yaml.
     (mkdir "$work/oauth" && cd "$work/oauth" \
       && perseid init --sdks csharp --spec "$here/../fixtures/oauth.yaml" > /dev/null \

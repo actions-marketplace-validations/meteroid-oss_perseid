@@ -58,6 +58,24 @@ decodes.
 - `tests = false`, at the top level or in a language table, leaves them out and deletes the
   generated ones.
 
+### Round trips
+
+`round_trips = true` adds a test decoding and encoding sample JSON of every model, from
+`round_trips.json`: every property set, required ones only, `null`s, each union variant and enum
+value. What comes back must be the same JSON, up to the spelling of date-times and decimals.
+
+| | Test | Samples |
+|---|---|---|
+| Rust | `tests/round_trips.rs` | `tests/round_trips.json` |
+| TypeScript | `tests/api/roundTrips.test.ts` | `tests/api/round_trips.json` |
+| Python | `tests/test_round_trips.py` | `tests/round_trips.json` |
+| Go | `round_trips_test.go` | `testdata/round_trips.json` |
+| Java | `src/test/java/.../api/RoundTripsTest.java` | `src/test/resources/.../api/round_trips.json` |
+| C# | `Acme.Tests/RoundTripsTests.cs` | `Acme.Tests/round_trips.json` |
+
+- It's off by default: the samples grow with the spec, to 19 MB for Stripe's and 25 MB for GitHub's.
+- It needs `tests`, and leaving it out deletes the generated round trips.
+
 ## Rust
 
 ### Install
@@ -202,6 +220,8 @@ const customer = await client.customers.retrieve("cus_1", { timeout: 5_000, maxR
 - The last argument of every method is `{ signal, headers, query, timeout, maxRetries, idempotencyKey }`.
 - Unions of scalars and lists are typed in query, header and path parameters.
 - `int64 = "bigint"` or `"string"` under `[typescript]` parses int64 values without losing digits.
+  With `"string"`, the int64 values of a union variant are `number | bigint`, as a string would
+  read as a string variant.
 
 ### Pagination
 
