@@ -98,7 +98,7 @@
       <text x="30" y="22.5" class="chip">C#</text></g>
   <text x="84" y="286" class="word">perseid</text>
   <text x="88" y="348" class="tag">OpenAPI in, idiomatic SDKs out.</text>
-  <text x="88" y="392" class="sub">Always in sync with your spec. No cloud, no subscription.</text>
+  <text x="88" y="392" class="sub">Always in sync with your spec, all in your CI.</text>
   <g transform="translate(86,440)">
     <rect width="232" height="46" rx="10" fill="#080b16" stroke="#232a44"/>
     <text x="20" y="29" class="cmd"><tspan fill="#8fa3e0">$</tspan> npx perseid init</text>

@@ -21,15 +21,19 @@ GitHub App only lends the workflows short-lived tokens, so no secret is stored.
 
 ## Quick start
 
-In the repository that holds your OpenAPI spec:
+perseid runs from the repository that holds your OpenAPI spec, so every change to the spec
+regenerates the SDKs. The SDKs can live there or in their own repositories.
 
 ```sh
-npx perseid init   # pick the languages and where the SDKs live
+npx perseid init   # pick the languages and where the SDKs live (this repo or others)
 npx perseid sync   # install the perseid App on this repository and the SDK repositories
-git add -A && git commit -m "ci: generate SDKs with perseid" && git push
 ```
 
-The push runs the `SDKs` workflow, which opens a pull request with every SDK.
+Commit and push what perseid wrote: the `SDKs` workflow then opens a pull request with every SDK.
+
+Rather keep perseid out of your API repository? Run it from a
+[separate SDKs repository](docs/ci.md#a-separate-sdks-repository) that your API repo pushes the
+spec to.
 
 The [perseid App](https://github.com/apps/perseid-sdks) has Contents and Pull requests access to
 the repositories you select. Each run
@@ -94,17 +98,19 @@ var pets = await petstore.Pets.ListAsync(new() { Limit = 10, Status = PetStatus.
  sdk-release.yml ─ release-please PR ← you merge ─ tag ─ publish to npm, PyPI, crates.io…
 ```
 
-`perseid init` and `perseid sync` write two workflows, with your own credentials:
+`perseid init` and `perseid sync` write three workflows, with your own credentials:
 
 - `sdks.yml` runs the `meteroid-oss/perseid` Action when the spec changes. It installs perseid
   and the pinned formatters, then runs `perseid generate --pr`, which commits the SDKs to the
   `perseid/update` branch and opens or updates one pull request per repository.
+- `sdk-ci.yml`, in each repository holding SDKs, builds each SDK and runs its tests on pull
+  requests and pushes.
 - `sdk-release.yml`, in each repository holding SDKs, runs release-please on merge and publishes
   each released SDK from the `release` environment.
 
 `sdks.yml` is pinned to the release line of the perseid that wrote it, such as
-`meteroid-oss/perseid@v0.6`: run `perseid init` again to refresh it. `sdk-release.yml` follows
-`@v0`, so it rarely changes.
+`meteroid-oss/perseid@v0.6`: run `perseid init` again to refresh it. `sdk-ci.yml` and
+`sdk-release.yml` follow `@v0`, so they rarely change.
 
 ## Where the SDKs live
 
@@ -117,7 +123,7 @@ var pets = await petstore.Pets.ListAsync(new() { Limit = 10, Status = PetStatus.
 | One SDKs repository | `repo = "acme/api-sdks"` | `acme/api-sdks`, a folder per language |
 
 - perseid never creates repositories: `gh repo create acme/api-typescript`, then `perseid sync`
-  installs the App there and commits its release workflow.
+  installs the App there and commits its CI and release workflows.
 - Spec in another repository? Run `perseid init` and `perseid sync` in the SDKs repository, then
   `npx perseid connect acme/api-sdks` in the API repository. It writes a workflow pushing the
   spec, and opens a pull request naming the API repository as the `source` of `perseid.toml`:
