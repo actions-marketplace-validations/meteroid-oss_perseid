@@ -72,9 +72,22 @@ case errors.As(err, &apiErr):
 {% if list %}
 ### Pagination
 
-A list method returns its first page, a `*Page[T, R]` such as `*@@PACKAGE_NAME@@.{{ docs.page_type(list) }}`,
-and its `...AutoPaging` twin an `*AutoPager[T]` over every item, fetching further pages on demand.
-A page holds its `Items` and its whole decoded response in `Body`, for totals and other fields:
+A list method returns its first page, a `*@@PACKAGE_NAME@@.{{ docs.page_type(list) }}`. The page embeds
+the decoded `{{ docs.body_type(list) }}` response, so its fields read directly on the page, and holds its
+`Items`; `HasNextPage()` and `NextPage(ctx)` step to the next page, nil after the last one. A
+response field named like one of these members stays reachable through the embedded response,
+`page.{{ docs.body_type(list) }}`:
+
+```go
+page, err := {{ docs.call(list) }}
+for page != nil && err == nil {
+	// {{ docs.page_field(list) }}, page.Items, page.HasNextPage()
+	page, err = page.NextPage(ctx)
+}
+```
+
+Its `...AutoPaging` twin returns an `*AutoPager[T]` over every item, fetching further pages on
+demand:
 
 ```go
 for {{ docs.var(list.item, "item") }}, err := range {{ docs.call(list, suffix="AutoPaging") }}.All() {
@@ -82,12 +95,6 @@ for {{ docs.var(list.item, "item") }}, err := range {{ docs.call(list, suffix="A
 		return err
 	}
 	fmt.Println({{ docs.var(list.item, "item") }})
-}
-
-page, err := {{ docs.call(list) }}
-for page != nil && err == nil {
-	// page.Items, page.Body, page.HasNextPage()
-	page, err = page.NextPage(ctx)
 }
 ```
 
@@ -127,7 +134,7 @@ log.Print(resp.Header.Get("X-Request-Id"))
 
 Connection errors, timeouts, 408, 429 and 5xx responses are retried twice with jittered backoff,
 honoring `Retry-After` and `retry-after-ms`, when the request is idempotent or carries an
-`Idempotency-Key` (POST requests get one). Each attempt times out after `DefaultTimeout`.
+`Idempotency-Key`. Each attempt times out after `DefaultTimeout`.
 `Options` sets them for the client (`MaxRetries`, `Timeout`), and request options for one call:
 `@@PACKAGE_NAME@@.WithMaxRetries(0)`, `@@PACKAGE_NAME@@.WithTimeout(time.Minute)`,
 `@@PACKAGE_NAME@@.WithIdempotencyKey(key)`, `@@PACKAGE_NAME@@.WithHeader(name, value)`.

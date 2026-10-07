@@ -5,7 +5,7 @@ import assert from "node:assert/strict";
 import { after, describe, it } from "node:test";
 import { generate } from "./_sdk.mjs";
 
-const { sdk, cleanup } = await generate("features.yaml", { name: "Features" });
+const { sdk, cleanup } = await generate("features.yaml", { name: "Features", idempotencyKeys: true });
 after(cleanup);
 
 const json = (body, status = 200, headers = {}) =>
@@ -349,6 +349,9 @@ describe("responses that cannot be decoded", () => {
     const first = await page.features.widgets.list();
     assert.equal(first.items[0].color, "red");
     assert.deepEqual(first.items[0].more, { deep: [null] });
+    assert.equal(first.extra, true);
+    assert.equal(first.nextCursor, null);
+    assert.equal(first.data, first.body.data);
   });
 });
 
@@ -498,5 +501,7 @@ describe("int64 values in the default number mode", () => {
       ids.push(entry.id);
     }
     assert.deepEqual(ids, ["r1", "r2", "r3"]);
+    const page = await features.records.list();
+    assert.equal(page.total, 3);
   });
 });

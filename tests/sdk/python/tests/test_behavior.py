@@ -20,7 +20,7 @@ import httpx
 
 from _support import generate_fixture, import_package, instant
 
-features = import_package(generate_fixture("features.yaml", "Features"))
+features = import_package(generate_fixture("features.yaml", "Features", settings="idempotency_keys = true\n"))
 models = features.models
 
 # Credentials and the base URL come from the arguments of the tests only.
@@ -415,6 +415,7 @@ class PaginationErrorTest(unittest.TestCase):
             self.assertEqual(body_get(raised.exception.body, "error"), "page_gone")
             self.assertEqual(len(calls), 2, "the failed page is not fetched again")
             page = api.errors.list_scenarios_pages()
+            self.assertEqual(page.next_cursor, "c2")
             self.assertTrue(page.has_next_page())
             with self.assertRaises(features.ConflictError):
                 page.get_next_page()

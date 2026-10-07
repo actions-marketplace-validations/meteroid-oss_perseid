@@ -248,7 +248,8 @@ For SDKs kept in the same repository, you can pass it to the Action by hand:
 - `token: ${{ github.token }}`, with `contents: write` and `pull-requests: write` on the job;
 - "Allow GitHub Actions to create and approve pull requests" in the repository settings;
 - `ci-workflows` listing your CI workflows, with `actions: write`. The Action dispatches them on
-  `perseid/update`, and each needs `on: workflow_dispatch`.
+  each update branch (`perseid/update`, or `perseid/update-<language>`), and each needs
+  `on: workflow_dispatch`.
 
 Dispatched runs do not show in the pull request's checks or count as required status checks
 ([GitHub docs](https://docs.github.com/en/pull-requests/how-tos/merge-and-close-pull-requests/troubleshooting-required-status-checks)).
@@ -329,7 +330,7 @@ fares, each problem with its fix.
 
 | Repository | Checks |
 |---|---|
-| SDKs repository | Secrets, workflows not yet refreshed or pushed, the last spec pushed (commit, release, age), open `perseid/update` pull requests, the last `sdks.yml` run, the App installation |
+| SDKs repository | Secrets, workflows not yet refreshed or pushed, the last spec pushed (commit, release, age), open update pull requests, the last `sdks.yml` run, the App installation |
 | API repository | The credential `perseid-push.yml` needs (the `source` of the SDKs repository, or the App's key or token), the last spec the SDKs repository received, the last `perseid-push.yml` run |
 
 - Exits with 2 when something waits on you, 1 on errors, 0 otherwise.
@@ -382,6 +383,15 @@ The Action installs the perseid matching its own ref, then:
 4. It runs `perseid generate --pr`, which commits the generated files on top of the current
    branch to `perseid/update`. It opens or updates a pull request in each repository holding
    SDKs, titled as described in [releases](#releases).
+
+   release-please tells which SDKs a commit changed from its files, of which GitHub lists the
+   first 3000. So when an update of several SDKs in one repository changes more than 2500 files
+   (a first generation, or a perseid upgrade rewriting them all), each SDK gets its own pull
+   request, from `perseid/update-<language>`, carrying the spec and release files along. Updates
+   stay split until those pull requests are merged, then share one again. An open
+   `perseid/update` pull request they replace is closed, as is the pull request of an SDK the
+   base branch already holds as generated. Each merges on its own: where branch protection
+   requires branches to be up to date, merge them one at a time or through a merge queue.
 
 | Input | Default | |
 |---|---|---|
@@ -513,8 +523,9 @@ Every SDK has its own version, in its own manifest, and is released on its own.
 
 1. `generate --pr` titles its pull request as a conventional commit sized by
    [oasdiff](https://github.com/oasdiff/oasdiff): `feat(api)!:` for breaking changes,
-   `feat(api):` for other API changes, `fix(api):` otherwise. oasdiff's changelog goes in the
-   description.
+   `feat(api):` for other API changes, `fix(api):` otherwise. Its changelog entries are nested
+   in the commit as conventional commits, and every change oasdiff finds is listed, folded, in
+   the description.
 2. Merging it, or any `fix:` or `feat:` commit touching an SDK, opens a release PR that bumps the
    touched SDKs and their changelogs. Before 1.0, breaking changes bump the minor version.
 3. Merging the release PR tags each SDK and publishes it.
@@ -525,9 +536,28 @@ Sizing the change:
   (`GITHUB_EVENT_BEFORE`, set by the Action), else the previous commit.
 - Without a previous spec, or without oasdiff, the pull request asks for a minor release.
 - `--bump major|minor|patch` skips the comparison.
-- An open pull request keeps its largest bump.
+- An open pull request keeps its largest bump, and the API changes it already lists.
+- SDKs generated for the first time get no API changes: everything in them is new.
 - `--relax-enum-additions`, on by default, counts enum values added to responses as minor
   changes. Generated SDKs accept unknown enum values, which makes this safe.
+
+The SDK changelogs name each breaking change (up to 10), then sum up the endpoints added,
+removed after deprecation and updated, naming up to 5 of each:
+
+```markdown
+### ⚠ BREAKING CHANGES
+
+* **api:** `DELETE /pets/{id}`: api path removed without deprecation
+
+### Features
+
+* **api:** add `POST /pets`
+* **api:** update `GET /pets`, `GET /owners` and 3 more
+* **api:** update SDKs to Pets 2
+```
+
+release-please reads them from the merged commit. Squash merges take them from the commit or
+the description; a squash message set to the pull request title alone drops them.
 
 Tags look like `rust/v0.4.0`, or `v0.4.0` alone in its repository. Go tags carry the module's
 folder, such as `api/go/v0.4.0`, as the module proxy expects.

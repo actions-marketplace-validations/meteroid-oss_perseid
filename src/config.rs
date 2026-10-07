@@ -51,9 +51,12 @@ pub struct Config {
     pub package: Package,
     /// API base URL the clients default to.
     pub base_url: Option<String>,
-    /// Prefix of the SDK's own headers, such as `{prefix}-idempotency-key`: the kebab-case
-    /// `name` by default.
+    /// Prefix of the SDK's own headers, such as `{prefix}-retry-count`: the kebab-case `name`
+    /// by default.
     pub header_prefix: Option<String>,
+    /// `true` when the API deduplicates POST requests by `Idempotency-Key`: the SDKs then send
+    /// one with every POST, and retry them. Otherwise only POSTs given a key are retried.
+    pub idempotency_keys: Option<bool>,
     /// Prefix of the `User-Agent` header: the kebab-case `name` by default.
     pub user_agent: Option<String>,
     /// Installs the Standard Webhooks signature verifier in every SDK.
@@ -223,6 +226,7 @@ pub struct Target {
     pub module: Option<String>,
     pub exports: Vec<String>,
     pub int64: Option<Int64>,
+    pub validate_responses: Option<bool>,
 }
 
 /// A language table: the settings every SDK takes, then the language's own.
@@ -297,6 +301,8 @@ language!(TypeScript, "npm package name: the kebab-case `name` by default." {
     exports: Vec<String>,
     /// Type of int64 values.
     int64: Option<Int64>,
+    /// `false` keeps response bodies as received, without checking them against their schema.
+    validate_responses: Option<bool>,
 });
 language!(Python, "Python package name: the snake_case `name` by default." {});
 language!(Go, "Go package name: the snake_case `name` by default." {
@@ -725,6 +731,7 @@ impl Config {
             "has_default_base_url": target.base_url.is_some() || self.base_url.is_some(),
             "user_agent_prefix": pick(&target.user_agent, &self.user_agent, &kebab),
             "header_prefix": pick(&target.header_prefix, &self.header_prefix, &kebab),
+            "idempotency_keys": self.idempotency_keys.unwrap_or(false),
             "env_prefix": self.name.to_shouty_snake_case(),
             "webhooks": target.webhooks.or(self.webhooks).unwrap_or(false),
             "tests": target.tests.or(self.tests).unwrap_or(true),
@@ -734,6 +741,7 @@ impl Config {
                 Int64::Bigint => "bigint",
                 Int64::String => "string",
             },
+            "validate_responses": target.validate_responses.unwrap_or(true),
             "version": version,
             "extra_exports": target.exports,
             "timeout": target.timeout.or(self.timeout).unwrap_or(60),
@@ -1189,6 +1197,11 @@ mod tests {
         let toml =
             "name = \"A\"\nsdks = [\"typescript\", \"python\"]\n[typescript]\nint64 = \"bigint\"\n";
         assert_eq!(context(toml, "typescript")["int64"], "bigint");
+        assert_eq!(context(toml, "typescript")["validate_responses"], true);
+        let lenient =
+            "name = \"A\"\nsdks = [\"typescript\"]\n[typescript]\nvalidate_responses = false\n";
+        assert_eq!(context(lenient, "typescript")["validate_responses"], false);
+        assert!(load("name = \"A\"\nsdks = [\"go\"]\n[go]\nvalidate_responses = false\n").is_err());
         assert!(
             load("name = \"A\"\nsdks = [\"typescript\"]\n[typescript]\nint64 = \"long\"\n")
                 .is_err()

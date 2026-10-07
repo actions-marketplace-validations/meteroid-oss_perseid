@@ -32,7 +32,9 @@ println!("{{ "{" }}{{ result }}:?}");{% else %}{{ call_of() }}.await?;{% endif %
 ```
 
 `@@CLIENT_NAME@@::from_env()?` takes the token from `@@ENV_PREFIX@@_API_KEY` and the base URL from
-`@@ENV_PREFIX@@_BASE_URL` when set. The builder also sets the timeout, retries and default headers:
+`@@ENV_PREFIX@@_BASE_URL` when set; `builder()` reads no environment variable, and
+`@@CLIENT_NAME@@Builder::from_env()` starts from them. The builder also sets the timeout, retries
+and default headers:
 
 ```rust
 let client = @@CLIENT_NAME@@::builder()
@@ -45,7 +47,7 @@ let client = @@CLIENT_NAME@@::builder()
 ```
 
 Building a client fails with `Error::Request` when it has no base URL (the API declares none and
-neither `base_url()` nor `@@ENV_PREFIX@@_BASE_URL` is set) or an invalid one.
+`base_url()` is not called) or an invalid one.
 
 Every API area hangs off the client (`{{ docs.resource(call.resource) if call else "client.items()" }}`), and `with_options` sets headers, the
 timeout, retries or the idempotency key of the calls made through it. Clients are cheap to clone
@@ -99,7 +101,7 @@ other.
 
 Connection errors, timeouts, 408, 429 and 5xx responses are retried twice with jittered
 backoff, honoring `Retry-After`, when the request is idempotent: GET, PUT, DELETE, or any request
-with an `Idempotency-Key` (POST requests get one automatically). Each attempt times out after 60
+with an `Idempotency-Key`. Each attempt times out after 60
 seconds by default.
 
 ```rust
@@ -111,23 +113,33 @@ let options = RequestOptions::new().max_retries(0).timeout(std::time::Duration::
 {% if list %}
 ## Pagination
 
-`*_iter` methods return a `Paginator`, a `futures_core::Stream` of every item that fetches pages
-on demand. `pages()` walks pages instead:
+A paginated list returns a `PageCall`. Awaited, it gives the first `Page`, which dereferences to
+the response body and lists this page's items with `items()`; `next_page()` fetches the next one.
+`items()` on the call streams every item across pages, fetching each page when needed, and
+`pages()` every page; both are `futures_core::Stream`s too:
 
 ```rust
-use futures_util::StreamExt;
-
-let mut items = {{ docs.call(list, iter=true) }};
-while let Some({{ docs.var(list.item, "item") }}) = items.next().await {
-    println!("{:?}", {{ docs.var(list.item, "item") }}?);
-}
-
-let page = {{ docs.call(list, iter=true) }}.first_page().await?;
-println!("{} items", page.items().len());
+{% set pg = list.operation.pagination -%}
+{% set shown = pg.next_cursor or pg.total_pages or pg.total or pg.has_more or pg["items"] -%}
+{% set item = docs.var(list.item, "item") -%}
+let page = {{ docs.call(list) }}.await?;
+println!("{:?}, {} items", page.{{ shown[0] | to_rust_ident }}, page.items().len());
 if let Some(next) = page.next_page().await? {
     println!("{} more", next.items().len());
 }
+
+let mut items = {{ docs.call(list) }}.items();
+while let Some({{ item }}) = items.next().await {
+    println!("{:?}", {{ item }}?);
+}
+
+let mut pages = {{ docs.call(list) }}.pages();
+while let Some(page) = pages.next().await {
+    println!("{} items", page?.items().len());
+}
 ```
+
+`into_inner()` gives a page's body, and `with_response()` the status and headers of the first page.
 {% endif %}
 {%- if stream %}
 ## Streaming

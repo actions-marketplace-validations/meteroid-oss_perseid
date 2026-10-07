@@ -8,7 +8,7 @@ Examples use an API named `Acme` with a `customers` resource. Names follow the `
 | Behavior | |
 |---|---|
 | Retries | Connection errors, timeouts, 408, 429 and 5xx, retried twice by default with jittered exponential backoff |
-| Safe retries only | Idempotent methods, or requests with an `Idempotency-Key`. Every POST gets one automatically |
+| Safe retries only | Idempotent methods, or requests with an `Idempotency-Key`. Every POST gets one automatically with [`idempotency_keys = true`](configuration.md#spec-name-and-sdks) |
 | `Retry-After` | `retry-after-ms` and `Retry-After` set the wait when at most 60 seconds, else the backoff applies |
 | Timeout | Per attempt, `timeout` of `perseid.toml` (60 seconds by default), settable per client and per call |
 | Environment | `ACME_API_KEY` for the token, `ACME_BASE_URL` for the base URL, `ACME_CLIENT_ID` and `ACME_CLIENT_SECRET` for OAuth2 client credentials |
@@ -29,12 +29,12 @@ See [features](features.md) for auth, pagination and encoding, and
 
 | | Requires | Client | Base error | Paginated list | Raw response |
 |---|---|---|---|---|---|
-| Rust | Tokio | `Acme::builder()...build()?` | `Error` | `list_iter(...)` | `.with_response()` |
+| Rust | Tokio | `Acme::builder()...build()?` | `Error` | `.items()` on `list()` | `.with_response()` |
 | TypeScript | Node.js 20+, Deno, Bun, browsers | `new Acme({ apiKey })` | `AcmeError` | `for await` on `list()` | `.withResponse()` |
 | Python | Python 3.10+ | `Acme(api_key=...)`, `AsyncAcme` | `AcmeError` | iterate `list()` | `client.with_raw_response` |
 | Go | Go 1.23+ | `acme.New(token, opts)` | `SDKError` | `ListAutoPaging(...)` | `WithResponseInto(&resp)` |
-| Java | Java 11+ | `new Acme(AcmeOptions...)` | `AcmeException` | `listIter()` | `client.withRawResponse()` |
-| C# | .NET 8 | `new AcmeClient(token)` | `AcmeException` | `ListAutoPagingAsync()` | `.WithRawResponse` |
+| Java | Java 11+ | `new Acme(AcmeOptions...)` | `AcmeException` | iterate `list()` | `client.withRawResponse()` |
+| C# | .NET 8 | `new AcmeClient(token)` | `AcmeException` | `await foreach` on `ListAsync()` | `.WithRawResponse` |
 
 ## Formats
 
@@ -119,6 +119,8 @@ let client = Acme::builder()
 ```
 
 - `Acme::new(token)` and `Acme::from_env()` are shortcuts. All three return a `Result`.
+- Only `from_env()` and `AcmeBuilder::from_env()` read the environment variables: `builder()` and
+  `new` take nothing from them.
 - The builder also takes `header`, `middleware`, `http_client`, and `connector` for any hyper
   connector (custom TLS roots, client certificates, a proxy).
 - Credentials: `token_provider`, `client_credentials(id, secret)`, `basic_auth`,
@@ -140,23 +142,33 @@ client.customers().with_options(options).list(None).await?;
 
 - Methods take path parameters, the body, then query and header parameters as an options struct.
 - Options structs are `#[non_exhaustive]`: `new(required...)`, then a setter per optional
-  parameter. When none is required, pass the struct or `None`.
+  parameter, and its `maybe_*` twin taking an `Option`. When none is required, pass the struct
+  or `None`.
+- A path parameter typed by a string schema of the spec takes `impl Into` of its newtype:
+  `retrieve("cus_1")` and `retrieve(&customer.id)` both work.
 - `with_options` on a resource sets headers, timeout, retries or idempotency key for its calls.
 - An operation that also declares a bodiless 2xx returns `Option<T>`.
 
 ### Pagination
 
 ```rust
-let mut customers = client.customers().list_iter(None);
+let page = client.customers().list(None).await?;    // the first page
+page.total;                                         // a response field, through Deref
+for customer in page.items() { ... }
+let next = page.next_page().await?;                 // None after the last page
+
+let mut customers = client.customers().list(None).items();
 while let Some(customer) = customers.next().await {
     let customer = customer?;
 }
-let page = client.customers().list_iter(None).first_page().await?;
 ```
 
-`*_iter` methods return a `Paginator`, a `futures_core::Stream` of items. `pages()` and
-`first_page()` give `Page`s with `items()`, `has_next_page()` and `next_page()`; the response
-body is reachable through `Deref`.
+- List methods return a `PageCall`. Awaited, it gives a `Page` that dereferences to the
+  response body, with `items()`, `into_items()`, `has_next_page()`, `next_page()` and
+  `into_inner()`, the body itself.
+- `.items()` is a `Paginator`, a `futures_core::Stream` of every item fetched page by page, with
+  `next()` and `collect()`; `.pages()` streams the pages; `.with_response()` gives the first
+  page with its status and headers.
 
 ### Streaming
 
@@ -188,9 +200,14 @@ match client.customers().retrieve("cus_1").await {
 - Structs keep undeclared properties in `extra` (`extra_properties` when the schema has an
   `extra` property). `allOf` parts are inlined into one struct.
 - Structs only found in responses are `#[non_exhaustive]`: build them with `new(required...)` or
-  `Default`, then assign fields. Request structs also take struct literals.
+  `Default`, then assign fields. Request structs also take struct literals, and a chainable
+  setter per field `new` leaves out: `CustomerUpdate::new().name("Ada")`.
 - `Default` is implemented when every required field has a default.
 - In PATCH bodies, nullable optional fields are `Option<Option<T>>`: `Some(None)` sends `null`.
+  Their setters wrap the value, and `clear_*()` sends `null`.
+- A named string schema, such as `CustomerId`, is a newtype over `String`: built `From` any
+  string, read as `&str` through `Deref`, `as_str()` or `Display`, compared with strings. One ID
+  type cannot be passed where another is expected.
 - Recursive fields are boxed. Dates are `chrono` types.
 - Enums and unions are `#[non_exhaustive]`, with an `Unknown` variant that serializes back
   unchanged.
@@ -248,10 +265,14 @@ const customer = await client.customers.retrieve("cus_1", { timeout: 5_000, maxR
 ```ts
 for await (const customer of client.customers.list({ perPage: 100 })) { ... }
 const page = await client.customers.list();
+page.total;                                       // a response field, read on the page
+page.items; page.hasNextPage(); await page.getNextPage();
 ```
 
-List methods return a `PagePromise`. A `Page` has `items`, `body`, `hasNextPage()`,
-`getNextPage()` and `iterPages()`.
+- List methods return a `PagePromise`: await it for the first page, or `for await` every item.
+- A `Page<Body, Item>` has the response's properties, typed, with `items`, `hasNextPage()`,
+  `getNextPage()`, `iterPages()`, `body` (the response as decoded) and `response` (the HTTP
+  response). `JSON.stringify(page)` writes the body.
 
 ### Streaming
 
@@ -281,7 +302,7 @@ try {
 | `BadRequestError`, `AuthenticationError`, `PermissionDeniedError`, `NotFoundError`, `ConflictError`, `UnprocessableEntityError`, `RateLimitError`, `InternalServerError` | 400, 401, 403, 404, 409, 422, 429, 5xx |
 | `APIConnectionError`, `APIConnectionTimeoutError` | No response, or none within the timeout |
 | `APIUserAbortError` | The `signal` aborted |
-| `APIDecodeError` | A 2xx body that is not valid JSON or the expected event stream |
+| `APIDecodeError` | A 2xx body that is not valid JSON, not the expected event stream, or not what its schema describes |
 
 ### Raw responses
 
@@ -294,6 +315,10 @@ Methods return an `APIPromise`. `.withResponse()` gives `{ data, response, reque
 - `CustomerSerializer.parse(json)` and `.serialize(value)` convert them, keeping unknown
   properties under their JSON names. A typed `additionalProperties` gives the model an index
   signature.
+- Parsing checks values against their schema: a wrong type, or a required property missing
+  or `null`, throws an `APIDecodeError` naming its path (`$.items[3].total: expected a number,
+  got string "abc"`). Unknown properties, unknown enum values and values no union variant holds
+  are kept. `validate_responses = false` under `[typescript]` turns the checks off.
 - With a non-default `int64`, `parseJson` and `stringifyJson` do the same for webhook payloads.
 - Enums are `const` objects with a union type of their values.
 - Tagged unions are unions of interfaces keyed by the discriminator.
@@ -356,12 +381,17 @@ client.customers.retrieve("cus_1", timeout=5.0, max_retries=0)
 
 ```python
 for customer in client.customers.list(per_page=100): ...
-page = client.customers.list()          # page.items, page.body, page.has_next_page(), page.get_next_page()
+page = client.customers.list()          # CustomersListPage, a CustomerList
+page.total                              # a response field, read on the page
+page.items, page.has_next_page(), page.get_next_page()
 async for customer in async_client.customers.list(): ...
 ```
 
-List methods return a `SyncPage`, iterated item by item; `iter_pages()` walks the pages. The
-async client returns an `AsyncPaginator`: `await` it for the first page, or `async for` the items.
+- List methods return the first page, such as `CustomersListPage`: a subclass of the response
+  model with `items`, `has_next_page()`, `get_next_page()`, `iter_pages()` and `body`, the
+  response as decoded. Iterating it yields every item, fetching pages on demand.
+- The async client returns an `AsyncPaginator`: `await` it for an `AsyncCustomersListPage`, or
+  `async for` the items.
 
 ### Streaming
 
@@ -464,12 +494,15 @@ customer, err := client.Customers().Retrieve(ctx, "cus_1", acme.WithMaxRetries(0
 ### Pagination
 
 ```go
+page, err := client.Customers().List(ctx, nil) // *CustomersListPage
+page.Total                                     // a response field, promoted
+page.Items; page.HasNextPage(); page, err = page.NextPage(ctx)
 for customer, err := range client.Customers().ListAutoPaging(ctx, nil).All() { ... }
-page, err := client.Customers().List(ctx, nil) // page.Items, page.Body, page.HasNextPage(), page.NextPage(ctx)
 ```
 
-- List methods return a page, such as `*CustomersListPage`, an alias of `*Page[Customer, *CustomerList]`.
-- `Body` is the whole typed response, for totals.
+- List methods return a page, such as `*CustomersListPage`, that embeds the response
+  (`page.CustomerList`) with `Items`, `HasNextPage()` and `NextPage(ctx)`, nil after the last
+  page. `json.Marshal(page)` writes the response.
 - The `ListAutoPaging` twin returns an `*AutoPager[Customer]`: `range pager.All()`, or
   `Next()`, `Current()` and `Err()`.
 
@@ -497,6 +530,8 @@ case errors.As(err, &apiErr):
 
 - Every error is an `SDKError`: `*APIError`, `*TimeoutError`, `*TransportError` (no
   response), `*DecodeError`, `*RequestError`.
+- `*DecodeError` also covers a 2xx body missing a required property, or holding it as `null`
+  when it is not nullable: it is not decoded as the zero value.
 - `errors.Is` tests the status: `ErrNotFound`, `ErrUnauthorized`, `ErrRateLimited`, `ErrServer`...
 - `APIError.Body` holds the body decoded as the declared error schema, else plain JSON.
 - `ErrorBody[T](err)` decodes it as any schema, `APIError.Detail()` as the API-wide one.
@@ -574,12 +609,17 @@ var customer = client.customers().retrieve("cus_1",
 ### Pagination
 
 ```java
-for (Customer customer : client.customers().listIter()) { ... }
-Page<Customer> page = client.customers().listIter().firstPage(); // items(), hasNextPage(), nextPage()
+for (Customer customer : client.customers().list()) { ... }
+CustomersListPage page = client.customers().list();
+page.total();                                   // a response property, read on the page
+page.items(); page.hasNextPage(); page.nextPage();
 ```
 
-`...Iter` methods return a `Paginator`: `Iterable`, `stream()`, `firstPage()`, `pages()`. The
-async client returns an `AsyncPaginator` with `forEach` and `toList`.
+- List methods return the first page, such as `CustomersListPage`: a getter per response
+  property, `items()`, `hasNextPage()`, `nextPage()`, `pages()` and `body()`, the response as
+  decoded. It is `Iterable` over every item, fetching pages on demand, and has `stream()`.
+- The async client returns a `CompletableFuture<CustomersListAsyncPage>`, whose `nextPage()`
+  is a future too, with `forEach`, `forEachPage` and `toList`.
 
 ### Streaming
 
@@ -668,12 +708,18 @@ await client.Customers.RetrieveAsync("cus_1",
 ### Pagination
 
 ```csharp
-await foreach (var customer in client.Customers.ListAutoPagingAsync(new() { PerPage = 100 })) { ... }
-var page = await client.Customers.ListAutoPagingAsync().GetFirstPageAsync();
+await foreach (var customer in client.Customers.ListAsync(new() { PerPage = 100 })) { ... }
+var page = await client.Customers.ListAsync();   // CustomersListPage
+page.Total;                                      // a response property, read on the page
+page.Items; page.HasNextPage; await page.GetNextPageAsync();
 ```
 
-`AsyncPager` gives pages through `AsPagesAsync()` and `GetFirstPageAsync()`. A `Page` has
-`Items`, `Response`, `HasNextPage` and `GetNextPageAsync()`.
+- List methods return an `AsyncPager`: `await` it for the first page, or `await foreach` every
+  item; `AsPagesAsync()` walks the pages. The cancellation token applies to every request.
+- A page, such as `CustomersListPage`, has a property per response property, `Items`,
+  `HasNextPage`, `GetNextPageAsync()`, `AsPagesAsync()` and `Body`, the response as decoded.
+  `await foreach` over it yields every item from this page on.
+- `WithRawResponse` lists return the response of one request, with its status and headers.
 
 ### Streaming
 

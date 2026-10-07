@@ -46,8 +46,12 @@
       ]
     },
     "header_prefix": {
-      "description": "Prefix of the SDK's own headers, such as `{prefix}-idempotency-key`: the kebab-case `name` by default.",
+      "description": "Prefix of the SDK's own headers, such as `{prefix}-retry-count`: the kebab-case `name` by default.",
       "type": "string"
+    },
+    "idempotency_keys": {
+      "description": "`true` when the API deduplicates POST requests by `Idempotency-Key`: the SDKs then send one with every POST, and retry them. Otherwise only POSTs given a key are retried.",
+      "type": "boolean"
     },
     "internal": {
       "description": "Also generates the operations marked `x-internal: true`.",
@@ -842,6 +846,11 @@
         "user_agent": {
           "description": "Prefix of this SDK's `User-Agent` header, over the top-level one.",
           "type": "string"
+        },
+        "validate_responses": {
+          "description": "`false` keeps response bodies as received, without checking them against their schema.",
+          "default": null,
+          "type": "boolean"
         },
         "webhooks": {
           "description": "Installs the Standard Webhooks signature verifier, over the top-level setting.",
