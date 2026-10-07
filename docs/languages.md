@@ -8,7 +8,7 @@ Examples use an API named `Acme` with a `customers` resource. Names follow the `
 | Behavior | |
 |---|---|
 | Retries | Connection errors, timeouts, 408, 429 and 5xx, retried twice by default with jittered exponential backoff |
-| Safe retries only | Idempotent methods, or requests with an `Idempotency-Key`. Every POST gets one automatically |
+| Safe retries only | Idempotent methods, or requests with an `Idempotency-Key`. Every POST gets one automatically with [`idempotency_keys = true`](configuration.md#spec-name-and-sdks) |
 | `Retry-After` | `retry-after-ms` and `Retry-After` set the wait when at most 60 seconds, else the backoff applies |
 | Timeout | Per attempt, `timeout` of `perseid.toml` (60 seconds by default), settable per client and per call |
 | Environment | `ACME_API_KEY` for the token, `ACME_BASE_URL` for the base URL, `ACME_CLIENT_ID` and `ACME_CLIENT_SECRET` for OAuth2 client credentials |
@@ -119,6 +119,8 @@ let client = Acme::builder()
 ```
 
 - `Acme::new(token)` and `Acme::from_env()` are shortcuts. All three return a `Result`.
+- Only `from_env()` and `AcmeBuilder::from_env()` read the environment variables: `builder()` and
+  `new` take nothing from them.
 - The builder also takes `header`, `middleware`, `http_client`, and `connector` for any hyper
   connector (custom TLS roots, client certificates, a proxy).
 - Credentials: `token_provider`, `client_credentials(id, secret)`, `basic_auth`,
@@ -140,7 +142,10 @@ client.customers().with_options(options).list(None).await?;
 
 - Methods take path parameters, the body, then query and header parameters as an options struct.
 - Options structs are `#[non_exhaustive]`: `new(required...)`, then a setter per optional
-  parameter. When none is required, pass the struct or `None`.
+  parameter, and its `maybe_*` twin taking an `Option`. When none is required, pass the struct
+  or `None`.
+- A path parameter typed by a string schema of the spec takes `impl Into` of its newtype:
+  `retrieve("cus_1")` and `retrieve(&customer.id)` both work.
 - `with_options` on a resource sets headers, timeout, retries or idempotency key for its calls.
 - An operation that also declares a bodiless 2xx returns `Option<T>`.
 
@@ -188,9 +193,14 @@ match client.customers().retrieve("cus_1").await {
 - Structs keep undeclared properties in `extra` (`extra_properties` when the schema has an
   `extra` property). `allOf` parts are inlined into one struct.
 - Structs only found in responses are `#[non_exhaustive]`: build them with `new(required...)` or
-  `Default`, then assign fields. Request structs also take struct literals.
+  `Default`, then assign fields. Request structs also take struct literals, and a chainable
+  setter per field `new` leaves out: `CustomerUpdate::new().name("Ada")`.
 - `Default` is implemented when every required field has a default.
 - In PATCH bodies, nullable optional fields are `Option<Option<T>>`: `Some(None)` sends `null`.
+  Their setters wrap the value, and `clear_*()` sends `null`.
+- A named string schema, such as `CustomerId`, is a newtype over `String`: built `From` any
+  string, read as `&str` through `Deref`, `as_str()` or `Display`, compared with strings. One ID
+  type cannot be passed where another is expected.
 - Recursive fields are boxed. Dates are `chrono` types.
 - Enums and unions are `#[non_exhaustive]`, with an `Unknown` variant that serializes back
   unchanged.
