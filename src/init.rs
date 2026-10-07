@@ -237,7 +237,7 @@ fn packages(config: &Config) -> Result<String> {
         names.push(match sdk.language {
             "typescript" => format!("npm {}", text("npm_package")),
             "python" => format!("PyPI {}", text("package_name")),
-            "rust" => format!("crates.io {}", text("rust_crate")),
+            "rust" => format!("crates.io {}", text("package_name")),
             "go" => format!("Go {}", text("go_module")),
             "java" => format!("Maven {}", text("java_package")),
             _ => format!("NuGet {}", text("package_name")),
@@ -264,15 +264,17 @@ fn next_steps(config: &Config, root: &Path) {
         None => "Preview the SDKs: `perseid generate --out /tmp/sdks`".to_owned(),
     }];
     if !remote.is_empty() {
-        let create: Vec<String> = remote
-            .iter()
-            .map(|r| format!("`gh repo create {r} --private`"))
-            .collect();
-        let noun = match create.len() {
-            1 => "repository",
-            _ => "repositories",
+        let all: Vec<&str> = remote.iter().copied().collect();
+        let (noun, command) = match all.as_slice() {
+            [one] => ("repository", format!("gh repo create {one} --public")),
+            _ => (
+                "repositories",
+                format!("echo {} | xargs -n1 gh repo create --public", all.join(" ")),
+            ),
         };
-        steps.push(format!("Create the SDK {noun}: {}", create.join(", ")));
+        steps.push(format!(
+            "Create the SDK {noun} (--private instead keeps them private):\n       {command}"
+        ));
     }
     steps.push(format!(
         "Run `perseid sync`: it installs the perseid App on {}, so the workflows open pull requests with nothing stored{}.

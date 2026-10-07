@@ -43,6 +43,9 @@ pub struct Config {
     pub repo: Option<String>,
     /// `false` leaves out the release-please files and the release workflow `perseid init` writes.
     pub release: Option<bool>,
+    /// `true` makes `sdks.yml` enable auto-merge on the SDK pull requests, and on the release PRs
+    /// they lead to: SDKs whose tests pass are merged and released unattended.
+    pub auto_merge: Option<bool>,
     /// Package metadata written into the manifests `perseid generate` creates.
     #[serde(default, rename = "metadata")]
     pub package: Package,
@@ -1129,6 +1132,14 @@ mod tests {
         let typescript = context(toml, "typescript");
         assert_eq!(typescript["npm_package"], "acme-api");
         assert_eq!(context(toml, "python")["package_name"], "acme_api");
+        let rust = context(
+            "name = \"acme\"\nsdks = [\"rust\"]\n[rust]\npackage = \"acme-rs\"\n",
+            "rust",
+        );
+        assert_eq!(
+            (&rust["package_name"], &rust["rust_crate"]),
+            (&"acme-rs".into(), &"acme_rs".into())
+        );
         let error = load("spec = \"s\"\nname = \"3d API\"\n").err().unwrap();
         assert!(
             format!("{error:#}").contains("must start with a letter"),

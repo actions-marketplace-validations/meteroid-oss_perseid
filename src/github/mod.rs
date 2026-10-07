@@ -236,6 +236,8 @@ pub struct Workflow<'a> {
     pub daily: Option<&'a str>,
     /// Skips generating until this file exists.
     pub requires: Option<&'a str>,
+    /// Enables auto-merge on the pull requests.
+    pub auto_merge: bool,
 }
 
 /// `meteroid-oss/perseid`, or its `action` folder, at the tag of this binary's release line:
@@ -270,10 +272,13 @@ pub fn workflow(w: &Workflow) -> String {
         "" => String::new(),
         dir => format!("          working-directory: {dir}\n"),
     };
+    let auto_merge = if w.auto_merge {
+        "          auto-merge: true\n"
+    } else {
+        ""
+    };
     format!(
-        r#"# Written by `perseid init`: regenerates the SDKs when the spec changes and opens their pull
-# requests as the perseid App, else the GitHub App set up by `perseid app` or the SDK_GITHUB_TOKEN
-# secret.
+        r#"# Written by `perseid init`: regenerates the SDKs when the spec changes.
 name: SDKs
 
 on:
@@ -297,7 +302,7 @@ jobs:
           token: ${{{{ secrets.SDK_GITHUB_TOKEN }}}}
           app-id: ${{{{ vars.SDK_APP_ID }}}}
           app-private-key: ${{{{ secrets.SDK_APP_PRIVATE_KEY }}}}
-{dir}"#,
+{auto_merge}{dir}"#,
         branch = w.branch,
     )
 }
@@ -361,7 +366,7 @@ pub fn publishing(config: &Config, hub: &str) -> Result<Vec<String>> {
                 text("package_name")
             ),
             "rust" => {
-                let name = text("rust_crate");
+                let name = text("package_name");
                 format!(
                     "crates.io: publish {name} once with a CARGO_REGISTRY_TOKEN secret on {repo}, then add {repo} as its trusted publisher at https://crates.io/crates/{name}/settings and delete the token"
                 )
@@ -371,7 +376,7 @@ pub fn publishing(config: &Config, hub: &str) -> Result<Vec<String>> {
                 text("java_package")
             ),
             "csharp" => format!(
-                "NuGet: add a NUGET_API_KEY secret to {repo}, from https://www.nuget.org/account/apikeys"
+                "NuGet: add {repo} as a trusted publisher at https://www.nuget.org/account/trustedpublishing, then a NUGET_USER variable to {repo} naming the nuget.org user or organization owning that policy"
             ),
             _ => format!("Go: nothing, the tags of {repo} publish through the module proxy"),
         });
@@ -403,6 +408,7 @@ mod tests {
             dir: "api",
             daily: None,
             requires: None,
+            auto_merge: false,
         });
         assert!(
             yaml.contains("paths: [\"api/openapi.json\",\"api/perseid.toml\"]"),
@@ -434,6 +440,7 @@ mod tests {
             dir: "",
             daily: Some("acme/api-sdks"),
             requires: Some("openapi.json"),
+            auto_merge: false,
         });
         assert!(yaml.contains("  schedule:\n    - cron: '"), "{yaml}");
         assert!(
@@ -454,5 +461,25 @@ mod tests {
             "{yaml}"
         );
         assert!(!yaml.contains("create-github-app-token"), "{yaml}");
+        assert!(!yaml.contains("auto-merge"), "{yaml}");
+    }
+
+    #[test]
+    fn auto_merge_is_written_into_the_workflow() {
+        let paths = ["openapi.json".to_owned()];
+        let yaml = workflow(&Workflow {
+            branch: "main",
+            paths: &paths,
+            dir: "api",
+            daily: None,
+            requires: None,
+            auto_merge: true,
+        });
+        assert!(
+            yaml.ends_with(
+                "app-private-key: ${{ secrets.SDK_APP_PRIVATE_KEY }}\n          auto-merge: true\n          working-directory: api\n"
+            ),
+            "{yaml}"
+        );
     }
 }

@@ -537,8 +537,8 @@ folder, such as `api/go/v0.4.0`, as the module proxy expects.
 | Registry | Credential |
 |---|---|
 | npm, PyPI, crates.io | Trusted publishing (OIDC) |
+| NuGet | Trusted publishing (OIDC), with a `NUGET_USER` variable naming the policy's owner, or a `NUGET_API_KEY` secret |
 | Maven Central | A Central Portal token and a GPG key |
-| NuGet | An API key |
 | Go | The module proxy, nothing to set up |
 
 Versions already on the registry are skipped, so re-running a failed job is safe. `perseid init`
@@ -579,7 +579,8 @@ no CI unless dispatched, and auto-merged release PRs publish nothing.
 
 `--auto-merge` (`auto-merge: true`) enables GitHub auto-merge (squash) on the SDK pull requests.
 It also labels them `perseid:auto-release`, so the release action auto-merges the release PR they
-lead to. It needs:
+lead to. `auto_merge = true` in `perseid.toml` makes `perseid init` write it into `sdks.yml`. It
+needs:
 
 - "Allow auto-merge" in the repository settings;
 - required status checks, through branch protection or rulesets. Without any, GitHub merges at
