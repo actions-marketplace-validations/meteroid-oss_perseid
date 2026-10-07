@@ -164,7 +164,7 @@ signs in with `GH_TOKEN`, `GITHUB_TOKEN`, the token `gh` stores, or a browser lo
 perseid reads OpenAPI 3.0, 3.1 and 3.2, in JSON or YAML. Convert Swagger 2.0 first, for example with
 `npx swagger2openapi`.
 
-It generates the [Meteroid SDKs](https://github.com/meteroid-oss/meteroid-clients). SDKs from the
+It generates the [Meteroid SDKs](https://github.com/search?q=org%3Ameteroid-oss+sdk&type=repositories). SDKs from the
 Stripe, GitHub, OpenAI, Twilio, DigitalOcean and Linode specs compile in every language, with one
 operation excluded on Stripe and on OpenAI.
 
