@@ -154,6 +154,157 @@ fn without_a_spec_init_points_to_connect_and_generate_previews() {
 }
 
 #[test]
+fn init_from_stainless_maps_targets_pagination_and_method_names() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::copy(
+        "tests/fixtures/stainless-openapi.yaml",
+        dir.path().join("openapi.yaml"),
+    )
+    .unwrap();
+    fs::copy(
+        "tests/fixtures/stainless.yml",
+        dir.path().join("stainless.yml"),
+    )
+    .unwrap();
+    let (ok, out) = perseid(dir.path(), &["init", "--from", "openapi.yaml"]);
+    assert!(!ok && out.contains("pass it as --spec"), "{out}");
+    let (ok, out) = perseid(dir.path(), &["init", "--from", "stainless.yml"]);
+    assert!(ok, "{out}");
+    let config = fs::read_to_string(dir.path().join("perseid.toml")).unwrap();
+    for expected in [
+        "spec = \"openapi.yaml\"\nname = \"Knock\"\nsdks = [\"typescript\", \"python\", \"go\"]\nbase_url = \"https://api.knock.app\"\nidempotency_keys = true\nexclude = [\"notify\"]\n",
+        "license = \"Apache-2.0\"\nhomepage = \"https://docs.knock.app\"\nauthors = [\"knock <support@knock.app>\"]\n",
+        "[methods]\naddAudienceMembers = \"add_members\"\narchiveMessage = \"mark_as_archived\"\ngetUser = \"get\"\n\n",
+        "# entries_cursor\ncursor = \"after\"\nitems = \"entries\"\nnext_cursor = \"page_info.after\"\n",
+        "# items_cursor\ncursor = \"after\"\nitems = \"items\"\nnext_cursor = \"page_info.after\"\n",
+        "[typescript]\npackage = \"@knocklabs/node\"\nrepo = \"knocklabs/knock-node\"\n",
+        "[python]\npackage = \"knockapi\"\nrepo = \"knocklabs/knock-python\"\nexclude = [\"listAudienceMembers\"]\n",
+    ] {
+        assert!(config.contains(expected), "{expected}\n---\n{config}");
+    }
+    assert!(
+        !config.contains("env_prefix") && !config.contains("timeout"),
+        "{config}"
+    );
+    assert!(
+        out.contains(
+            "Knock SDKs: knocklabs/knock-node, knocklabs/knock-python, knocklabs/knock-go"
+        ),
+        "{out}"
+    );
+    for skipped in [
+        "targets.ruby: perseid generates no Ruby SDK",
+        "targets.{go,python,typescript}.staging_repo: ",
+        "client_settings.opts.branch: perseid clients take no custom options: send `X-Knock-Branch`",
+        "pagination.entries_cursor.request.before: previous_cursor_param",
+        "pagination.slack_channels_cursor: `query_options.cursor` is a nested parameter",
+        "resources.*.models: perseid names types after their schema, without resource namespaces: MessageSchedule is Schedule",
+        "resources.users.list_schedules: `paginated: false`",
+        "resources.users.feeds (1 method): nested resource: perseid has one level of resources, named after the operations' first tag: users.retrieve_feed",
+        "readme: ",
+    ] {
+        assert!(
+            out.contains(&format!("  - {skipped}")),
+            "{skipped}\n---\n{out}"
+        );
+    }
+    let args = [
+        "generate",
+        "--no-format",
+        "--out",
+        "sdks",
+        "typescript",
+        "python",
+    ];
+    let (ok, out) = perseid(dir.path(), &args);
+    assert!(ok, "{out}");
+    let api = fs::read_to_string(dir.path().join("sdks/typescript/api.md")).unwrap();
+    assert!(
+        api.contains("client.users.get(userId: string)")
+            && api.contains("client.messages.markAsArchived(")
+            && api.contains("client.users.list(options?: UsersListOptions): PagePromise<")
+            && !api.contains("/v1/notify"),
+        "{api}"
+    );
+    let audiences =
+        fs::read_to_string(dir.path().join("sdks/python/knockapi/api/audiences.py")).unwrap();
+    assert!(
+        audiences.contains("def add_members(") && !audiences.contains("def list_members("),
+        "{audiences}"
+    );
+}
+
+#[test]
+fn init_from_a_stainless_config_written_for_another_spec_warns_and_keeps_its_operations() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::copy(
+        "tests/fixtures/stainless-openapi.yaml",
+        dir.path().join("openapi.yaml"),
+    )
+    .unwrap();
+    let config = fs::read_to_string("tests/fixtures/stainless.yml").unwrap();
+    let stale = config
+        .replace(" /v1/", " /v2/")
+        .replace("post /v2/notify", "post /v1/notify");
+    fs::write(dir.path().join("stainless.yml"), stale).unwrap();
+    let (ok, out) = perseid(dir.path(), &["init", "--from", "stainless.yml"]);
+    assert!(ok, "{out}");
+    assert!(
+        out.contains("! only 0 of the 13 endpoints of stainless.yml are operations of the spec"),
+        "{out}"
+    );
+    let config = fs::read_to_string(dir.path().join("perseid.toml")).unwrap();
+    assert!(config.contains("exclude = [\"notify\"]\n"), "{config}");
+}
+
+#[test]
+fn init_from_a_stainless_config_without_its_spec_lists_what_needs_one() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::copy(
+        "tests/fixtures/stainless-legacy.yml",
+        dir.path().join("openapi.stainless.yml"),
+    )
+    .unwrap();
+    let args = [
+        "init",
+        "--from",
+        "openapi.stainless.yml",
+        "--sdks",
+        "typescript,go,java",
+    ];
+    let (ok, out) = perseid(dir.path(), &args);
+    assert!(ok, "{out}");
+    let config = fs::read_to_string(dir.path().join("perseid.toml")).unwrap();
+    for expected in [
+        "spec = \"openapi.json\"\nname = \"OnebusawaySDK\"\nsdks = [\"typescript\", \"go\", \"java\"]\nbase_url = \"https://api.pugetsound.onebusaway.org\"\ntimeout = 120\n",
+        "[context]\nenv_prefix = \"ONEBUSAWAY\"\n",
+        "# page\npage = \"page\"\nitems = \"list\"\ntotal_pages = \"total_pages\"\n",
+        "[typescript]\npackage = \"onebusaway-sdk\"\nrepo = \"OneBusAway/js-sdk\"\n",
+        "[go]\npackage = \"onebusaway\"\nrepo = \"OneBusAway/go-sdk\"\nmodule = \"github.com/OneBusAway/go-sdk/v2\"\n",
+        "[java]\npackage = \"org.onebusaway\"\n",
+    ] {
+        assert!(config.contains(expected), "{expected}\n---\n{config}");
+    }
+    for skipped in [
+        "targets.python: left out by --sdks",
+        "targets.kotlin: perseid generates no Kotlin SDK",
+        "client_settings.default_retries.max_retries: perseid retries twice",
+        "environments.sandbox: perseid clients have one default base URL",
+        "query_settings.array_format: ",
+        "pagination.next_url: perseid has no pagination by next-page URL",
+        "resources: method names and the operations stainless.yml leaves out need the spec",
+        "security_schemes: perseid reads them from the spec",
+    ] {
+        assert!(
+            out.contains(&format!("  - {skipped}")),
+            "{skipped}\n---\n{out}"
+        );
+    }
+    let (ok, out) = perseid(dir.path(), &["init", "--from", "openapi.stainless.yml"]);
+    assert!(!ok && out.contains("perseid.toml already exists"), "{out}");
+}
+
+#[test]
 fn generate_is_idempotent_and_check_detects_drift() {
     let dir = project();
     let (ok, out) = perseid(dir.path(), &["generate", "--no-format"]);
@@ -492,18 +643,36 @@ fn openapi_3_0_generates_the_same_sdks_as_the_3_1_equivalent() {
 }
 
 #[test]
-fn swagger_2_still_gets_a_perseid_toml_and_a_hint() {
+fn swagger_2_specs_are_converted_in_memory() {
     let dir = tempfile::tempdir().unwrap();
-    fs::write(dir.path().join("openapi.yaml"), "swagger: '2.0'\n").unwrap();
-    let (ok, out) = perseid(dir.path(), &["init", "--sdks", "rust"]);
+    fs::copy(
+        "tests/fixtures/petstore-swagger2.json",
+        dir.path().join("swagger.json"),
+    )
+    .unwrap();
+    let (ok, out) = perseid(dir.path(), &["init", "--sdks", "typescript,python"]);
+    assert!(ok, "{out}");
+    let config = fs::read_to_string(dir.path().join("perseid.toml")).unwrap();
+    assert!(
+        config.contains("spec = \"swagger.json\"")
+            && config.contains("base_url = \"https://petstore.swagger.io/v2\""),
+        "{config}"
+    );
+    let (ok, out) = perseid(dir.path(), &["generate", "--no-format"]);
     assert!(ok, "{out}");
     assert!(
-        out.contains("! openapi.yaml can't be read") && out.contains("swagger2openapi"),
+        out.contains("note: swagger.json is Swagger 2.0, converted to OpenAPI 3 in memory"),
         "{out}"
     );
-    assert!(dir.path().join("perseid.toml").exists());
-    let (ok, out) = perseid(dir.path(), &["generate", "--no-format"]);
-    assert!(!ok && out.contains("swagger2openapi"), "{out}");
+    let pets = fs::read_to_string(dir.path().join("typescript/src/api/petApi.ts")).unwrap();
+    for call in [
+        "setMultipartBody(form)",
+        "setFormBody(",
+        "setBody(PetSerializer.serialize(pet))",
+        "setExplodedQueryParam(\"status\"",
+    ] {
+        assert!(pets.contains(call), "{call}: {pets}");
+    }
 }
 
 #[test]
@@ -2828,6 +2997,99 @@ fn java_enums_keep_unknown_values_and_docs_are_html() {
 
 const LANGUAGES: [&str; 6] = ["rust", "typescript", "python", "go", "java", "csharp"];
 
+#[test]
+fn readme_examples_build_lists_and_nested_models_in_every_language() {
+    let languages = ["rust", "typescript", "python", "go", "java", "csharp"];
+    let dir = project_from("petstore.yaml", &languages);
+    let spec = r##"
+openapi: 3.1.0
+info: { title: Shop, version: "1" }
+servers: [{ url: https://x.example.com }]
+paths:
+  /orders:
+    post:
+      operationId: create_order
+      tags: [orders]
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: '#/components/schemas/OrderCreate' } } }
+      responses:
+        '200': { description: ok, content: { application/json: { schema: { $ref: '#/components/schemas/OrderCreate' } } } }
+components:
+  schemas:
+    OrderCreate:
+      type: object
+      required: [tags, lines, shipping]
+      properties:
+        tags: { type: array, items: { type: string } }
+        lines: { type: array, items: { $ref: '#/components/schemas/Line' } }
+        shipping: { $ref: '#/components/schemas/Address' }
+    Line:
+      type: object
+      required: [sku, quantity, size]
+      properties:
+        sku: { type: string }
+        quantity: { type: integer, format: int64 }
+        size: { type: string, enum: [small, large] }
+        parent: { $ref: '#/components/schemas/Line' }
+    Address:
+      type: object
+      required: [city]
+      properties:
+        city: { type: string, example: Paris }
+"##;
+    fs::write(dir.path().join("openapi.yaml"), spec).unwrap();
+    let (ok, out) = perseid(dir.path(), &["generate", "--no-format"]);
+    assert!(ok, "{out}");
+    let calls = [
+        (
+            "rust",
+            "OrderCreate::new(vec![Line::new(1, \"small\".into(), \"sku\")], Address::new(\"Paris\"), vec![\"tags\".to_owned()])",
+        ),
+        (
+            "typescript",
+            "{ lines: [{ quantity: 1, size: \"small\", sku: \"sku\" }], shipping: { city: \"Paris\" }, tags: [\"tags\"] }",
+        ),
+        (
+            "python",
+            "lines=[Line(quantity=1, size=LineSize(\"small\"), sku=\"sku\")], shipping=Address(city=\"Paris\"), tags=[\"tags\"]",
+        ),
+        (
+            "go",
+            "petstore.OrderCreate{Lines: []petstore.Line{{Quantity: 1, Size: petstore.LineSize(\"small\"), Sku: \"sku\"}}, Shipping: petstore.Address{City: \"Paris\"}, Tags: []string{\"tags\"}}",
+        ),
+        (
+            "java",
+            "OrderCreate.builder().lines(java.util.List.of(Line.builder().quantity(1L).size(com.petstore.models.LineSize.of(\"small\")).sku(\"sku\").build())).shipping(Address.builder().city(\"Paris\").build()).tags(java.util.List.of(\"tags\")).build()",
+        ),
+        (
+            "csharp",
+            "new OrderCreate { Lines = [new Line { Quantity = 1, Size = \"small\", Sku = \"sku\" }], Shipping = new Address { City = \"Paris\" }, Tags = [\"tags\"] }",
+        ),
+    ];
+    let imports = [
+        (
+            "rust",
+            "use petstore::models::{Address, Line, OrderCreate};",
+        ),
+        (
+            "python",
+            "from petstore.models import Address, Line, LineSize\n",
+        ),
+        (
+            "java",
+            "import com.petstore.models.Address;\nimport com.petstore.models.Line;\n",
+        ),
+    ];
+    for (language, needle) in calls.iter().chain(&imports) {
+        let readme = fs::read_to_string(dir.path().join(language).join("README.md")).unwrap();
+        assert!(
+            readme.contains(needle),
+            "no `{needle}` in the {language} {readme}"
+        );
+    }
+}
+
 /// `(METHOD, path)` of every operation `language` generates.
 fn operations(dir: &Path, language: &str) -> Vec<(String, String)> {
     let (ok, out) = perseid(dir, &["inspect", language]);
@@ -3207,6 +3469,31 @@ fn cookie_parameters_are_sent_in_the_cookie_header_in_every_language() {
         let text = generated_text(dir.path(), language);
         assert!(text.contains(needle), "{language}: missing `{needle}`");
     }
+}
+
+#[test]
+fn undeclared_security_schemes_fail_unless_their_operations_are_excluded() {
+    let dir = project_from("petstore.yaml", &["typescript"]);
+    let spec = "openapi: 3.1.0\ninfo: {title: Keys, version: 1.0.0}\n\
+        servers: [{url: https://x.example.com}]\n\
+        paths:\n\
+        \x20 /x:\n    get:\n      operationId: get_x\n      tags: [x]\n      \
+        security: [{api_key: []}]\n      responses:\n        '204': {description: ok}\n\
+        \x20 /y:\n    get:\n      operationId: get_y\n      tags: [x]\n      responses:\n        \
+        '204': {description: ok}\n\
+        components:\n  securitySchemes:\n    bearer: {type: http, scheme: bearer}\n\
+        security: [{bearer: []}]\n";
+    fs::write(dir.path().join("openapi.yaml"), spec).unwrap();
+    let (ok, out) = perseid(dir.path(), &["generate", "--no-format"]);
+    assert!(
+        !ok && out.contains("operation `get_x` requires the security scheme `api_key`"),
+        "{out}"
+    );
+    let config_path = dir.path().join("perseid.toml");
+    let config = fs::read_to_string(&config_path).unwrap();
+    fs::write(&config_path, format!("exclude = [\"get_x\"]\n{config}")).unwrap();
+    let (ok, out) = perseid(dir.path(), &["generate", "--no-format"]);
+    assert!(ok, "{out}");
 }
 
 #[test]
