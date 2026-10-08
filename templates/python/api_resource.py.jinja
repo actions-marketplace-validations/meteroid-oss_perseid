@@ -1,4 +1,4 @@
-{% from "types/macros.py.jinja" import arg_type, docstring, in_class, literal_type, field_ident, field_type, field_decl, has_object_union, is_flat_union, named_type, page_class, py_str, py_field, py_ident, py_type, param_type, resource_module, type_refs, union_refs, union_type -%}
+{% from "types/macros.py.jinja" import arg_type, docstring, in_class, literal_type, field_ident, field_type, field_decl, has_object_union, is_flat_union, named_type, page_class, py_str, py_field, py_ident, py_type, param_type, resource_module, type_refs, union_type -%}
 # this file is @generated
 {% if resource.subresources | length > 0 -%}
     {{ panic("resource `" ~ resource.name ~ "` has subresources, which the Python templates do not support yet") }}
@@ -16,7 +16,7 @@ from __future__ import annotations
 {% for op in resource.operations if op.response_may_be_empty | default(false) and op.pagination is not defined and not (op.response_is_event_stream or op.response_is_binary or op.response_is_text) -%}
     {% if op.response_body_json_type is defined or op.response_body_schema_name is defined %}{% set may_be_empty.any = true %}{% endif -%}
 {% endfor -%}
-{#- Models a method names that `referenced_components` leaves out: event and typed union ones. -#}
+{#- Models a method names that `referenced_components` leaves out: event ones and those of flattened bodies. -#}
 {#- The indices of the fields of an object body that a method takes as keyword arguments,
     after "F"; nothing when the body is not an object or a field is named like a parameter.
     The `stream` property a `_stream` twin sets is left out of both twins. -#}
@@ -59,9 +59,6 @@ from __future__ import annotations
     {% endfor -%}
     {% for union_name in [op.request_body_union, op.response_body_union] if union_name is defined and union_name | to_upper_camel_case in names -%}
         {% set extra_models.names = extra_models.names + [union_name | to_upper_camel_case] -%}
-    {% endfor -%}
-    {% for p in op.query_params if p.typed_union is defined -%}
-        {% set extra_models.names = extra_models.names + (union_refs(p.typed_union) | trim | split(" ") | reject("equalto", "") | list) -%}
     {% endfor -%}
 {% endfor -%}
 {#- `extra_models` holds class names already: camel-casing `AB` again would make it `Ab`. -#}
@@ -338,7 +335,7 @@ class {{ class_name }}({{ base_class }}):
                 query_params=serialize_query_params(
                     {
 {%- for p in op.query_params %}
-                        {{ py_str(p.name) }}: {% if pg and p.name == pg.param %}page_param{% else %}{{ py_ident(p.ident) }}{% endif %},
+                        {{ py_str(p.name) }}: {% if pg and pg.before is defined and p.name == pg.param %}{{ py_ident(p.ident) }} if backwards else page_param{% elif pg and pg.before is defined and p.name == pg.before %}page_param if backwards else {{ py_ident(p.ident) }}{% elif pg and p.name == pg.param %}page_param{% else %}{{ py_ident(p.ident) }}{% endif %},
 {%- endfor %}
                     },
 {%- set comma_joined %}
@@ -478,6 +475,11 @@ class {{ class_name }}({{ base_class }}):
         self,{{ signature }}
     ) -> {{ unshadow(page_type) }}:
         {{ docstring(doc | trim) | indent(8) }}
+{%- if pg.before is defined %}
+{%- set before_query = op.query_params | selectattr("name", "equalto", pg.before) | first %}
+{%- set before_arg = py_ident(before_query.ident) %}
+        backwards = {{ before_arg }} is not None
+{%- endif %}
 
         {% if is_async %}async {% endif %}def fetch(page_param: {{ "str" if pg.style == "cursor" else "int" }} | None) -> {{ response_type }}:
             response = {{ await }}self._request({{ request | indent(4) }}
@@ -495,6 +497,9 @@ class {{ class_name }}({{ base_class }}):
 {%- if pg.item_cursor is defined %}
             item_cursor=lambda item: item.{{ py_field(pg.item_cursor) }},
 {%- endif %}
+{%- if pg.before is defined %}
+            backwards=backwards,
+{%- endif %}
 {%- if pg.total_pages is defined %}
             total_pages=lambda body: {{ accessor("body", pg.total_pages) }},
 {%- endif %}
@@ -507,6 +512,7 @@ class {{ class_name }}({{ base_class }}):
         )
 {%- set pg_query = op.query_params | selectattr("name", "equalto", pg.param) | first %}
 {%- set pg_arg = py_ident(pg_query.ident if pg_query else pg.param) %}
+{%- if pg.before is defined %}{% set pg_arg = before_arg ~ " if backwards else " ~ pg_arg %}{% endif %}
 {%- if is_async %}
         return AsyncPaginator(lambda: {{ page }}._first(fetch, {{ pg_arg }}, paging))
 {%- else %}

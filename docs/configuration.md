@@ -71,7 +71,7 @@ of every key with its description and allowed values.
 
 ## Spec, name and SDKs
 
-| Key | |
+| Key | Description |
 |---|---|
 | `spec` | The OpenAPI document, a path relative to `perseid.toml` (`openapi.json` by default) or an `http(s)` URL |
 | `name` | The client name, in any form |
@@ -91,7 +91,7 @@ of every key with its description and allowed values.
 
 See [repository layouts](ci.md#repository-layouts) for the trade-offs.
 
-| Key | |
+| Key | Description |
 |---|---|
 | `repo` | `"acme/api-{lang}"`: a repository per SDK. `"acme/api-sdks"`: one repository, a folder per SDK. Unset: next to `perseid.toml` |
 | `release` | `false` leaves out the release-please files and `sdk-release.yml` |
@@ -104,7 +104,7 @@ kept next to `perseid.toml`. The first pull request in each SDK repository carri
 
 Each key is also a key of the [language tables](#language-tables), which override it for one SDK.
 
-| Key | Default | |
+| Key | Default | Description |
 |---|---|---|
 | `base_url` | The spec's first server | API base URL of the clients |
 | `timeout` | `60` | Request timeout, in seconds |
@@ -119,7 +119,7 @@ Each key is also a key of the [language tables](#language-tables), which overrid
 
 `[types]` holds settings of every SDK only:
 
-| Key | Default | |
+| Key | Default | Description |
 |---|---|---|
 | `uuid` | `"typed"` | `format: uuid` values are the [language's UUID type](languages.md#formats). `"string"` keeps them strings, for an API whose "uuid" values are not all UUIDs: one would fail decoding the whole response |
 
@@ -127,19 +127,20 @@ Each key is also a key of the [language tables](#language-tables), which overrid
 
 Every operation is generated, except those marked `x-internal: true`.
 
-| Key | |
+| Key | Description |
 |---|---|
 | `internal` | `true` also generates the `x-internal` operations |
 | `exclude` | Operation ids left out of every SDK. In a language table, of that SDK only |
 | `only` | The only operation ids generated, `x-internal` or not |
 | `[pagination]` | [Pagination rules](features.md#pagination), one table or an array of tables |
+| `detect_pagination` | `false` leaves unpaged the Stripe-style lists no rule matches, which perseid [detects](features.md#pagination) by default |
 
 ## Package metadata
 
 `[metadata]` holds what the generated manifests say about the packages. `perseid init` fills it
 from the spec's `info` and the license it asks for, and comments out the rest.
 
-| Key | |
+| Key | Description |
 |---|---|
 | `description` | One line, `"{name} API client"` by default |
 | `license` | SPDX license expression |
@@ -163,7 +164,7 @@ from the spec's `info` and the license it asks for, and comments out the rest.
 an SDK that `sdks` lists. A table for an SDK not listed fails. `perseid init` writes one per SDK,
 naming its package.
 
-| Key | |
+| Key | Description |
 |---|---|
 | `path` | Output directory, relative to the repository the SDK lives in. The language name by default |
 | `repo` | `owner/name` of the repository to generate into, over the top-level `repo` |
@@ -177,7 +178,7 @@ naming its package.
 
 Keys of one language:
 
-| Table | Key | |
+| Table | Key | Description |
 |---|---|---|
 | `[typescript]` | `exports` | Modules re-exported from the entry point |
 | `[typescript]` | `int64` | Type of int64 values: `"number"` (default, exact up to 2^53), `"bigint"` or `"string"` |
@@ -291,10 +292,13 @@ Read as declared:
 Discriminators and `allOf`:
 
 - A discriminator on a base schema whose subtypes reference it in `allOf` makes the base a union
-  of its subtypes: those of the `mapping`, plus those referencing the base.
-- The base's own fields move to `{Base}Base`.
-- A variant missing from the `mapping` is tagged with the `const` or `enum` of its discriminator
-  property, else its schema name.
+  of its subtypes: those of the `mapping`, plus those referencing the base or another subtype.
+- The base's own fields move to `{Base}Base`. A subtype that other subtypes extend becomes the
+  union of its own fields, as `{Subtype}Base`, and of its subtypes: a list of it decodes each
+  one as its actual subtype.
+- A variant missing from the `mapping` is tagged with its `x-ms-discriminator-value`, else the
+  `const` or `enum` of its discriminator property, else its schema name. Variants sharing the
+  same values, such as the `enum` of the base they inherit, take their schema name.
 - An `allOf` of parts declaring the same property keeps the narrower schema.
 
 Untyped JSON and skipped operations, each with a warning naming the operation or schema:

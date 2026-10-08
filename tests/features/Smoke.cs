@@ -48,6 +48,13 @@ Ids(
     "e1,e2,e3",
     await Collect(client.Widgets.ListEventsAsync("w1", new() { Kind = "created" }), e => e.Id)
 );
+Ids(
+    "e7,e8,e6",
+    await Collect(
+        client.Widgets.ListEventsAsync("w1", new() { Kind = "created", EndingBefore = "e9" }),
+        e => e.Id
+    )
+);
 Ids("g1,g2,g3", await Collect(client.Gadgets.ListAsync(), g => g.Id));
 Ids("r1,r2,r3", await Collect(client.Records.ListAsync(), r => r.Id));
 
@@ -206,13 +213,15 @@ var searched = await client.Wire.SearchAsync(
         Ids = new List<string> { "x", "y" },
         Tags = ["t1", "t2"],
         Range = new SearchRange { Gte = 1, Lt = 9 },
+        Created = new RangeQuerySpecs { Gte = 3, Lt = 7 },
     }
 );
 Equal(
-    "expand[]=a&expand[]=b&filter[amount][gte]=5&filter[status]=open&ids=x&ids=y"
+    "created[gte]=3&created[lt]=7&expand[]=a&expand[]=b&filter[amount][gte]=5&filter[status]=open&ids=x&ids=y"
         + "&metadata[k]=v&range[gte]=1&range[lt]=9&tags=t1,t2",
     searched.Status
 );
+Equal("created=5", (await client.Wire.SearchAsync(new() { Created = 5 })).Status);
 var charged = await client.Wire.CreateChargeAsync(
     new Charge
     {

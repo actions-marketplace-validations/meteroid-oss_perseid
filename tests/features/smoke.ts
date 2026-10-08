@@ -323,6 +323,11 @@ async function main() {
     await collect(client.widgets.listEvents("w1", { kind: "created" })),
     ["e1", "e2", "e3"]
   );
+  // From `ending_before`, pages go backwards and never send `starting_after`.
+  assert.deepEqual(
+    await collect(client.widgets.listEvents("w1", { kind: "created", endingBefore: "e9" })),
+    ["e7", "e8", "e6"]
+  );
   assert.deepEqual(await collect(client.gadgets.list()), ["g1", "g2", "g3"]);
   assert.deepEqual(await collect(client.records.list()), ["r1", "r2", "r3"]);
 
@@ -452,12 +457,14 @@ async function main() {
     ids: ["x", "y"],
     tags: ["t1", "t2"],
     range: { gte: 1n, lt: 9n },
+    created: { gte: 3n, lt: 7n },
   });
   assert.equal(
     searched.status,
-    "expand[]=a&expand[]=b&filter[amount][gte]=5&filter[status]=open&ids=x&ids=y" +
+    "created[gte]=3&created[lt]=7&expand[]=a&expand[]=b&filter[amount][gte]=5&filter[status]=open&ids=x&ids=y" +
       "&metadata[k]=v&range[gte]=1&range[lt]=9&tags=t1,t2"
   );
+  assert.equal((await client.wire.search({ created: 5n })).status, "created=5");
   const charged = await client.wire.createCharge({
     amount: 100n,
     capture: true,
