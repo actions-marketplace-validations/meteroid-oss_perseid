@@ -14,6 +14,7 @@ import com.features.api.WireBetaSearchOptions;
 import com.features.api.WireSearchOptions;
 import com.features.api.WidgetsListAsyncPage;
 import com.features.api.WidgetsListEventsAsyncPage;
+import com.features.api.WidgetsListEventsOptions;
 import com.features.api.WidgetsListPage;
 import com.features.exceptions.ApiConnectionException;
 import com.features.exceptions.ApiException;
@@ -49,6 +50,7 @@ import com.features.models.ItemPatch;
 import com.features.models.NullBag;
 import com.features.models.Paint;
 import com.features.models.Payment;
+import com.features.models.RangeQuerySpecs;
 import com.features.models.SearchRange;
 import com.features.models.Widget;
 import com.features.streaming.EventStream;
@@ -116,6 +118,8 @@ public class Smoke {
         expect(client.account().retrieveMachine().status(), "Bearer tok||");
         expect(ids(client.widgets().list(), Widget::id), List.of("w1", "w2", "w3"));
         expect(ids(client.widgets().listEvents("w1", "created"), Event::id), List.of("e1", "e2", "e3"));
+        WidgetsListEventsOptions before = WidgetsListEventsOptions.builder().endingBefore("e9").build();
+        expect(ids(client.widgets().listEvents("w1", "created", before), Event::id), List.of("e7", "e8", "e6"));
         expect(ids(client.gadgets().list(), Gadget::id), List.of("g1", "g2", "g3"));
         expect(client.records().list().stream().map(Entry::id).collect(Collectors.toList()), List.of("r1", "r2", "r3"));
 
@@ -236,11 +240,18 @@ public class Smoke {
                 .ids(WireSearchOptions.Ids.ofArrayOfStrings(List.of("x", "y")))
                 .tags(List.of("t1", "t2"))
                 .range(SearchRange.builder().gte(1L).lt(9L).build())
+                .created(WireSearchOptions.Created.ofRangeQuerySpecs(
+                        RangeQuerySpecs.builder().gte(3L).lt(7L).build()))
                 .build();
         expect(
                 client.wire().search(search).status(),
-                "expand[]=a&expand[]=b&filter[amount][gte]=5&filter[status]=open&ids=x&ids=y"
+                "created[gte]=3&created[lt]=7&expand[]=a&expand[]=b&filter[amount][gte]=5&filter[status]=open&ids=x&ids=y"
                         + "&metadata[k]=v&range[gte]=1&range[lt]=9&tags=t1,t2");
+        expect(
+                client.wire().search(WireSearchOptions.builder()
+                        .created(WireSearchOptions.Created.ofInteger(5L))
+                        .build()).status(),
+                "created=5");
         Charge charge = Charge.builder()
                 .amount(100L)
                 .capture(true)
@@ -376,7 +387,7 @@ public class Smoke {
         expect(extras.additionalProperties().get("extra").asInt(), 1);
         expect(extras.additionalProperties().get("nested").get("a").get(2).has("b"), true);
 
-        NullBag nulls = client.content().listScenariosNulls();
+        NullBag nulls = client.content().nulls().retrieve();
         expect(nulls.name().isPresent(), false);
         expect(nulls.tags(), Arrays.asList("a", null, "b"));
         Map<String, Long> counts = new LinkedHashMap<>();
@@ -390,7 +401,7 @@ public class Smoke {
         NullBag sent = NullBag.builder().name(null).tags(Arrays.asList("a", null)).counts(sentCounts).build();
         JsonNode sentJson = MAPPER.readTree("{\"name\":null,\"tags\":[\"a\",null],\"counts\":{\"x\":null,\"y\":2}}");
         expect(MAPPER.readTree(sent.toJson()), sentJson);
-        NullBag echoed = client.content().createScenariosNull(sent);
+        NullBag echoed = client.content().nulls().create(sent);
         expect(echoed.name().isPresent(), false);
         expect(echoed.tags(), Arrays.asList("a", null));
         expect(echoed.counts(), sentCounts);
@@ -423,8 +434,8 @@ public class Smoke {
         expect(big.min(), Long.MIN_VALUE);
         String base64 = Base64.getEncoder().encodeToString(HELLO);
         expect(base64, "aGVsbG/7//4=");
-        expect(Arrays.equals(Base64.getDecoder().decode(client.encoding().createScenariosByte(Blob.builder().data(base64).build()).data()), HELLO), true);
-        expect(Arrays.equals(Base64.getDecoder().decode(client.encoding().listScenariosBytes().data()), HELLO), true);
+        expect(Arrays.equals(Base64.getDecoder().decode(client.encoding().bytes().create(Blob.builder().data(base64).build()).data()), HELLO), true);
+        expect(Arrays.equals(Base64.getDecoder().decode(client.encoding().bytes().retrieve().data()), HELLO), true);
         for (ZoneOffset zone : List.of(ZoneOffset.UTC, ZoneOffset.ofHours(2), ZoneOffset.ofHoursMinutes(-5, -30))) {
             OffsetDateTime at = INSTANT.withOffsetSameInstant(zone);
             DateBox queried = client.encoding().retrieveScenariosDatetime(at, LocalDate.of(2024, 1, 2));

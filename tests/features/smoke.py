@@ -34,6 +34,7 @@ from features.models import (
     Filter,
     FilterAmount,
     Health,
+    RangeQuerySpecs,
     SearchRange,
     WidgetList,
 )
@@ -92,6 +93,8 @@ assert client.account.check_health().status == "||"
 assert client.account.retrieve_machine().status == "Bearer tok||"
 assert ids(client.widgets.list()) == ["w1", "w2", "w3"]
 assert ids(client.widgets.list_events("w1", kind="created")) == ["e1", "e2", "e3"]
+# From `ending_before`, pages go backwards and never send `starting_after`.
+assert ids(client.widgets.list_events("w1", kind="created", ending_before="e9")) == ["e7", "e8", "e6"]
 assert ids(client.gadgets.list()) == ["g1", "g2", "g3"]
 assert ids(client.records.list()) == ["r1", "r2", "r3"]
 
@@ -189,12 +192,14 @@ searched = client.wire.search(
     ids=["x", "y"],
     tags=["t1", "t2"],
     range=SearchRange(gte=1, lt=9),
+    created=RangeQuerySpecs(gte=3, lt=7),
 )
 assert searched.status == (
-    "expand[]=a&expand[]=b&filter[amount][gte]=5&filter[status]=open&ids=x&ids=y"
+    "created[gte]=3&created[lt]=7&expand[]=a&expand[]=b&filter[amount][gte]=5&filter[status]=open&ids=x&ids=y"
     "&metadata[k]=v&range[gte]=1&range[lt]=9&tags=t1,t2"
 ), searched
 assert client.wire.search(ids="z").status == "ids=z"
+assert client.wire.search(created=5).status == "created=5"
 assert client.wire.search(ids="z", extra_query={"debug": True}).status == "debug=true&ids=z"
 charged = client.wire.create_charge(
     amount=100,
@@ -240,10 +245,10 @@ assert raises(APIResponseValidationError, client.content.retrieve_scenarios_malf
 assert raises(APIResponseValidationError, client.content.retrieve_scenarios_empty_body).raw_body == b""
 extras = client.content.list_scenarios_extra_fields()
 assert extras.status == "ok" and extras.extra_fields["extra"] == 1, extras
-nulls = client.content.list_scenarios_nulls()
+nulls = client.content.nulls.retrieve()
 assert nulls.name is None and nulls.note is None, nulls
 assert nulls.tags == ["a", None, "b"] and nulls.counts == {"x": 1, "y": None}, nulls
-echoed = client.content.create_scenarios_null(name=None, tags=["a", None], counts={"x": None, "y": 2})
+echoed = client.content.nulls.create(name=None, tags=["a", None], counts={"x": None, "y": 2})
 assert (echoed.name, echoed.tags, echoed.counts) == (None, ["a", None], {"x": None, "y": 2}), echoed
 assert echoed.note is UNSET, echoed
 assert echoed.to_dict() == {"name": None, "tags": ["a", None], "counts": {"x": None, "y": 2}}, echoed
@@ -259,8 +264,8 @@ assert unknown.kind == "magenta" and unknown.kinds == ["red", "magenta"], unknow
 big = client.encoding.scenarios_bigint(value=9007199254740993, min=-9223372036854775808)
 assert (big.value, big.min) == (9007199254740993, -9223372036854775808), big
 HELLO = b"hello\xfb\xff\xfe"
-assert raw_bytes(client.encoding.create_scenarios_byte(data="aGVsbG/7//4=").data) == HELLO
-assert raw_bytes(client.encoding.list_scenarios_bytes().data) == HELLO
+assert raw_bytes(client.encoding.bytes_.create(data="aGVsbG/7//4=").data) == HELLO
+assert raw_bytes(client.encoding.bytes_.retrieve().data) == HELLO
 INSTANT = datetime(2024, 1, 2, 3, 4, 5, 250000, tzinfo=timezone.utc)
 for zone in (timezone.utc, timezone(timedelta(hours=2)), timezone(timedelta(hours=-5, minutes=-30))):
     at = INSTANT.astimezone(zone)

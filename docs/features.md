@@ -52,6 +52,7 @@ Mark list operations with `x-pagination`:
 x-pagination:
   cursor: starting_after        # or `page: page`, or `offset: offset`
   item_cursor: id               # next cursor from the last item, or `next_cursor: <path>`
+  before: ending_before         # with `item_cursor`: set by the caller, pages backwards
   has_more: has_more            # optional, as are `total_pages`, `total` and `first_page`
   items: data                   # `data` by default, else the response's only array of objects
 ```
@@ -74,7 +75,25 @@ total = "total"
 A rule without `operations` uses `has_more`, `total_pages` and `total` only where the response
 has them; without any, paging stops at the first empty page.
 
-`x-pagination: false` opts an operation out of the `perseid.toml` rules.
+Operations no rule matches are paged when they have Stripe's list shape: a `starting_after`
+string query parameter, and a response with a `has_more` boolean and a `data` array of items
+with a string `id`. That is the rule
+
+```toml
+[[pagination]]
+cursor = "starting_after"
+item_cursor = "id"
+has_more = "has_more"
+items = "data"
+```
+
+`x-pagination: false` opts an operation out of the `perseid.toml` rules and of this one, and
+`detect_pagination = false` in `perseid.toml` turns this rule off, for a spec you do not own.
+
+With `item_cursor`, a list started from the `before` parameter pages backwards, as Stripe's
+`ending_before`: each next page ends before the first item of the last, and the cursor
+parameter is never sent along. `before` is `ending_before` by default when the cursor is
+`starting_after` and the operation takes it. Items keep the order of each response.
 
 A paginated operation has one method. It gives the first page, and iterating it gives every
 item, fetching the next pages on demand; Go iterates with a `...AutoPaging` twin. A page is the response body, with the paging members:
@@ -143,7 +162,7 @@ for await (const chunk of stream) process.stdout.write(chunk.delta);
 
 Every SDK can return the status, headers and request id of a successful call with its body.
 
-| Language | |
+| Language | Usage |
 |---|---|
 | TypeScript | `const { data, response, requestId } = await client.customers.retrieve(id).withResponse()` |
 | Python | `raw = client.with_raw_response.customers.retrieve(id)`, then `raw.headers`, `raw.parse()` |
@@ -167,6 +186,7 @@ expand[]=a&expand[]=b                         # lists with `style: deepObject`
 | Parameter | Sent as |
 |---|---|
 | List | Repeated (`?tag=a&tag=b`), comma-separated with `explode: false` |
+| `deepObject` union (`anyOf: [object, integer]`) | Typed in every SDK: `created[gte]=1` for the object, `created=1` for the integer |
 | `pipeDelimited`, `spaceDelimited` list | `ids=a\|b\|c`, `ids=a b c`; repeated with `explode` |
 | `content: application/json` (query, path, header) | Typed by its schema, sent as compact JSON, percent-encoded where needed |
 | Header | Typed by its schema like a query parameter: numbers, booleans, dates, enums, lists (comma-separated) |
@@ -201,9 +221,10 @@ expand[]=a&expand[]=b                         # lists with `style: deepObject`
 
 ## Base URL
 
-Every operation goes to the client's one base URL. Operations or path items declaring `servers`
-that the root `servers` do not list produce a warning naming them. Put them in a spec of their
-own, or set the base URL when creating the client.
+Every operation goes to the client's one base URL. Generated operations, or their path items,
+declaring `servers` that the root `servers` do not list produce a warning naming them; those left
+out by `exclude` or `x-internal` do not. Put them in a spec of their own, or set the base URL
+when creating the client.
 
 ## Unsupported constructs
 

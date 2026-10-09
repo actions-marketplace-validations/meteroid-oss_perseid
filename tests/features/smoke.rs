@@ -24,7 +24,7 @@ use features::error::{ApiErrorKind, Error};
 use features::models::{
     BigBox, Blob, Charge, ChargeItemsItem, ChargeShipping, ChargeShippingAddress,
     CompletionRequest, DateBox, Filter, FilterAmount, Health, Item, ItemPatch, NullBag,
-    PaintKind, PaintKindsItem, Payment, SearchRange, Widget, WidgetList,
+    PaintKind, PaintKindsItem, Payment, RangeQuerySpecs, SearchRange, Widget, WidgetList,
 };
 use futures::{StreamExt, TryStreamExt};
 use http::{HeaderMap, StatusCode};
@@ -60,6 +60,9 @@ async fn smoke() {
     let options = WidgetsListEventsOptions::new("created");
     let events = widgets.list_events("w1", options).items();
     assert_eq!(ids(events, |e| e.id).await, ["e1", "e2", "e3"]);
+    let options = WidgetsListEventsOptions::new("created").ending_before("e9");
+    let events = widgets.list_events("w1", options).items();
+    assert_eq!(ids(events, |e| e.id).await, ["e7", "e8", "e6"]);
     let mut gadgets = tok.gadgets().list(None).items();
     let mut gadget_ids = Vec::new();
     while let Some(gadget) = gadgets.next().await {
@@ -223,12 +226,15 @@ async fn wire() {
         .metadata([("k".to_owned(), "v".to_owned())])
         .ids(vec!["x".to_owned(), "y".to_owned()])
         .tags(vec!["t1".into(), "t2".into()])
-        .range(SearchRange { gte: Some(1), lt: Some(9), ..Default::default() });
+        .range(SearchRange { gte: Some(1), lt: Some(9), ..Default::default() })
+        .created(RangeQuerySpecs { gte: Some(3), lt: Some(7), ..Default::default() });
     assert_eq!(
         wire.search(Some(search)).await.unwrap().status,
-        "expand[]=a&expand[]=b&filter[amount][gte]=5&filter[status]=open&ids=x&ids=y\
+        "created[gte]=3&created[lt]=7&expand[]=a&expand[]=b&filter[amount][gte]=5&filter[status]=open&ids=x&ids=y\
          &metadata[k]=v&range[gte]=1&range[lt]=9&tags=t1,t2"
     );
+    let search = WireSearchOptions::new().created(5);
+    assert_eq!(wire.search(Some(search)).await.unwrap().status, "created=5");
     let charge = Charge {
         capture: Some(true),
         metadata: Some([("order".to_owned(), "7".to_owned())].into()),
@@ -426,7 +432,7 @@ async fn unknown_fields_and_nulls_are_kept() {
     assert_eq!(health.extra["nested"], serde_json::json!({"a": [1, 2, {"b": null}]}));
     assert_eq!(health.extra["list"], serde_json::json!([1, "x"]));
 
-    let nulls = content.list_scenarios_nulls().await.unwrap();
+    let nulls = content.nulls().retrieve().await.unwrap();
     assert_eq!(nulls.name, None);
     assert_eq!(nulls.tags, [Some("a".to_owned()), None, Some("b".to_owned())]);
     assert_eq!(nulls.counts, HashMap::from([("x".to_owned(), Some(1)), ("y".to_owned(), None)]));
@@ -441,7 +447,7 @@ async fn unknown_fields_and_nulls_are_kept() {
             vec![Some("a".to_owned()), None],
         )
     };
-    assert_eq!(content.create_scenarios_null(sent.clone()).await.unwrap(), sent);
+    assert_eq!(content.nulls().create(sent.clone()).await.unwrap(), sent);
 }
 
 #[tokio::test]
@@ -472,9 +478,9 @@ async fn integers_bytes_and_dates_round_trip() {
     // Bytes are base64 text in the model.
     let bytes = b"hello\xfb\xff\xfe";
     assert_eq!(base64_encode(bytes), "aGVsbG/7//4=");
-    let echoed = encoding.create_scenarios_byte(Blob::new(base64_encode(bytes))).await.unwrap();
+    let echoed = encoding.bytes().create(Blob::new(base64_encode(bytes))).await.unwrap();
     assert_eq!(base64_decode(&echoed.data), bytes);
-    let fetched = encoding.list_scenarios_bytes().await.unwrap();
+    let fetched = encoding.bytes().retrieve().await.unwrap();
     assert_eq!(base64_decode(&fetched.data), bytes);
 
     let options = EncodingRetrieveScenariosDatetimeOptions::new(instant(), day());

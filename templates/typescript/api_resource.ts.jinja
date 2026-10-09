@@ -84,14 +84,27 @@
     {% endif -%}
 {% endfor -%}
 
-{% set summary = resource.name | to_snake_case | replace("_", " ") -%}
-/** The {{ summary }} operations, reached through the client's `{{ resource.name | to_lower_camel_case }}`. */
+{% set summary = resource.path | join(" ") | replace("_", " ") -%}
+/** The {{ summary }} operations, reached through the client's `{{ resource.path | map("to_lower_camel_case") | join(".") }}`. */
 export class {{ resource_type_name }} {
+    {% for child in resource.children -%}
+    private _{{ child.accessor | to_lower_camel_case }}?: {{ child.name | to_upper_camel_case }};
+    {% endfor -%}
+
     /** @internal */
     public constructor(private readonly requestCtx: {{ sdk.client_name }}RequestContext) {}
 
-    {% set extension %}extensions/{{ resource.name | to_snake_case }}.ts{% endset -%}
+    {% set extension %}extensions/{{ resource.path | join(".") }}.ts{% endset -%}
     {% include extension ignore missing %}
+
+    {% for child in resource.children -%}
+    /** The {{ child.accessor | replace("_", " ") }} operations. */
+    public get {{ child.accessor | to_lower_camel_case }}(): {{ child.name | to_upper_camel_case }} {
+        this._{{ child.accessor | to_lower_camel_case }} ??= new {{ child.name | to_upper_camel_case }}(this.requestCtx);
+        return this._{{ child.accessor | to_lower_camel_case }};
+    }
+
+    {% endfor -%}
 
     {% for op in resource.operations -%}
         {% if op.response_is_event_stream and op.event_schema_name is defined -%}
@@ -159,11 +172,19 @@ export class {{ resource_type_name }} {
         {% set pf = namespace(name=pg.param) -%}
         {% for p in op.query_params if p.name == pg.param %}{% set pf.name = p.ident %}{% endfor -%}
         {% set param_field = pf.name | ident("camel") -%}
+        {% if pg.before is defined -%}
+        {% set bf = namespace(name=pg.before) -%}
+        {% for p in op.query_params if p.name == pg.before %}{% set bf.name = p.ident %}{% endfor -%}
+        {% set before_field = bf.name | ident("camel") -%}
+        {% endif -%}
         {% set pv = namespace(value=pg.style) -%}
         {% for p in op.query_params if p.name == pg.param and pg.style != "cursor" and m.is_int64(p.type) -%}
             {% set pv.value = ("BigInt(" if sdk.int64 == "bigint" else "String(") ~ pg.style ~ ")" -%}
         {% endfor -%}
-        {{ op_doc(op, "Await it for the first page: the response body, its properties read on the page, with\n`items`, `hasNextPage()`, `getNextPage()` and `iterPages()`. Or iterate it with `for await`\nover every item of every page, fetched on demand.") }}public {{ method }}({{ params }}): {{ runtime("PagePromise") }}<{{ page_type }}, {{ item_type }}> {
+        {{ op_doc(op, "Await it for the first page: the response body, its properties read on the page, with\n`items`, `hasNextPage()`, `getNextPage()` and `iterPages()`. Or iterate it with `for await`\nover every item of every page, fetched on demand." ~ ("\nSetting `" ~ before_field ~ "` pages backwards, each page ending before the first item of the last." if pg.before is defined else "")) }}public {{ method }}({{ params }}): {{ runtime("PagePromise") }}<{{ page_type }}, {{ item_type }}> {
+            {% if pg.before is defined -%}
+            const backwards = options?.{{ before_field }} !== undefined && options?.{{ before_field }} !== null;
+            {% endif -%}
             return new {{ runtime("PagePromise") }}<{{ page_type }}, {{ item_type }}>(
                 {
                     style: "{{ pg.style }}",
@@ -174,7 +195,7 @@ export class {{ resource_type_name }} {
                     {% if pg.next_cursor is defined -%}
                     nextCursor: (page) => {{ at(pg.next_cursor) }},
                     {% elif pg.item_cursor is defined -%}
-                    nextCursor: (_page, items) => items[items.length - 1]?.{{ pg.item_cursor | ident("camel") }},
+                    nextCursor: (_page, items) => {% if pg.before is defined %}(backwards ? items[0] : items[items.length - 1]){% else %}items[items.length - 1]{% endif %}?.{{ pg.item_cursor | ident("camel") }},
                     {% endif -%}
                     {% if pg.total_pages is defined -%}
                     totalPages: (page) => {{ at(pg.total_pages) }},
@@ -186,11 +207,12 @@ export class {{ resource_type_name }} {
                     firstPage: {{ pg.first_page }},
                     {% endif -%}
                     fetch: ({{ pg.style }}) => this.#{{ method }}({{ leading_args }}
-                        {%- if pg.style == "cursor" %}cursor === undefined ? options : {% endif %}{ ...options, {{ param_field }}: {{ pv.value }} },
+                        {%- if pg.style == "cursor" %}cursor === undefined ? options : {% endif %}
+                        {%- if pg.before is defined %}backwards ? { ...options, {{ before_field }}: cursor } : {% endif %}{ ...options, {{ param_field }}: {{ pv.value }} },
                         requestOptions,
                     ),
                 },
-                options?.{{ param_field }},
+                {% if pg.before is defined %}backwards ? options?.{{ before_field }} : {% endif %}options?.{{ param_field }},
             );
         }
 
@@ -344,11 +366,20 @@ import { {{ decode_helpers | join(", ") }} } from "../decode.js";
 {% if union_helpers -%}
 import { {{ union_helpers | join(", ") }} } from "../unions.js";
 {% endif -%}
+{% for child in resource.children -%}
+import { {{ child.name | to_upper_camel_case }} } from "./{{ child.name | to_lower_camel_case }}.js";
+{% endfor -%}
+{% if resource.operations -%}
 import { {{ runtime_import("APIPromise") }} } from "../apiPromise.js";
+{% endif -%}
 {% if paginated -%}
 import { {{ runtime_import("PagePromise") }} } from "../pagination.js";
 {% endif -%}
+{% if resource.operations -%}
 import { {{ sdk.client_name }}Request, type {{ sdk.client_name }}RequestContext, type RequestOptions } from "../request.js";
+{% else -%}
+import type { {{ sdk.client_name }}RequestContext } from "../request.js";
+{% endif -%}
 {% if streams or "binary" in kinds or "multipart" in kinds -%}
 import {
     {% if raw_streams %}type {{ runtime_import("EventStream") }},{% endif %}

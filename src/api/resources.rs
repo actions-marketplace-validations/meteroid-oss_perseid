@@ -42,15 +42,19 @@ impl std::error::Error for SpecError {}
 /// Intermediate representation of `paths` from the spec.
 pub(crate) type Resources = BTreeMap<String, Resource>;
 
+/// The operations of `paths` by tag, the errors of their spec, and the id of every operation of
+/// the spec. Excluded operations are read too, without warnings or errors, so that leaving one out
+/// of an SDK does not move the others: the caller drops them once they are placed and named.
 pub(crate) fn from_openapi(
     paths: openapi::Paths,
     component_schemas: &IndexMap<String, openapi::SchemaObject>,
     include_mode: IncludeMode,
     excluded_operations: &BTreeSet<String>,
     specified_operations: &BTreeSet<String>,
-) -> (Resources, Vec<String>) {
+) -> (Resources, Vec<String>, BTreeSet<String>) {
     let mut resources = BTreeMap::new();
     let mut errors = Vec::new();
+    let mut ids = BTreeSet::new();
 
     for (path, pi) in paths {
         let Some(path_item) = pi.into_item() else {
@@ -59,24 +63,34 @@ pub(crate) fn from_openapi(
         };
         for (method, op) in path_item {
             let op_id = op.operation_id.clone().unwrap_or_default();
+            ids.insert(op_id.clone());
+            let excluded = excluded_operations.contains(&op_id);
             let _span = tracing::warn_span!("operation", name = %op_id).entered();
-            match Operation::from_openapi(
-                &path,
-                method,
-                op,
-                component_schemas,
-                include_mode,
-                excluded_operations,
-                specified_operations,
-            ) {
-                Ok(Some((res_path, op))) => {
-                    let operations =
-                        &mut get_or_insert_resource(&mut resources, res_path).operations;
+            let read = || {
+                Operation::from_openapi(
+                    &path,
+                    method,
+                    op,
+                    component_schemas,
+                    include_mode,
+                    specified_operations,
+                )
+            };
+            let read = match excluded {
+                true => tracing::subscriber::with_default(tracing_subscriber::registry(), read),
+                false => read(),
+            };
+            match read {
+                Ok(Some((tag, op))) => {
+                    let operations = &mut (resources.entry(tag.clone()))
+                        .or_insert_with(|| Resource::new(vec![tag]))
+                        .operations;
                     let stream = op.event_stream_variant();
                     operations.push(op);
                     operations.extend(stream);
                 }
                 Ok(None) => {}
+                Err(_) if excluded => {}
                 Err(e) if e.downcast_ref::<SpecError>().is_some() => errors.push(format!(
                     "operation `{op_id}` ({} {path}): {e:#}",
                     method.to_uppercase()
@@ -86,11 +100,7 @@ pub(crate) fn from_openapi(
             }
         }
     }
-    for resource in resources.values_mut() {
-        resource.disambiguate_operation_names();
-    }
-
-    (resources, errors)
+    (resources, errors, ids)
 }
 
 pub(crate) fn referenced_components(resources: &Resources) -> impl Iterator<Item = &str> {
@@ -109,12 +119,6 @@ pub(crate) fn resolve_schema_refs_in_resources(
 }
 
 fn resolve_schema_refs_in_resource(resource: &mut Resource, string_alias_names: &BTreeSet<String>) {
-    // Resolve in subresources
-    for sub in resource.subresources.values_mut() {
-        resolve_schema_refs_in_resource(sub, string_alias_names);
-    }
-
-    // Resolve in operations
     for op in &mut resource.operations {
         for field in &mut op.multipart_fields {
             resolve_schema_ref_in_field_type_public(&mut field.field.r#type, string_alias_names);
@@ -173,7 +177,6 @@ pub(crate) fn mark_structured_query_params(resources: &mut Resources, types: &Ty
                 param.structured |= is_structured(&param.r#type, types, 0);
             }
         }
-        stack.extend(resource.subresources.values_mut());
     }
 }
 
@@ -183,9 +186,6 @@ pub(crate) fn name_body_unions(resources: &mut Resources, types: &Types) {
     fn visit(resource: &mut Resource, taken: &BTreeSet<String>) {
         for op in &mut resource.operations {
             op.name_body_unions(taken);
-        }
-        for sub in resource.subresources.values_mut() {
-            visit(sub, taken);
         }
     }
     let taken: BTreeSet<String> = types.keys().map(|k| k.to_upper_camel_case()).collect();
@@ -202,12 +202,16 @@ pub(crate) fn request_and_response_roots(
     let mut responses = BTreeSet::new();
     let mut stack: Vec<&Resource> = resources.values().collect();
     while let Some(resource) = stack.pop() {
-        stack.extend(resource.subresources.values());
         for op in &resource.operations {
             requests.extend(op.request_body_schema_name.as_deref());
             let sent = (op.request_body_json_type.iter())
                 .chain(op.multipart_fields.iter().map(|f| &f.field.r#type))
                 .chain(op.query_params.iter().map(|p| &p.r#type))
+                .chain(
+                    op.query_params
+                        .iter()
+                        .filter_map(|p| p.typed_union.as_ref()),
+                )
                 .chain(op.path_styles.values().filter_map(|p| p.r#type.as_ref()))
                 .chain(op.header_params.iter().map(|p| &p.r#type));
             for ty in sent {
@@ -227,7 +231,8 @@ pub(crate) fn request_and_response_roots(
 }
 
 /// A `pet` resource and a `Pet` schema would both be `Pet` in most SDKs: the resource becomes
-/// `pet_api`, as do resources named like a type the SDK already uses.
+/// `pet_api`, as do resources named like a type the SDK already uses. A child resource keeps its
+/// accessor, a top-level one is reached as `pet_api`.
 pub(crate) fn rename_resources_named_like_types(
     resources: &mut Resources,
     types: &Types,
@@ -235,45 +240,69 @@ pub(crate) fn rename_resources_named_like_types(
 ) {
     let mut type_names: BTreeSet<String> = types.keys().map(|n| n.to_upper_camel_case()).collect();
     type_names.extend(reserved.iter().cloned());
-    let clashing: Vec<String> = resources
+    let renamed: BTreeMap<String, String> = resources
         .keys()
         .filter(|name| type_names.contains(&name.to_upper_camel_case()))
-        .cloned()
+        .map(|name| (name.clone(), format!("{name}_api")))
         .collect();
-    for name in clashing {
-        let mut resource = resources.remove(&name).expect("listed above");
-        let renamed = format!("{name}_api");
-        resource.name.clone_from(&renamed);
-        resources.insert(renamed, resource);
+    if renamed.is_empty() {
+        return;
+    }
+    let rename = |name: &mut String| {
+        if let Some(new) = renamed.get(name) {
+            new.clone_into(name);
+        }
+    };
+    *resources = std::mem::take(resources)
+        .into_values()
+        .map(|mut resource| {
+            if let Some(top) = renamed.get(&resource.path[0]) {
+                resource.path[0].clone_from(top);
+            }
+            rename(&mut resource.name);
+            resource.parent.iter_mut().for_each(rename);
+            resource
+                .children
+                .iter_mut()
+                .for_each(|c| rename(&mut c.name));
+            (resource.name.clone(), resource)
+        })
+        .collect();
+}
+
+/// Removes the resources left without operations, in them or below them.
+pub(crate) fn drop_empty(resources: &mut Resources) {
+    let used: BTreeSet<String> = resources
+        .values()
+        .filter(|r| !r.operations.is_empty())
+        .flat_map(|r| (1..=r.path.len()).map(|n| r.path[..n].join(".")))
+        .collect();
+    resources.retain(|_, r| used.contains(&r.path.join(".")));
+    let names: BTreeSet<String> = resources.keys().cloned().collect();
+    for resource in resources.values_mut() {
+        resource.children.retain(|c| names.contains(&c.name));
     }
 }
 
-fn get_or_insert_resource(resources: &mut Resources, path: Vec<String>) -> &mut Resource {
-    let mut path_iter = path.into_iter();
-    let mut name = path_iter.next().expect("path must be non-empty");
-    let mut r = resources
-        .entry(name.clone())
-        .or_insert_with(|| Resource::new(name.clone()));
-
-    for sub_name in path_iter {
-        name.push('.');
-        name.push_str(&sub_name);
-
-        r = r
-            .subresources
-            .entry(sub_name)
-            .or_insert_with(|| Resource::new(name.clone()));
-    }
-
-    r
-}
-
-/// A named group of [`Operation`]s.
+/// A named group of [`Operation`]s: a top-level resource of the client, or a child of one.
 #[derive(Clone, Deserialize, Serialize)]
 pub(crate) struct Resource {
+    /// Unique among the resources: the class, module and file name of the resource, its path
+    /// joined with `_` unless a type is named like it.
     pub name: String,
+    /// The accessors leading to it from the client: `["workspaces", "peers"]`.
+    pub path: Vec<String>,
+    /// The name of the resource holding it.
+    pub parent: Option<String>,
+    pub children: Vec<Child>,
     pub operations: Vec<Operation>,
-    pub subresources: Resources,
+}
+
+/// A resource below another, reached through its `accessor`.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub(crate) struct Child {
+    pub name: String,
+    pub accessor: String,
 }
 
 impl Resource {
@@ -320,9 +349,6 @@ impl Resource {
             }
             operation.untype_unions();
         }
-        for resource in self.subresources.values_mut() {
-            resource.inline_aliases(aliases)?;
-        }
         Ok(())
     }
 
@@ -330,22 +356,20 @@ impl Resource {
         &mut self,
         security: &Security,
         rules: &[config::Pagination],
+        detect: bool,
         types: &Types,
     ) -> anyhow::Result<()> {
         for op in &mut self.operations {
             op.security = security.override_for(&op.id);
-            op.resolve_pagination(rules, types)
+            op.resolve_pagination(rules, detect, types)
                 .with_context(|| format!("pagination of `{}`", op.id))?;
-        }
-        for resource in self.subresources.values_mut() {
-            resource.resolve_extensions(security, rules, types)?;
         }
         Ok(())
     }
 
     /// Falls back to the full operation id for operations whose short names collide. Names that
     /// still clash are reported by `naming::apply`, once `x-perseid-name` and `[methods]` apply.
-    fn disambiguate_operation_names(&mut self) {
+    pub(crate) fn disambiguate_operation_names(&mut self) {
         let key = |op: &Operation| op.name.to_snake_case();
         let counts = self.operations.iter().map(key).counts();
         for op in &mut self.operations {
@@ -355,11 +379,13 @@ impl Resource {
         }
     }
 
-    fn new(name: String) -> Self {
+    pub(crate) fn new(path: Vec<String>) -> Self {
         Self {
-            name,
+            name: path.join("_"),
+            path,
+            parent: None,
+            children: Vec::new(),
             operations: Vec::new(),
-            subresources: BTreeMap::new(),
         }
     }
 
@@ -367,16 +393,11 @@ impl Resource {
     pub(crate) fn patch_bodies(&self) -> BTreeSet<&str> {
         let own = self.operations.iter().filter(|op| op.method == "patch");
         own.filter_map(|op| op.request_body_schema_name.as_deref())
-            .chain(self.subresources.values().flat_map(Self::patch_bodies))
             .collect()
     }
 
     pub(crate) fn referenced_components(&self) -> BTreeSet<&str> {
         let mut res = BTreeSet::new();
-
-        for resource in self.subresources.values() {
-            res.extend(resource.referenced_components());
-        }
 
         for operation in &self.operations {
             for field in &operation.multipart_fields {
@@ -389,6 +410,7 @@ impl Resource {
                     res.insert(name);
                 }
                 res.extend(param.r#type.union_refs());
+                res.extend(param.typed_union.iter().flat_map(FieldType::union_refs));
             }
             for param in operation.path_styles.values() {
                 if let Some(name) = param.r#type.as_ref().and_then(FieldType::referenced_schema) {
@@ -550,6 +572,13 @@ pub(crate) struct Operation {
     /// `x-perseid-name` of the operation.
     #[serde(skip)]
     pub(crate) x_perseid_name: Option<String>,
+    /// `x-perseid-resource` of the operation, as a resource path.
+    #[serde(skip)]
+    pub(crate) x_perseid_resource: Option<Vec<String>>,
+    /// The index of the path segment its resource is named after, when nesting put it below its
+    /// tag's resource. Method names describe the path after it.
+    #[serde(skip)]
+    pub(crate) root: Option<usize>,
     /// Whether this is the `_stream` twin of another operation.
     #[serde(skip)]
     pub(crate) stream: bool,
@@ -687,6 +716,22 @@ pub(crate) struct Operation {
     body_stream_property: Option<String>,
 }
 
+/// Whether the operation is generated, given `include_mode` and the `exclude` list.
+pub(crate) fn is_generated(
+    operation_id: &str,
+    internal: bool,
+    include_mode: IncludeMode,
+    excluded: &BTreeSet<String>,
+    specified: &BTreeSet<String>,
+) -> bool {
+    let included = match include_mode {
+        IncludeMode::OnlyPublic => !internal,
+        IncludeMode::PublicAndInternal => true,
+        IncludeMode::OnlySpecified => specified.contains(operation_id),
+    };
+    included && !excluded.contains(operation_id)
+}
+
 impl Operation {
     /// Whether the request carries a body.
     pub(crate) fn has_body(&self) -> bool {
@@ -724,9 +769,8 @@ impl Operation {
         op: openapi::Operation,
         component_schemas: &IndexMap<String, aide::openapi::SchemaObject>,
         include_mode: IncludeMode,
-        excluded_operations: &BTreeSet<String>,
         specified_operations: &BTreeSet<String>,
-    ) -> anyhow::Result<Option<(Vec<String>, Self)>> {
+    ) -> anyhow::Result<Option<(String, Self)>> {
         let op_id = op
             .operation_id
             .context("missing operationId (derived ids are added while reading the spec)")?;
@@ -735,12 +779,14 @@ impl Operation {
             .extensions
             .get("x-internal")
             .is_some_and(|val| val == true);
-        let include_operation = match include_mode {
-            IncludeMode::OnlyPublic => !x_internal,
-            IncludeMode::PublicAndInternal => true,
-            IncludeMode::OnlySpecified => specified_operations.contains(&op_id),
-        };
-        if !include_operation || excluded_operations.contains(&op_id) {
+        // Excluded operations are read too: `Api::new` drops them once they are placed and named.
+        if !is_generated(
+            &op_id,
+            x_internal,
+            include_mode,
+            &BTreeSet::new(),
+            specified_operations,
+        ) {
             return Ok(None);
         }
 
@@ -748,7 +794,7 @@ impl Operation {
             Some(tag) => tag.clone(),
             None => resource_from_path(path),
         };
-        let res_path = vec![resource_name(&tag)];
+        let tag = resource_name(&tag);
         // `repos/get-content` style ids already carry their resource.
         let op_name = op_id.rsplit('/').next().unwrap_or(&op_id).to_owned();
 
@@ -779,6 +825,7 @@ impl Operation {
                     typed_path_params.push(TypedParam {
                         name: parameter_data.name.clone(),
                         r#type,
+                        example: parameter_example(&parameter_data, component_schemas),
                     });
                     path_styles.extend(path_style.map(|style| (name.clone(), style)));
                     path_params.push(parameter_data.name);
@@ -886,6 +933,7 @@ impl Operation {
             typed_path_params.push(TypedParam {
                 name: name.clone(),
                 r#type: FieldType::String,
+                example: None,
             });
         }
         disambiguate_parameters(&path_params, &mut query_params, &mut header_params);
@@ -922,8 +970,23 @@ impl Operation {
                 return Err(SpecError("`x-perseid-name` must be a non-empty string").into());
             }
         };
+        let x_perseid_resource = match op.extensions.get("x-perseid-resource") {
+            None => None,
+            Some(serde_json::Value::String(path)) => {
+                Some(super::nesting::resource_path(path).map_err(|_| {
+                    SpecError(
+                        "`x-perseid-resource` must be a dotted path of at most three snake_case \
+                         resource names, `workspaces.peers`, none a member of the generated \
+                         resources (`client`, `with_raw_response`...)",
+                    )
+                })?)
+            }
+            Some(_) => return Err(SpecError("`x-perseid-resource` must be a string").into()),
+        };
         let op = Operation {
             x_perseid_name,
+            x_perseid_resource,
+            root: None,
             stream: false,
             id: op_id,
             name: op_name,
@@ -967,7 +1030,7 @@ impl Operation {
             pagination: None,
             x_pagination,
         };
-        Ok(Some((res_path, op)))
+        Ok(Some((tag, op)))
     }
 
     /// The `{name}_stream` twin of an operation answering JSON or an event stream, for the
@@ -1072,17 +1135,19 @@ impl Operation {
         Ok(())
     }
 
-    /// Applies `x-pagination`, or the first perseid.toml rule matching this operation.
+    /// Applies `x-pagination`, or the first perseid.toml rule matching this operation, else
+    /// with `detect` the [detected](super::pagination::detected) list shape.
     fn resolve_pagination(
         &mut self,
         rules: &[config::Pagination],
+        detect: bool,
         types: &Types,
     ) -> anyhow::Result<()> {
         let candidate = Candidate {
             query_params: self
                 .query_params
                 .iter()
-                .map(|p| (p.name.as_str(), &p.r#type))
+                .map(|p| (p.name.as_str(), &p.r#type, p.required))
                 .collect(),
             response: self.response_body_schema_name.as_deref(),
         };
@@ -1113,7 +1178,11 @@ impl Operation {
                         Err(_) => {}
                     }
                 }
-                found
+                let detected = super::pagination::detected();
+                found.or_else(|| {
+                    let detected = detect.then_some(&detected)?;
+                    Pagination::resolve(detected, &candidate, types, true).ok()
+                })
             }
         };
         if let Some(pagination) = &self.pagination {
@@ -1215,7 +1284,7 @@ impl Operation {
 
 /// A tag as a resource name, which every SDK can use as an identifier: `1-Click Apps` becomes
 /// `one_click_apps`, `Requête` `requete` and `OAuth` `oauth`.
-fn resource_name(tag: &str) -> String {
+pub(crate) fn resource_name(tag: &str) -> String {
     const DIGITS: [&str; 10] = [
         "zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine",
     ];
@@ -1463,6 +1532,37 @@ fn is_collection_schema(
             );
     }
     false
+}
+
+/// The `example` of a parameter, else its first `examples` value, else its schema's example.
+fn parameter_example(
+    data: &openapi::ParameterData,
+    schemas: &IndexMap<String, openapi::SchemaObject>,
+) -> Option<serde_json::Value> {
+    let named = data
+        .examples
+        .values()
+        .find_map(|e| e.as_item()?.value.clone());
+    if let Some(example) = data.example.clone().or(named) {
+        return Some(example);
+    }
+    let openapi::ParameterSchemaOrContent::Schema(schema) = &data.format else {
+        return None;
+    };
+    let mut schema = schema;
+    for _ in 0..16 {
+        let Schema::Object(obj) = &schema.json_schema else {
+            return None;
+        };
+        let own = (schema.example.clone())
+            .or_else(|| obj.extensions.get("example").cloned())
+            .or_else(|| obj.metadata.as_ref()?.examples.first().cloned());
+        if own.is_some() {
+            return own;
+        }
+        schema = schemas.get(&get_schema_name(obj.reference.as_deref())?)?;
+    }
+    None
 }
 
 /// How a path parameter is serialized, or `None` for a plain `simple` text scalar, which SDKs
@@ -1865,6 +1965,9 @@ pub(crate) struct TypedParam {
     pub(crate) name: String,
     #[serde(serialize_with = "serialize_field_type")]
     pub(crate) r#type: FieldType,
+    /// The example of the parameter, else of its schema.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) example: Option<serde_json::Value>,
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -2163,7 +2266,6 @@ mod tests {
             &schemas,
             IncludeMode::OnlyPublic,
             &BTreeSet::new(),
-            &BTreeSet::new(),
         )
         .unwrap()
         .unwrap();
@@ -2199,7 +2301,6 @@ mod tests {
             op,
             &schemas,
             IncludeMode::OnlyPublic,
-            &BTreeSet::new(),
             &BTreeSet::new(),
         )
         .unwrap()
@@ -2372,7 +2473,6 @@ mod tests {
             &IndexMap::new(),
             IncludeMode::OnlyPublic,
             &BTreeSet::new(),
-            &BTreeSet::new(),
         )
         .unwrap()
         .unwrap();
@@ -2381,7 +2481,7 @@ mod tests {
 
     #[test]
     fn prefixed_operation_ids_keep_their_short_name_unless_it_collides() {
-        let mut resource = Resource::new("repos".into());
+        let mut resource = Resource::new(vec!["repos".into()]);
         resource.operations = vec![
             operation("repos/get"),
             operation("gists/get"),
@@ -2410,7 +2510,6 @@ mod tests {
             &IndexMap::new(),
             IncludeMode::OnlyPublic,
             &BTreeSet::new(),
-            &BTreeSet::new(),
         )
         .err()
         .unwrap();
@@ -2427,7 +2526,6 @@ mod tests {
             serde_json::from_value(op).unwrap(),
             &IndexMap::new(),
             IncludeMode::OnlyPublic,
-            &BTreeSet::new(),
             &BTreeSet::new(),
         )?
         .unwrap();
@@ -2553,7 +2651,6 @@ mod tests {
             &IndexMap::new(),
             IncludeMode::OnlyPublic,
             &BTreeSet::new(),
-            &BTreeSet::new(),
         )
         .unwrap()
         .unwrap();
@@ -2626,7 +2723,6 @@ mod tests {
             serde_json::from_value(op).unwrap(),
             &IndexMap::new(),
             IncludeMode::OnlyPublic,
-            &BTreeSet::new(),
             &BTreeSet::new(),
         )
         .unwrap()

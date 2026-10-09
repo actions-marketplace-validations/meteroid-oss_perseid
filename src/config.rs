@@ -75,6 +75,10 @@ pub struct Config {
     /// Method names by operation id, over the resource-style names.
     #[serde(default, rename = "methods")]
     pub names: BTreeMap<String, String>,
+    /// Resources by operation id, over the ones derived from tags and paths: `workspaces.peers`
+    /// puts the method in `client.workspaces.peers`, `workspaces` in the top-level resource.
+    #[serde(default)]
+    pub resources: BTreeMap<String, String>,
     /// Also generates the operations marked `x-internal: true`.
     #[serde(default)]
     pub internal: bool,
@@ -84,6 +88,9 @@ pub struct Config {
     /// Operation ids left out of every SDK.
     #[serde(default)]
     pub exclude: Vec<String>,
+    /// `false` pages only the operations that `x-pagination` or a `pagination` rule matches,
+    /// not the Stripe-style lists perseid detects.
+    pub detect_pagination: Option<bool>,
     /// Paginated list operations, detected from their query parameter and response shape.
     #[serde(default, deserialize_with = "one_or_many")]
     #[schemars(with = "OneOrMany")]
@@ -118,6 +125,10 @@ pub struct Config {
     #[serde(default, deserialize_with = "target::<CSharp, _>")]
     #[schemars(with = "Option<CSharp>")]
     pub csharp: Option<Target>,
+    /// What perseid writes besides the SDKs, each into one folder of a repository through pull
+    /// requests: `[targets.docs]`.
+    #[serde(default)]
+    pub targets: BTreeMap<String, TargetTable>,
     #[serde(skip)]
     pub home: Home,
 }
@@ -200,6 +211,51 @@ impl Language {
     pub fn name(self) -> &'static str {
         LANGUAGES[self as usize]
     }
+}
+
+/// A `[targets.<name>]` table: what perseid writes besides the SDKs, as pull requests on `repo`.
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct TargetTable {
+    /// What the target writes: the table's name by default, so `[targets.docs]` is a `docs`
+    /// target. Set it to name the table otherwise, such as two `docs` targets.
+    pub kind: Option<TargetKind>,
+    /// `owner/name` of the repository the target writes to.
+    pub repo: String,
+    /// The only folder perseid writes in `repo`, replaced whole: `api` by default.
+    pub path: Option<String>,
+    /// When its pull request opens: once every SDK generated from the current spec is released
+    /// (`sdks`, the default), or with the SDK pull requests (`generate`).
+    pub after: Option<After>,
+}
+
+/// What a target writes.
+#[derive(Clone, Copy, Debug, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum TargetKind {
+    /// The spec and `docs-data.json`, for docs sites showing the reader's SDK language.
+    Docs,
+}
+
+impl TargetKind {
+    pub const ALL: [TargetKind; 1] = [TargetKind::Docs];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            TargetKind::Docs => "docs",
+        }
+    }
+}
+
+/// When a target's pull request opens.
+#[derive(Clone, Copy, Debug, Default, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum After {
+    /// With the SDK pull requests, in the same run.
+    Generate,
+    /// Once every SDK generated from the current spec is released.
+    #[default]
+    Sdks,
 }
 
 fn default_spec() -> String {
@@ -384,6 +440,10 @@ pub struct Pagination {
     pub next_cursor: Option<String>,
     /// Field of the last item that is the next cursor, e.g. `id` for `starting_after`.
     pub item_cursor: Option<String>,
+    /// With `item_cursor`, query parameter taking the cursor to list the items before, as
+    /// Stripe's `ending_before`: a list started from it pages backwards, from the first item of
+    /// each page. `ending_before` by default when `cursor` is `starting_after`.
+    pub before: Option<String>,
     /// Boolean telling whether more pages follow.
     pub has_more: Option<String>,
     /// Number of pages.
@@ -537,18 +597,56 @@ impl Config {
             self.spec
         );
         self.listed()?;
+        for (id, dotted) in &self.resources {
+            if let Err(why) = crate::api::nesting::resource_path(dotted) {
+                anyhow::bail!("[resources] `{id} = {dotted:?}`: `{dotted}` {why}");
+            }
+        }
         ensure!(
             !self.internal || self.only.is_empty(),
             "`only` lists every operation generated: `internal` can't add any, delete it"
         );
+        for target in self.targets(&[])? {
+            ensure!(
+                target.after == After::Generate || self.release != Some(false),
+                "[targets.{}] waits for the SDK releases (`after = \"sdks\"`), which `release = false` leaves to you: set `after = \"generate\"`",
+                target.name
+            );
+        }
         Ok(())
+    }
+
+    /// The `[targets]` named `selected`, or all of them.
+    pub fn targets(&self, selected: &[String]) -> Result<Vec<crate::targets::Target>> {
+        for name in selected {
+            ensure!(
+                self.targets.contains_key(name),
+                "no [targets.{name}] in {FILE}"
+            );
+        }
+        self.targets
+            .iter()
+            .filter(|(name, _)| selected.is_empty() || selected.contains(name))
+            .map(|(name, table)| crate::targets::Target::of(name, table))
+            .collect()
+    }
+
+    /// Whether a target waits for the SDK releases, which the release workflows then report.
+    pub fn awaits_releases(&self) -> bool {
+        (self.targets.values()).any(|t| t.after.unwrap_or_default() == After::Sdks)
+    }
+
+    /// The repository the SDK release workflows report their releases to: the one holding
+    /// perseid.toml, when a target waits for them.
+    pub fn reports_to(&self) -> Option<&str> {
+        self.home.repo().filter(|_| self.awaits_releases())
     }
 
     /// The language tables, checked against `sdks`.
     fn listed(&self) -> Result<()> {
         let tables: Vec<&str> = LANGUAGES
             .into_iter()
-            .zip(self.targets())
+            .zip(self.tables())
             .filter_map(|(language, target)| target.as_ref().map(|_| language))
             .collect();
         if self.sdks.is_empty() {
@@ -574,7 +672,7 @@ impl Config {
         Ok(())
     }
 
-    fn targets(&self) -> [&Option<Target>; 6] {
+    fn tables(&self) -> [&Option<Target>; 6] {
         [
             &self.rust,
             &self.typescript,
@@ -608,8 +706,10 @@ impl Config {
             excluded: self.exclude.iter().cloned().collect(),
             specified: self.only.iter().cloned().collect(),
             pagination: self.pagination.clone(),
+            detect_pagination: self.detect_pagination != Some(false),
             reserved: BTreeSet::new(),
             names: self.names.clone(),
+            resources: self.resources.clone(),
             uuid_strings: self.types.uuid == Some(UuidType::String),
         }
     }
@@ -624,7 +724,7 @@ impl Config {
         self.listed()?;
         let all: Vec<_> = LANGUAGES
             .into_iter()
-            .zip(self.targets())
+            .zip(self.tables())
             .filter(|(language, _)| self.sdks.iter().any(|l| l.name() == *language))
             .map(|(language, target)| {
                 let target = target.as_ref().unwrap_or(&DEFAULT_TARGET);
@@ -1099,6 +1199,40 @@ mod tests {
                 .unwrap()
         );
         assert!(error.contains("perseid connect"), "{error}");
+    }
+
+    #[test]
+    fn resources_are_dotted_snake_case_paths_three_deep_at_most() {
+        let config =
+            |path: &str| format!("name = \"A\"\nsdks = [\"go\"]\n[resources]\nop = \"{path}\"\n");
+        assert!(load(&config("workspaces")).is_ok());
+        assert!(load(&config("admin.audit.logs")).is_ok());
+        assert!(load(&config("v2_admin.users")).is_ok());
+        let error = |path: &str| format!("{:#}", load(&config(path)).err().unwrap());
+        assert!(
+            error("a.b.c.d").contains("[resources] `op = \"a.b.c.d\"`: `a.b.c.d` nests 4 resources, perseid nests 3 at most"),
+            "{}",
+            error("a.b.c.d")
+        );
+        for bad in [
+            "Workspaces",
+            "workspaces.Peers",
+            "workspaces..peers",
+            "work-spaces",
+            "_x",
+            "x_",
+            "1x",
+        ] {
+            assert!(
+                error(bad).contains("is not a snake_case name"),
+                "{bad}: {}",
+                error(bad)
+            );
+        }
+        assert!(
+            error("schools.client").contains("`client` is a member of the generated resources")
+        );
+        assert!(load(&config("client")).is_ok());
     }
 
     #[test]

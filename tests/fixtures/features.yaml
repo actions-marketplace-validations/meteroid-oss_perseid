@@ -41,6 +41,7 @@ paths:
       parameters:
         - { name: widget_id, in: path, required: true, schema: { type: string } }
         - { name: starting_after, in: query, schema: { type: string } }
+        - { name: ending_before, in: query, schema: { type: string } }
         - { name: kind, in: query, required: true, schema: { type: string } }
       responses:
         '200':
@@ -223,6 +224,20 @@ paths:
             properties:
               gte: { type: integer }
               lt: { type: integer }
+        - name: created
+          in: query
+          style: deepObject
+          explode: true
+          schema:
+            anyOf:
+              - title: range_query_specs
+                type: object
+                properties:
+                  gt: { type: integer }
+                  gte: { type: integer }
+                  lt: { type: integer }
+                  lte: { type: integer }
+              - type: integer
       responses:
         '200':
           description: the query as the server read it

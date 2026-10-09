@@ -1,7 +1,7 @@
 {% from "types/macros.go.jinja" import go_local, go_arg, go_query_scalar, go_header_type, go_type, go_ident, go_export, go_security, go_strings, go_field_type, go_words, go_article, go_path_guard, go_path_value, go_union -%}
 {% set resource_type_name = go_ident(resource.name) -%}
 {#- The union a query parameter typed as untyped JSON keeps, declared next to the operation
-    when its variants are scalars, lists or named schemas told apart by their JSON type. -#}
+    when its variants are scalars, lists or named schemas. -#}
 {% macro param_union(op, p) -%}
     {%- if p.typed_union is defined and p.structured -%}
         {%- set ns = namespace(ok=true) -%}
@@ -9,7 +9,7 @@
             {%- set nested = namespace(t=v.type) -%}
             {%- for level in range(3) %}{% if nested.t.is_list() or nested.t.is_set() %}{% set nested.t = nested.t.inner_type() %}{% endif %}{% endfor -%}
             {%- set t = nested.t -%}
-            {%- if not (t.to_go() in ["string", "bool", "int16", "int32", "int64", "uint16", "uint64", "float32", "float64"] or (t.is_schema_ref() and v.json_type not in ["", "object"])) %}{% set ns.ok = false %}{% endif -%}
+            {%- if not (t.to_go() in ["string", "bool", "int16", "int32", "int64", "uint16", "uint64", "float32", "float64"] or (t.is_schema_ref() and v.json_type != "")) %}{% set ns.ok = false %}{% endif -%}
         {%- endfor -%}
         {%- if ns.ok %}{{ (resource_type_name ~ (op.name | ident("pascal", "go")) ~ (p.ident | ident("pascal", "go"))) | go_name }}{% endif -%}
     {%- endif -%}
@@ -63,6 +63,7 @@ package {{ sdk.package_name }}
 {% for p in op.path_params if p in op.path_styles and op.path_styles[p].type is defined %}{% if "json." in go_type(op.path_styles[p].type) %}{% set ns.json = true %}{% endif %}{% if "time." in go_type(op.path_styles[p].type) %}{% set ns.time = true %}{% endif %}{% endfor -%}
 {% for p in op.path_params if p in op.path_styles and op.path_styles[p].type is defined %}{% if "uuid." in go_type(op.path_styles[p].type) %}{% set ns.uuid = true %}{% endif %}{% endfor -%}
 {% endfor -%}
+{% if resource.operations -%}
 import (
 	"context"
 {% if ns.io %}	"io"
@@ -72,6 +73,7 @@ import (
 {% endif %}{% if ns.uuid %}
 	"github.com/google/uuid"
 {% endif %})
+{% endif -%}
 
 {% for op in resource.operations if op.request_body_kind == "multipart" %}
 {% set body_type_name = (resource_type_name ~ (op.name | ident("pascal", "go")) ~ "Body") | go_name %}
@@ -105,11 +107,17 @@ type {{ options_type_name }} struct {
 {% endif %}{% if op.response_body_union is defined and op.response_body_union not in types %}
 {{ go_union(go_ident(op.response_body_union), op.response_body_json_type) }}
 {% endif %}{% endfor %}
-// {{ resource_type_name }} groups the {{ go_words(resource.name) }} operations of the {{ sdk.client_name }} API.
+// {{ resource_type_name }} groups the {{ go_words(resource.path | join("_")) }} operations of the {{ sdk.client_name }} API.
 type {{ resource_type_name }} struct {
 	client *Client
 }
-
+{% for child in resource.children %}
+{% set name = go_ident(child.accessor) %}
+// {{ name }} returns the {{ go_words(child.accessor) }} API.
+func (a *{{ resource_type_name }}) {{ name }}() *{{ go_ident(child.name) }} {
+	return &{{ go_ident(child.name) }}{client: a.client}
+}
+{% endfor %}
 {% for op in resource.operations %}
 {% set name = go_export(op.name) %}
 {% set required_query = op.query_params | selectattr("required") | list %}
@@ -256,6 +264,7 @@ type {{ resource_type_name }} struct {
 {% set item_type = go_ident(pg.item_schema) %}
 {% set cursor = go_arg(param.ident) if param.required else "params." ~ go_export(param.ident) %}
 {% set pointer = not param.required %}
+{% if pg.before is defined %}{% set before = "params." ~ go_export((op.query_params | selectattr("name", "equalto", pg.before) | first).ident) %}{% endif -%}
 {% set page_type = (resource_type_name ~ (op.name | ident("pascal", "go")) ~ "Page") | go_name %}
 {% set body_type = ret_type[1:] if ret_type is startingwith("*") else ret_type %}
 {% set body_value = "*resp" if ret_type is startingwith("*") else "resp" %}
@@ -320,16 +329,33 @@ func (p *{{ page_type }}) pageItems() []{{ item_type }} { return p.Items }
 {%- if pg.style == "cursor" %}
 {%- if pg.next_cursor is defined %}{% set root = "resp" %}{% set path = pg.next_cursor %}{% set flags = opt["next_cursor"] %}
 {%- else %}{% set root = "last" %}{% set path = [pg.item_cursor] %}{% set flags = opt["item_cursor"] %}	last := page.Items[len(page.Items)-1]
-{% endif %}
+{% if pg.before is defined %}	backwards := {{ before }} != nil
+	if backwards {
+		last = page.Items[0]
+	}
+{% endif %}{% endif %}
 {%- set missing = go_path_guard(root, path, flags, true, true) %}
 {%- if missing %}	if {{ missing }} {
 		return page, nil
 	}
 {% endif %}	next := {{ go_path_value(root, path, flags) }}
-	if next == "" || {% if pointer %}({{ cursor }} != nil && *{{ cursor }} == next){% else %}{{ cursor }} == next{% endif %} {
+{% if pg.before is defined %}	current := {{ cursor }}
+	if backwards {
+		current = {{ before }}
+	}
+	if next == "" || (current != nil && *current == next) {
+		return page, nil
+	}
+	if backwards {
+		{{ before }} = &next
+	} else {
+		{{ cursor }} = &next
+	}
+{% else %}	if next == "" || {% if pointer %}({{ cursor }} != nil && *{{ cursor }} == next){% else %}{{ cursor }} == next{% endif %} {
 		return page, nil
 	}
 	{{ cursor }} = {% if pointer %}&{% endif %}next
+{% endif %}
 {% elif pg.style == "page" %}
 {%- set ptype = go_type(param.type) %}
 {%- if pointer %}	current := {{ ptype }}({{ pg.first_page }})

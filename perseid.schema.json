@@ -29,6 +29,10 @@
         }
       ]
     },
+    "detect_pagination": {
+      "description": "`false` pages only the operations that `x-pagination` or a `pagination` rule matches, not the Stripe-style lists perseid detects.",
+      "type": "boolean"
+    },
     "exclude": {
       "description": "Operation ids left out of every SDK.",
       "default": [],
@@ -122,6 +126,14 @@
       "description": "Default repository of every SDK: `owner/name-{lang}` gives each its own (`{lang}` is the language: `typescript`, `python`…), `owner/name` holds them all in folders named after their language. Without it, the SDKs live next to perseid.toml.",
       "type": "string"
     },
+    "resources": {
+      "description": "Resources by operation id, over the ones derived from tags and paths: `workspaces.peers` puts the method in `client.workspaces.peers`, `workspaces` in the top-level resource.",
+      "default": {},
+      "type": "object",
+      "additionalProperties": {
+        "type": "string"
+      }
+    },
     "round_trips": {
       "description": "Also generates a test decoding and encoding sample JSON of every model, with `tests`.",
       "type": "boolean"
@@ -153,6 +165,13 @@
       "description": "The OpenAPI document (3.0 or 3.1, JSON or YAML) generated from: a path relative to perseid.toml, where `perseid connect` pushes it from another repository, or an http(s) URL.",
       "default": "openapi.json",
       "type": "string"
+    },
+    "targets": {
+      "description": "What perseid writes besides the SDKs, each into one folder of a repository through pull requests: `[targets.docs]`.",
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/definitions/TargetTable"
+      }
     },
     "tests": {
       "description": "`false` leaves out the tests generated with each SDK, one per operation.",
@@ -199,6 +218,25 @@
   },
   "additionalProperties": false,
   "definitions": {
+    "After": {
+      "description": "When a target's pull request opens.",
+      "oneOf": [
+        {
+          "description": "With the SDK pull requests, in the same run.",
+          "type": "string",
+          "enum": [
+            "generate"
+          ]
+        },
+        {
+          "description": "Once every SDK generated from the current spec is released.",
+          "type": "string",
+          "enum": [
+            "sdks"
+          ]
+        }
+      ]
+    },
     "CSharp": {
       "type": "object",
       "properties": {
@@ -525,6 +563,10 @@
       "description": "How a list operation pages, as `x-pagination` on an operation or `[pagination]` in perseid.toml. Exactly one of `cursor`, `page` or `offset` names the query parameter selecting the page; response values are dotted paths of JSON property names. A perseid.toml rule without `operations` uses `has_more`, `total_pages` and `total` only in responses that have them.",
       "type": "object",
       "properties": {
+        "before": {
+          "description": "With `item_cursor`, query parameter taking the cursor to list the items before, as Stripe's `ending_before`: a list started from it pages backwards, from the first item of each page. `ending_before` by default when `cursor` is `starting_after`.",
+          "type": "string"
+        },
         "cursor": {
           "description": "Query parameter taking the cursor of the page.",
           "type": "string"
@@ -756,6 +798,52 @@
         "webhooks": {
           "description": "Installs the Standard Webhooks signature verifier, over the top-level setting.",
           "type": "boolean"
+        }
+      },
+      "additionalProperties": false
+    },
+    "TargetKind": {
+      "description": "What a target writes.",
+      "oneOf": [
+        {
+          "description": "The spec and `docs-data.json`, for docs sites showing the reader's SDK language.",
+          "type": "string",
+          "enum": [
+            "docs"
+          ]
+        }
+      ]
+    },
+    "TargetTable": {
+      "description": "A `[targets.<name>]` table: what perseid writes besides the SDKs, as pull requests on `repo`.",
+      "type": "object",
+      "required": [
+        "repo"
+      ],
+      "properties": {
+        "after": {
+          "description": "When its pull request opens: once every SDK generated from the current spec is released (`sdks`, the default), or with the SDK pull requests (`generate`).",
+          "allOf": [
+            {
+              "$ref": "#/definitions/After"
+            }
+          ]
+        },
+        "kind": {
+          "description": "What the target writes: the table's name by default, so `[targets.docs]` is a `docs` target. Set it to name the table otherwise, such as two `docs` targets.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/TargetKind"
+            }
+          ]
+        },
+        "path": {
+          "description": "The only folder perseid writes in `repo`, replaced whole: `api` by default.",
+          "type": "string"
+        },
+        "repo": {
+          "description": "`owner/name` of the repository the target writes to.",
+          "type": "string"
         }
       },
       "additionalProperties": false

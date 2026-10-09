@@ -52,16 +52,7 @@ pub(crate) fn generate_with_output_context(
         .rsplit_once(".")
         .context("template name must contain '.'")?;
 
-    if language != "rs" {
-        api.inline_aliases()?;
-    }
-    api.settle_object_unions(&sdk);
-    if language == "java" {
-        api.inline_string_alias_bodies()?;
-    }
-    if matches!(language, "cs" | "go" | "rs") {
-        api.inline_flattened_fields()?;
-    }
+    for_language(&mut api, &sdk, language)?;
 
     let tpl_kind = match tpl_base_name {
         "api_resource" => TemplateKind::ApiResource,
@@ -135,6 +126,25 @@ pub(crate) fn generate_with_output_context(
     Ok(generated_paths)
 }
 
+/// Shapes `api` as the templates of `language` (`rs`, `ts`...) receive it.
+pub(crate) fn for_language(
+    api: &mut Api,
+    sdk: &serde_json::Value,
+    language: &str,
+) -> anyhow::Result<()> {
+    if language != "rs" {
+        api.inline_aliases()?;
+    }
+    api.settle_object_unions(sdk);
+    if language == "java" {
+        api.inline_string_alias_bodies()?;
+    }
+    if matches!(language, "cs" | "go" | "rs") {
+        api.inline_flattened_fields()?;
+    }
+    Ok(())
+}
+
 struct Generator<'a> {
     tpl: Template<'a, 'a>,
     tpl_file_ext: &'a str,
@@ -143,16 +153,9 @@ struct Generator<'a> {
 
 impl Generator<'_> {
     fn generate_api_resources_options(self, api: Api) -> anyhow::Result<Vec<Utf8PathBuf>> {
-        self.generate_api_resources_options_inner(api.resources.values(), &errors_context(&api))
-    }
-
-    fn generate_api_resources_options_inner<'a>(
-        &self,
-        resources: impl Iterator<Item = &'a Resource>,
-        errors: &minijinja::Value,
-    ) -> anyhow::Result<Vec<Utf8PathBuf>> {
+        let errors = &errors_context(&api);
         let mut generated_paths = vec![];
-        for resource in resources {
+        for resource in api.resources.values() {
             let referenced_components = resource.referenced_components();
             for operation in &resource.operations {
                 if operation.has_query_or_header_params() {
@@ -162,13 +165,7 @@ impl Generator<'_> {
                     )?);
                 }
             }
-
-            generated_paths.extend_from_slice(
-                &self
-                    .generate_api_resources_options_inner(resource.subresources.values(), errors)?,
-            );
         }
-
         Ok(generated_paths)
     }
 
@@ -176,27 +173,14 @@ impl Generator<'_> {
         // Every schema, for templates that read the fields of a request body.
         let types = minijinja::Value::from_serialize(&api.types);
         let shared = context! { types, ..errors_context(&api) };
-        self.generate_api_resources_inner(api.resources.values(), &shared)
-    }
-
-    fn generate_api_resources_inner<'a>(
-        &self,
-        resources: impl Iterator<Item = &'a Resource>,
-        errors: &minijinja::Value,
-    ) -> anyhow::Result<Vec<Utf8PathBuf>> {
         let mut generated_paths = vec![];
-
-        for resource in resources {
+        for resource in api.resources.values() {
             let referenced_components = resource.referenced_components();
             generated_paths.extend_from_slice(&self.render_tpl(
                 Some(&resource.name),
-                context! { resource, referenced_components, ..errors.clone() },
+                context! { resource, referenced_components, ..shared.clone() },
             )?);
-            generated_paths.extend_from_slice(
-                &self.generate_api_resources_inner(resource.subresources.values(), errors)?,
-            );
         }
-
         Ok(generated_paths)
     }
 

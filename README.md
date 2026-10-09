@@ -69,7 +69,7 @@ var pets = await petstore.Pets.ListAsync(new() { Limit = 10, Status = PetStatus.
 
 ## Features
 
-| | |
+| Area | Support |
 |---|---|
 | Languages | Rust, TypeScript, Python (sync and async), Go, Java, C# |
 | Requests | Typed errors by status, retries with backoff and `Retry-After`, idempotency keys, per-call timeouts and headers |
@@ -135,7 +135,7 @@ See [repository layouts](docs/ci.md#repository-layouts).
 
 ## Commands
 
-| Command | |
+| Command | Description |
 |---|---|
 | `init` | Write `perseid.toml` and the workflows. Local only: nothing is sent to GitHub. |
 | `generate` | Write the SDKs. `--out <dir>` previews, `--check` fails on drift, `--pr` opens pull requests. |
@@ -144,6 +144,8 @@ See [repository layouts](docs/ci.md#repository-layouts).
 | `app` | Set up a GitHub App of your own instead of the perseid App. |
 | `status` | Check the setup: secrets, workflows, last spec pushed, open pull requests, last runs. |
 | `inspect` | Print the model the templates receive, as JSON. |
+| `docs-data` | Print how each SDK names and calls every operation, as JSON for a docs site. See [docs data](docs/customizing.md#docs-data). |
+| `targets` | Write the [targets](docs/ci.md#targets) of `perseid.toml`, such as the spec and docs data of a docs repository. `--out <dir>` previews, `--pr` opens pull requests. |
 | `eject <lang>` | Copy the built-in templates and runtime of a language to `.perseid/` to edit them. |
 | `tools list`, `tools install` | List or download the pinned formatters and oasdiff. |
 

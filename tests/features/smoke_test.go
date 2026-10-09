@@ -56,6 +56,9 @@ func TestSmoke(t *testing.T) {
 	expect(t, ids(t, client.Widgets().ListAutoPaging(ctx, nil), widget), []string{"w1", "w2", "w3"})
 	events := client.Widgets().ListEventsAutoPaging(ctx, "w1", "created", nil)
 	expect(t, ids(t, events, func(e Event) string { return e.ID }), []string{"e1", "e2", "e3"})
+	before := "e9"
+	events = client.Widgets().ListEventsAutoPaging(ctx, "w1", "created", &WidgetsListEventsOptions{EndingBefore: &before})
+	expect(t, ids(t, events, func(e Event) string { return e.ID }), []string{"e7", "e8", "e6"})
 	gadgets := client.Gadgets().ListAutoPaging(ctx, nil)
 	var gadgetIds []string
 	for gadgets.Next() {
@@ -250,10 +253,12 @@ func TestSmokeWire(t *testing.T) {
 		IDs:      Ptr(NewWireSearchIDsFromArrayOfStrings([]string{"x", "y"})),
 		Tags:     []string{"t1", "t2"},
 		Range:    &SearchRange{Gte: Ptr[int64](1), Lt: Ptr[int64](9)},
+		Created:  Ptr(NewWireSearchCreatedFromRangeQuerySpecs(RangeQuerySpecs{Gte: Ptr[int64](3), Lt: Ptr[int64](7)})),
 	}
 	expect(t, status(wire.Search(ctx, search)),
-		"expand[]=a&expand[]=b&filter[amount][gte]=5&filter[status]=open&ids=x&ids=y"+
+		"created[gte]=3&created[lt]=7&expand[]=a&expand[]=b&filter[amount][gte]=5&filter[status]=open&ids=x&ids=y"+
 			"&metadata[k]=v&range[gte]=1&range[lt]=9&tags=t1,t2")
+	expect(t, status(wire.Search(ctx, &WireSearchOptions{Created: Ptr(NewWireSearchCreatedFromInteger(5))})), "created=5")
 	charge := Charge{
 		Amount:   100,
 		Capture:  Ptr(true),
@@ -422,7 +427,7 @@ func TestScenarioContent(t *testing.T) {
 		expect(t, asJSON(t, health.ExtraFields["list"]), []any{float64(1), "x"})
 	})
 	t.Run("nulls", func(t *testing.T) {
-		bag, err := content.ListScenariosNulls(ctx)
+		bag, err := content.Nulls().Retrieve(ctx)
 		must(t, err)
 		expect(t, bag.Name == nil, true)
 		expect(t, bag.Tags, RequiredSlice[*string]{Ptr("a"), nil, Ptr("b")})
@@ -435,7 +440,7 @@ func TestScenarioContent(t *testing.T) {
 			Tags:   RequiredSlice[*string]{Ptr("a"), nil},
 			Counts: RequiredMap[*int64]{"x": nil, "y": Ptr[int64](2)},
 		}
-		echoed, err := content.CreateScenariosNull(ctx, sent)
+		echoed, err := content.Nulls().Create(ctx, sent)
 		must(t, err)
 		expect(t, echoed.Name == nil, true)
 		expect(t, echoed.Tags, sent.Tags)
@@ -482,10 +487,10 @@ func TestScenarioEncoding(t *testing.T) {
 	t.Run("bytes", func(t *testing.T) {
 		want := []byte("hello\xfb\xff\xfe")
 		// The SDK keeps a `format: byte` property as its standard base64 text.
-		echoed, err := encoding.CreateScenariosByte(ctx, Blob{Data: base64.StdEncoding.EncodeToString(want)})
+		echoed, err := encoding.Bytes().Create(ctx, Blob{Data: base64.StdEncoding.EncodeToString(want)})
 		must(t, err)
 		expect(t, echoed.Data, "aGVsbG/7//4=")
-		got, err := encoding.ListScenariosBytes(ctx)
+		got, err := encoding.Bytes().Retrieve(ctx)
 		must(t, err)
 		for _, blob := range []*Blob{echoed, got} {
 			decoded, err := base64.StdEncoding.DecodeString(blob.Data)

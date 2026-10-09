@@ -115,12 +115,12 @@ async function content(client: Features) {
   });
   assert.equal((await client.content.listScenariosExtraFields()).status, "ok");
 
-  const nulls = await client.content.listScenariosNulls();
+  const nulls = await client.content.nulls.retrieve();
   assert.equal(nulls.name, null);
   assert.deepEqual(nulls.tags, ["a", null, "b"]);
   assert.deepEqual(nulls.counts, { x: 1n, y: null });
   assert.equal(nulls.note, null);
-  const echoed = await client.content.createScenariosNull({
+  const echoed = await client.content.nulls.create({
     name: null,
     tags: ["a", null],
     counts: { x: null, y: 2n },
@@ -155,8 +155,8 @@ async function encoding(client: Features) {
   assert.equal(big.min, -9223372036854775808n);
 
   const sent = { data: BYTES_BASE64 };
-  assert.deepEqual(Array.from(Buffer.from((await client.encoding.createScenariosByte(sent)).data, "base64")), BYTES);
-  assert.deepEqual(Array.from(Buffer.from((await client.encoding.listScenariosBytes()).data, "base64")), BYTES);
+  assert.deepEqual(Array.from(Buffer.from((await client.encoding.bytes.create(sent)).data, "base64")), BYTES);
+  assert.deepEqual(Array.from(Buffer.from((await client.encoding.bytes.retrieve()).data, "base64")), BYTES);
 
   const queried = await client.encoding.retrieveScenariosDatetime({ since: INSTANT, day: "2024-01-02" });
   assert.equal(queried.at.getTime(), INSTANT.getTime());
@@ -323,6 +323,11 @@ async function main() {
     await collect(client.widgets.listEvents("w1", { kind: "created" })),
     ["e1", "e2", "e3"]
   );
+  // From `ending_before`, pages go backwards and never send `starting_after`.
+  assert.deepEqual(
+    await collect(client.widgets.listEvents("w1", { kind: "created", endingBefore: "e9" })),
+    ["e7", "e8", "e6"]
+  );
   assert.deepEqual(await collect(client.gadgets.list()), ["g1", "g2", "g3"]);
   assert.deepEqual(await collect(client.records.list()), ["r1", "r2", "r3"]);
 
@@ -452,12 +457,14 @@ async function main() {
     ids: ["x", "y"],
     tags: ["t1", "t2"],
     range: { gte: 1n, lt: 9n },
+    created: { gte: 3n, lt: 7n },
   });
   assert.equal(
     searched.status,
-    "expand[]=a&expand[]=b&filter[amount][gte]=5&filter[status]=open&ids=x&ids=y" +
+    "created[gte]=3&created[lt]=7&expand[]=a&expand[]=b&filter[amount][gte]=5&filter[status]=open&ids=x&ids=y" +
       "&metadata[k]=v&range[gte]=1&range[lt]=9&tags=t1,t2"
   );
+  assert.equal((await client.wire.search({ created: 5n })).status, "created=5");
   const charged = await client.wire.createCharge({
     amount: 100n,
     capture: true,

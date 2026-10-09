@@ -48,6 +48,13 @@ Ids(
     "e1,e2,e3",
     await Collect(client.Widgets.ListEventsAsync("w1", new() { Kind = "created" }), e => e.Id)
 );
+Ids(
+    "e7,e8,e6",
+    await Collect(
+        client.Widgets.ListEventsAsync("w1", new() { Kind = "created", EndingBefore = "e9" }),
+        e => e.Id
+    )
+);
 Ids("g1,g2,g3", await Collect(client.Gadgets.ListAsync(), g => g.Id));
 Ids("r1,r2,r3", await Collect(client.Records.ListAsync(), r => r.Id));
 
@@ -206,13 +213,15 @@ var searched = await client.Wire.SearchAsync(
         Ids = new List<string> { "x", "y" },
         Tags = ["t1", "t2"],
         Range = new SearchRange { Gte = 1, Lt = 9 },
+        Created = new RangeQuerySpecs { Gte = 3, Lt = 7 },
     }
 );
 Equal(
-    "expand[]=a&expand[]=b&filter[amount][gte]=5&filter[status]=open&ids=x&ids=y"
+    "created[gte]=3&created[lt]=7&expand[]=a&expand[]=b&filter[amount][gte]=5&filter[status]=open&ids=x&ids=y"
         + "&metadata[k]=v&range[gte]=1&range[lt]=9&tags=t1,t2",
     searched.Status
 );
+Equal("created=5", (await client.Wire.SearchAsync(new() { Created = 5 })).Status);
 var charged = await client.Wire.CreateChargeAsync(
     new Charge
     {
@@ -428,7 +437,7 @@ internal static class Scenarios
             "the list unknown field is kept"
         );
 
-        var nulls = await content.ListScenariosNullsAsync();
+        var nulls = await content.Nulls.RetrieveAsync();
         IsNull(nulls.Name, "name");
         Same<string?>(new string?[] { "a", null, "b" }, nulls.Tags);
         Equal(2, nulls.Counts.Count);
@@ -451,7 +460,7 @@ internal static class Scenarios
             ),
             $"the null bag is sent as {wire}"
         );
-        var echoed = await content.CreateScenariosNullAsync(sent);
+        var echoed = await content.Nulls.CreateAsync(sent);
         IsNull(echoed.Name, "echoed name");
         Same<string?>(new string?[] { "a", null }, echoed.Tags);
         IsNull(echoed.Counts["x"], "echoed counts.x");
@@ -495,8 +504,8 @@ internal static class Scenarios
         var hello = new byte[] { 0x68, 0x65, 0x6C, 0x6C, 0x6F, 0xFB, 0xFF, 0xFE };
         var sentBlob = new Blob { Data = Convert.ToBase64String(hello) };
         Equal("aGVsbG/7//4=", sentBlob.Data);
-        Same(hello, Convert.FromBase64String((await encoding.CreateScenariosByteAsync(sentBlob)).Data));
-        Same(hello, Convert.FromBase64String((await encoding.ListScenariosBytesAsync()).Data));
+        Same(hello, Convert.FromBase64String((await encoding.Bytes.CreateAsync(sentBlob)).Data));
+        Same(hello, Convert.FromBase64String((await encoding.Bytes.RetrieveAsync()).Data));
 
         var instant = new DateTimeOffset(2024, 1, 2, 3, 4, 5, 250, TimeSpan.Zero);
         var spellings = new[]

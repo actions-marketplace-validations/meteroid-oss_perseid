@@ -46,6 +46,9 @@ uuid = "typed"                      # or "string" for `format: uuid` values that
 [methods]                           # method names by operation id
 listWidgetEvents = "events"
 
+[resources]                         # resources by operation id, as dotted paths
+listWidgetEvents = "widgets.events"
+
 [pagination]                        # or [[pagination]] for several rules
 cursor = "starting_after"
 item_cursor = "id"
@@ -58,6 +61,11 @@ package = "@acme/sdk"
 int64 = "bigint"
 [go]
 repo = "acme/acme-golang"           # its own repository name, over the top-level `repo`
+
+[targets.docs]                      # besides the SDKs: the spec and docs data of a docs site
+repo = "acme/docs"                  # the repository it writes to, through pull requests
+path = "api"                        # the only folder perseid writes there, replaced whole
+after = "sdks"                      # once every SDK is released, or "generate": with the SDK PRs
 ```
 
 ## Editor completion
@@ -71,7 +79,7 @@ of every key with its description and allowed values.
 
 ## Spec, name and SDKs
 
-| Key | |
+| Key | Description |
 |---|---|
 | `spec` | The OpenAPI document, a path relative to `perseid.toml` (`openapi.json` by default) or an `http(s)` URL |
 | `name` | The client name, in any form |
@@ -91,7 +99,7 @@ of every key with its description and allowed values.
 
 See [repository layouts](ci.md#repository-layouts) for the trade-offs.
 
-| Key | |
+| Key | Description |
 |---|---|
 | `repo` | `"acme/api-{lang}"`: a repository per SDK. `"acme/api-sdks"`: one repository, a folder per SDK. Unset: next to `perseid.toml` |
 | `release` | `false` leaves out the release-please files and `sdk-release.yml` |
@@ -100,11 +108,41 @@ See [repository layouts](ci.md#repository-layouts) for the trade-offs.
 `{lang}` is the language as `sdks` names it. `perseid init` writes the release files for SDKs
 kept next to `perseid.toml`. The first pull request in each SDK repository carries them.
 
+## Targets
+
+A `[targets.<name>]` table makes perseid write something besides the SDKs, into one folder of a
+repository, through a pull request like those of the SDKs. See [targets](ci.md#targets) for the
+flow.
+
+| Key | Default | Description |
+|---|---|---|
+| `repo` | required | `owner/name` of the repository the target writes to |
+| `path` | `"api"` | The only folder perseid writes in `repo`. It owns it: files it no longer writes there are deleted. Nothing outside it is touched |
+| `after` | `"sdks"` | `"sdks"`: the pull request opens once every SDK generated from the current spec is released, with their versions. `"generate"`: with the SDK pull requests, in the same run |
+| `kind` | the table's name | What the target writes |
+
+The table's name is its kind, so `[targets.docs]` is a `docs` target. `kind` names it otherwise,
+for two targets of a kind:
+
+```toml
+[targets.public-docs]
+kind = "docs"
+repo = "acme/website"
+path = "reference/api"
+```
+
+| Kind | Writes in `path` |
+|---|---|
+| `docs` | `openapi.json`, the spec as perseid read it; `docs-data.json`, what [`perseid docs-data`](customizing.md#docs-data) prints for every SDK, with the `version` of each released SDK; `.gitattributes`, marking both as generated so GitHub collapses their diffs |
+
+Other kinds will take keys of their own in the same table. A name or `kind` perseid doesn't know
+is an error. `after = "sdks"` needs the release workflows, so it can't go with `release = false`.
+
 ## SDK defaults
 
 Each key is also a key of the [language tables](#language-tables), which override it for one SDK.
 
-| Key | Default | |
+| Key | Default | Description |
 |---|---|---|
 | `base_url` | The spec's first server | API base URL of the clients |
 | `timeout` | `60` | Request timeout, in seconds |
@@ -115,11 +153,12 @@ Each key is also a key of the [language tables](#language-tables), which overrid
 | `header_prefix` | kebab-case `name` | Prefix of the headers the SDKs send on their own: `acme-retry-count` |
 | `user_agent` | kebab-case `name` | Prefix of the `User-Agent` header |
 | `[methods]` | | Method names by operation id, over the [resource-style names](#method-names) |
+| `[resources]` | | Resources by operation id, over the [ones derived from tags and paths](#resources) |
 | `[context]` | | Values exposed to templates as `sdk.*` |
 
 `[types]` holds settings of every SDK only:
 
-| Key | Default | |
+| Key | Default | Description |
 |---|---|---|
 | `uuid` | `"typed"` | `format: uuid` values are the [language's UUID type](languages.md#formats). `"string"` keeps them strings, for an API whose "uuid" values are not all UUIDs: one would fail decoding the whole response |
 
@@ -127,19 +166,20 @@ Each key is also a key of the [language tables](#language-tables), which overrid
 
 Every operation is generated, except those marked `x-internal: true`.
 
-| Key | |
+| Key | Description |
 |---|---|
 | `internal` | `true` also generates the `x-internal` operations |
 | `exclude` | Operation ids left out of every SDK. In a language table, of that SDK only |
 | `only` | The only operation ids generated, `x-internal` or not |
 | `[pagination]` | [Pagination rules](features.md#pagination), one table or an array of tables |
+| `detect_pagination` | `false` leaves unpaged the Stripe-style lists no rule matches, which perseid [detects](features.md#pagination) by default |
 
 ## Package metadata
 
 `[metadata]` holds what the generated manifests say about the packages. `perseid init` fills it
 from the spec's `info` and the license it asks for, and comments out the rest.
 
-| Key | |
+| Key | Description |
 |---|---|
 | `description` | One line, `"{name} API client"` by default |
 | `license` | SPDX license expression |
@@ -163,7 +203,7 @@ from the spec's `info` and the license it asks for, and comments out the rest.
 an SDK that `sdks` lists. A table for an SDK not listed fails. `perseid init` writes one per SDK,
 naming its package.
 
-| Key | |
+| Key | Description |
 |---|---|
 | `path` | Output directory, relative to the repository the SDK lives in. The language name by default |
 | `repo` | `owner/name` of the repository to generate into, over the top-level `repo` |
@@ -177,7 +217,7 @@ naming its package.
 
 Keys of one language:
 
-| Table | Key | |
+| Table | Key | Description |
 |---|---|---|
 | `[typescript]` | `exports` | Modules re-exported from the entry point |
 | `[typescript]` | `int64` | Type of int64 values: `"number"` (default, exact up to 2^53), `"bigint"` or `"string"` |
@@ -203,6 +243,7 @@ Methods are named after the HTTP method and the path within their resource.
 | `upload_file` | `files.upload` |
 | `create_session`, as `POST /auth/session` | `create_session` |
 | `GET /health` | `check`, `check_health` in another resource |
+| `PUT`, `DELETE /groups/{id}/repositories` next to `PUT`, `DELETE .../repositories/{repo}` | `set`, `delete_all` next to `update`, `delete` |
 
 - When the path only says CRUD, an operation id starting with another verb names the method,
   without the resource's own noun.
@@ -210,6 +251,38 @@ Methods are named after the HTTP method and the path within their resource.
   `OAuth` is `oauth`, `IPAddress` is `ip_address`.
 - A name two operations of a resource would share falls back to the operation id.
 - `[methods]` or `x-perseid-name` on an operation renames one.
+
+## Resources
+
+Each tag is a resource of the client, and the paths within it nest resources below it, three deep
+at most:
+
+| Operations of the tag `workspaces` | Methods |
+|---|---|
+| `GET`, `POST /workspaces/{id}/peers`, `GET /workspaces/{id}/peers/{peer_id}` | `workspaces.peers.list`, `create`, `retrieve` |
+| `GET /workspaces/{id}/usage`, the only one under `usage` | `workspaces.retrieve_usage` |
+
+- A collection (`peers`), or a segment paths go on below, holding two operations or more is a
+  resource of its own; other segments name methods of their parent (`retrieve_usage`).
+- A child drops the noun of its parent: `/check-runs` in `checks` is `checks.runs`, unless another
+  child is named `runs`.
+- A tag its paths don't name is rooted at the segment they share: the tag `connect` of
+  `/connected-accounts/{id}/payouts` gives `connect.payouts`.
+- No child is named like a member of the generated resources (`client`, `new`, `api`, `async`,
+  `sync`, `constructor`, `request_ctx`, `with_options`, `with_raw_response`): its operations stay
+  methods of the parent.
+- Every SDK places operations alike: one an SDK's `exclude` leaves out moves no other.
+- `[resources]` or `x-perseid-resource` on an operation places it in a dotted path of at most three
+  snake_case names, `workspaces.peers`, or `workspaces` to keep it a method of the tag's resource.
+  A resource on the way that holds no method of its own, `admin` of `admin.users`, only reaches
+  its children. perseid warns about `[resources]` entries naming no operation of the spec.
+
+Adding an endpoint can move existing methods: `GET /customers/{id}/cash_balance/transactions`
+makes `cash_balance` a child resource, and `customers.retrieve_cash_balance` becomes
+`customers.cash_balance.retrieve`. SDK users' calls break, though
+[oasdiff](ci.md#from-spec-change-to-release) sizes a spec change that only adds as minor. Pin the
+methods whose call paths must hold with `[resources]` or `x-perseid-resource`
+(`retrieveCashBalance = "customers"`), or release such a change with `--bump major`.
 
 ## Unions of objects
 
@@ -291,10 +364,13 @@ Read as declared:
 Discriminators and `allOf`:
 
 - A discriminator on a base schema whose subtypes reference it in `allOf` makes the base a union
-  of its subtypes: those of the `mapping`, plus those referencing the base.
-- The base's own fields move to `{Base}Base`.
-- A variant missing from the `mapping` is tagged with the `const` or `enum` of its discriminator
-  property, else its schema name.
+  of its subtypes: those of the `mapping`, plus those referencing the base or another subtype.
+- The base's own fields move to `{Base}Base`. A subtype that other subtypes extend becomes the
+  union of its own fields, as `{Subtype}Base`, and of its subtypes: a list of it decodes each
+  one as its actual subtype.
+- A variant missing from the `mapping` is tagged with its `x-ms-discriminator-value`, else the
+  `const` or `enum` of its discriminator property, else its schema name. Variants sharing the
+  same values, such as the `enum` of the base they inherit, take their schema name.
 - An `allOf` of parts declaring the same property keeps the narrower schema.
 
 Untyped JSON and skipped operations, each with a warning naming the operation or schema:
