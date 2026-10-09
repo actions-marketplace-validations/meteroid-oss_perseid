@@ -410,6 +410,7 @@ fn commands_find_perseid_toml_from_a_subfolder_and_inspect_one_language() {
         api["resources"].is_object() || api["resources"].is_array(),
         "{out}"
     );
+    assert_eq!(api["model_version"], perseid::MODEL_VERSION, "{out}");
     let empty = tempfile::tempdir().unwrap();
     let (ok, out) = perseid(empty.path(), &["generate"]);
     assert!(
@@ -3091,6 +3092,69 @@ fn java_enums_keep_unknown_values_and_docs_are_html() {
 const LANGUAGES: [&str; 6] = ["rust", "typescript", "python", "go", "java", "csharp"];
 
 #[test]
+fn header_parameters_are_documented_with_their_description_in_every_language() {
+    let dir = project_from("petstore.yaml", &LANGUAGES);
+    let spec = r##"
+openapi: 3.1.0
+info: { title: Shop, version: "1" }
+servers: [{ url: https://x.example.com }]
+paths:
+  /orders:
+    get:
+      operationId: list_orders
+      tags: [orders]
+      parameters:
+        - { name: X-Tenant, in: header, description: "The tenant to list the orders of.", schema: { type: string } }
+        - { name: X-Trace, in: header, schema: { type: string } }
+      responses:
+        '204': { description: ok }
+"##;
+    fs::write(dir.path().join("openapi.yaml"), spec).unwrap();
+    let (ok, out) = perseid(dir.path(), &["generate", "--no-format"]);
+    assert!(ok, "{out}");
+    let fallbacks = [
+        (
+            "rust",
+            "/// The `X-Tenant` header parameter.",
+            "/// The `X-Trace` header parameter.",
+        ),
+        (
+            "typescript",
+            "Sent as the `X-Tenant` header",
+            "Sent as the `X-Trace` header",
+        ),
+        ("python", "", ""),
+        (
+            "go",
+            "XTenant is sent as the X-Tenant header",
+            "XTrace is sent as the X-Trace header",
+        ),
+        (
+            "java",
+            "The {@code X-Tenant} parameter.",
+            "The {@code X-Trace} parameter.",
+        ),
+        (
+            "csharp",
+            "The <c>X-Tenant</c> header",
+            "The <c>X-Trace</c> header",
+        ),
+    ];
+    for (language, described, undescribed) in fallbacks {
+        let all = files(&dir.path().join(language));
+        let text: String = all.iter().map(|(_, text)| text.as_str()).collect();
+        assert!(
+            text.contains("The tenant to list the orders of."),
+            "{language}: the description is missing"
+        );
+        if !described.is_empty() {
+            assert!(!text.contains(described), "{language}: {described}");
+            assert!(text.contains(undescribed), "{language}: {undescribed}");
+        }
+    }
+}
+
+#[test]
 fn readme_examples_build_lists_and_nested_models_in_every_language() {
     let languages = ["rust", "typescript", "python", "go", "java", "csharp"];
     let dir = project_from("petstore.yaml", &languages);
@@ -4719,11 +4783,25 @@ fn targets_preview_writes_the_spec_and_docs_data_of_a_docs_target() {
 /// holding an older spec and a page perseid doesn't write.
 #[cfg(unix)]
 fn docs_repository(dir: &Path) -> String {
-    let work = dir.join("docs-work");
-    fs::create_dir_all(work.join("api")).unwrap();
-    fs::write(work.join("README.md"), "# Docs\n").unwrap();
-    fs::write(work.join("api/guide.md"), "stale\n").unwrap();
-    fs::write(work.join("api/openapi.json"), "{}\n").unwrap();
+    bare_repository(
+        dir,
+        "docs",
+        &[
+            ("README.md", "# Docs\n"),
+            ("api/guide.md", "stale\n"),
+            ("api/openapi.json", "{}\n"),
+        ],
+    )
+}
+
+/// A bare repository at `<dir>/<name>.git` holding `files` on `main`: its URL.
+#[cfg(unix)]
+fn bare_repository(dir: &Path, name: &str, files: &[(&str, &str)]) -> String {
+    let work = dir.join(format!("{name}-work"));
+    for (path, text) in files {
+        fs::create_dir_all(work.join(path).parent().unwrap()).unwrap();
+        fs::write(work.join(path), text).unwrap();
+    }
     let git = |args: &[&str]| git_in(&work, args);
     git(&["init", "--quiet", "--initial-branch", "main"]);
     git(&["add", "--all"]);
@@ -4736,7 +4814,7 @@ fn docs_repository(dir: &Path) -> String {
         "-qm",
         "docs",
     ]);
-    let bare = dir.join("docs.git");
+    let bare = dir.join(format!("{name}.git"));
     git_in(
         dir,
         &[
@@ -4745,7 +4823,7 @@ fn docs_repository(dir: &Path) -> String {
             "--bare",
             "--initial-branch",
             "main",
-            "docs.git",
+            bare.to_str().unwrap(),
         ],
     );
     git(&["push", "--quiet", bare.to_str().unwrap(), "main"]);
@@ -4816,6 +4894,170 @@ fn docs_targets_open_their_pull_request_with_the_sdks_or_once_they_are_released(
     assert!(
         run.output.contains("[targets.docs]: waits for the release of go (the repository holding it isn't on GitHub), rust (")
             && run.output.contains("then opens its pull request on file://"),
+        "{}",
+        run.output
+    );
+}
+
+/// Appends `[targets.cli]`, the toy pack wrapping the Rust SDK, with `table`, to perseid.toml in
+/// `dir`.
+fn with_pack_target(dir: &Path, table: &str) {
+    let path = dir.join("perseid.toml");
+    let config = fs::read_to_string(&path).unwrap();
+    let toy = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/packs/toy");
+    let pack = format!("pack = {:?}\nwraps = \"rust\"\n", toy.display());
+    fs::write(&path, format!("{config}\n[targets.cli]\n{pack}{table}")).unwrap();
+}
+
+#[test]
+fn pack_targets_render_against_the_sdk_they_wrap_and_scaffold_once() {
+    let dir = project();
+    with_pack_target(dir.path(), "repo = \"acme/acme-cli\"\nafter = \"rust\"\n");
+    let (ok, out) = perseid(
+        dir.path(),
+        &["targets", "cli", "--out", "preview", "--no-format"],
+    );
+    assert!(ok, "{out}");
+    assert!(
+        out.contains("cli (preview/cli): 9 added, 0 modified, 0 removed\n"),
+        "{out}"
+    );
+    let cli = dir.path().join("preview/cli");
+    let read = |file: &str| fs::read_to_string(cli.join(file)).unwrap();
+    assert!(read(".github/workflows/release.yml").contains("cargo publish -p cli\n"));
+    assert_eq!(
+        read("src/commands/pets.rs"),
+        "// This file is @generated by perseid, from the toy pack.\n\
+         //! `cli pets`, calling the `petstore` crate.\n\
+         \n\
+         pub const METHODS: &[&str] = &[\n    \"list()\",\n    \"create()\",\n    \
+         \"retrieve(pet_id: String)\",\n    \"delete(pet_id: String)\",\n];\n"
+    );
+    assert_eq!(
+        read("src/commands/mod.rs"),
+        "// This file is @generated by perseid.\n//! The commands of the Petstore API.\n\npub mod pets;\n"
+    );
+    assert!(
+        read("src/runtime/output.rs")
+            .contains("//! Prints what `cli` commands return, for Petstore.\n")
+    );
+    assert!(
+        read("Cargo.toml").contains("name = \"cli\"\n")
+            && read("Cargo.toml").contains("petstore = \"0.1.0\"\n")
+    );
+    let spec: serde_json::Value = serde_json::from_str(&read(".perseid/openapi.json")).unwrap();
+    assert_eq!(spec["info"]["title"], "Petstore API");
+    let (ok, out) = perseid(dir.path(), &["targets", "--out", "preview", "--check"]);
+    assert!(ok && out.contains("cli (preview/cli): up to date"), "{out}");
+
+    let marker = "// this file is @generated\n";
+    fs::write(cli.join("src/commands/proto.rs"), marker).unwrap();
+    fs::write(cli.join("src/commands/mine.rs"), "// handwritten\n").unwrap();
+    fs::write(cli.join("Cargo.toml"), "# mine\n").unwrap();
+    fs::remove_file(cli.join("src/main.rs")).unwrap();
+    fs::remove_file(cli.join("src/commands/pets.rs")).unwrap();
+    let (ok, out) = perseid(dir.path(), &["targets", "--out", "preview", "--check"]);
+    assert!(
+        !ok && out.contains("+ src/commands/pets.rs") && out.contains("out of date"),
+        "{out}"
+    );
+    assert!(
+        !cli.join("src/commands/pets.rs").exists(),
+        "--check must not write"
+    );
+    let (ok, out) = perseid(dir.path(), &["targets", "--out", "preview", "--no-format"]);
+    assert!(
+        ok && out.contains("cli (preview/cli): 1 added, 0 modified, 0 removed\n"),
+        "{out}"
+    );
+    assert!(
+        cli.join("src/commands/proto.rs").exists(),
+        "a file perseid didn't generate stays"
+    );
+    assert!(cli.join("src/commands/mine.rs").exists());
+    assert_eq!(read("Cargo.toml"), "# mine\n");
+    assert!(
+        !cli.join("src/main.rs").exists(),
+        "the scaffold is written once"
+    );
+
+    fs::write(cli.join("src/commands/pets.rs"), "// handwritten\n").unwrap();
+    let (ok, out) = perseid(dir.path(), &["targets", "--out", "preview", "--no-format"]);
+    assert!(
+        !ok && out.contains(
+            "refusing to overwrite files without the `@generated` marker: src/commands/pets.rs"
+        ),
+        "{out}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn pack_targets_open_their_pull_request_once_the_sdk_they_wrap_is_released() {
+    let dir = pull_request_project();
+    let cli = bare_repository(dir.path(), "cli", &[("README.md", "# CLI\n")]);
+    with_pack_target(
+        dir.path(),
+        &format!("repo = {cli:?}\nafter = \"generate\"\n"),
+    );
+    let run = run_pr(dir.path(), &["--bump", "patch"], Answers::default(), &[]);
+    assert!(run.ok, "{}", run.output);
+    let created = run.request("POST", "/cli/pulls");
+    assert_eq!(created["head"], "perseid/targets/cli");
+    assert_eq!(created["title"], "fix(api): update to Petstore API 1.0.0");
+    let body = created["body"].as_str().unwrap();
+    assert!(
+        body.contains("cli: 8 added, 0 modified, 0 removed\n")
+            && !body.contains("+ .github")
+            && body.contains("SDK versions: rust (unreleased)."),
+        "{body}"
+    );
+    assert!(
+        body.contains(
+            "The scaffold also writes these workflows, which pull requests from CI can't carry:\n\n\
+             - `.github/workflows/release.yml`\n\n\
+             Add them by hand: `perseid targets cli --out <dir>`, then commit them from `<dir>/cli`."
+        ),
+        "{body}"
+    );
+    let bare = dir.path().join("cli.git");
+    let tree = git_in(
+        &bare,
+        &["ls-tree", "-r", "--name-only", "perseid/targets/cli"],
+    );
+    assert_eq!(
+        tree.lines().collect::<Vec<_>>(),
+        [
+            ".perseid/generation.json",
+            ".perseid/openapi.json",
+            "Cargo.toml",
+            "README.md",
+            "api.md",
+            "src/commands/mod.rs",
+            "src/commands/pets.rs",
+            "src/main.rs",
+            "src/runtime/output.rs",
+        ]
+    );
+
+    let config = dir.path().join("perseid.toml");
+    let text = fs::read_to_string(&config).unwrap();
+    fs::write(
+        &config,
+        text.replace("after = \"generate\"", "after = \"rust\""),
+    )
+    .unwrap();
+    let run = run_pr(dir.path(), &["--bump", "patch"], Answers::default(), &[]);
+    assert!(run.ok, "{}", run.output);
+    assert!(
+        run.requests("POST", "/cli/pulls").is_empty(),
+        "{:#?}",
+        run.calls
+    );
+    assert!(
+        run.output
+            .contains("[targets.cli]: waits for the release of rust (")
+            && !run.output.contains("go ("),
         "{}",
         run.output
     );
