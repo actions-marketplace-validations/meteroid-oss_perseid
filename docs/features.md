@@ -77,7 +77,8 @@ has them; without any, paging stops at the first empty page.
 
 Operations no rule matches are paged when they have Stripe's list shape: a `starting_after`
 string query parameter, and a response with a `has_more` boolean and a `data` array of items
-with a string `id`. That is the rule
+with a string `id`. Or OpenAI's and Anthropic's: an `after` or `after_id` string query
+parameter, and a response with `has_more`, `data` and a string `last_id`. Those are the rules
 
 ```toml
 [[pagination]]
@@ -85,10 +86,16 @@ cursor = "starting_after"
 item_cursor = "id"
 has_more = "has_more"
 items = "data"
+
+[[pagination]]
+cursor = "after"                # or "after_id"
+next_cursor = "last_id"
+has_more = "has_more"
+items = "data"
 ```
 
-`x-pagination: false` opts an operation out of the `perseid.toml` rules and of this one, and
-`detect_pagination = false` in `perseid.toml` turns this rule off, for a spec you do not own.
+`x-pagination: false` opts an operation out of the `perseid.toml` rules and of these, and
+`detect_pagination = false` in `perseid.toml` turns these rules off, for a spec you do not own.
 
 With `item_cursor`, a list started from the `before` parameter pages backwards, as Stripe's
 `ending_before`: each next page ends before the first item of the last, and the cursor
@@ -146,7 +153,8 @@ for await (const chunk of stream) process.stdout.write(chunk.delta);
 | Media type | SDK |
 |---|---|
 | `text/event-stream` response | An event stream: `for await`, `for`, `range`, `Stream`, `Iterable`, `await foreach` |
-| `multipart/form-data` body | A typed `...Body`, with `Upload` files. List fields are one part per item |
+| Binary response (`application/octet-stream`, `image/png`, `audio/mpeg`...) | Go, Java and C#: the body streamed as it arrives (`io.ReadCloser`, `InputStream`, `Stream`), or read whole in one call (`Bytes()`, `bytes()`, `ReadAsBytesAsync()`) or to a file. [Languages](languages.md) |
+| `multipart/form-data` body | A typed `...Body` (keyword arguments in Python), with `Upload` files. List fields are one part per item |
 | `application/octet-stream` body | Bytes or a stream |
 | Any other media type (`image/png`, `text/plain`...) | Sent as given, with its media type |
 
@@ -154,8 +162,17 @@ for await (const chunk of stream) process.stdout.write(chunk.delta);
   decodes into that model and the stream ends at `data: [DONE]`.
 - The raw event (`event`, `id`) of the last item is `lastEvent` / `last_event` / `Event()` /
   `LastEvent`.
-- A JSON response that may also be an event stream gets a `..._stream` twin method. It sets the
-  body's boolean `stream` property to `true` when there is one.
+- A binary response (any media type other than JSON, text or an event stream, such as a file
+  download) is streamed in every SDK: the method returns a `BinaryResponse` with its status and
+  headers, its body unread. One call reads it whole (`.bytes()`, `.read()`), or it gives its
+  chunks as they arrive, or streams to a file. An error status fails the call
+  before any body; retries end once the headers arrive; the timeout covers the headers, then
+  each read, so a long download is not cut short.
+- A JSON, binary or text response that may also be an event stream gets a `..._stream` twin
+  method, as OpenAI's speech: a binary response, or audio events. It sets the body's boolean
+  `stream` property to `true` when there is one. A multipart body's boolean `stream` part, as OpenAI's
+  transcriptions have, is the twins' to send: `true` from the `_stream` twin, left out by the
+  other, and absent from both bodies.
 - Streamed uploads are not retried.
 
 ## Raw responses
@@ -165,7 +182,7 @@ Every SDK can return the status, headers and request id of a successful call wit
 | Language | Usage |
 |---|---|
 | TypeScript | `const { data, response, requestId } = await client.customers.retrieve(id).withResponse()` |
-| Python | `raw = client.with_raw_response.customers.retrieve(id)`, then `raw.headers`, `raw.parse()` |
+| Python | `raw = client.with_raw_response.customers.retrieve(id)`, then `raw.request_id`, `raw.parse()` |
 | Go | `client.Customers().Retrieve(ctx, id, acme.WithResponseInto(&resp))` |
 | Rust | `client.customers().retrieve(id).with_response().await?`, then `.request_id()`, `.into_data()` |
 | Java | `client.withRawResponse().customers().retrieve(id)`, an `ApiResponse<Customer>` |

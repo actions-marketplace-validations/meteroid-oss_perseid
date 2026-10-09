@@ -49,7 +49,8 @@ pub struct Config {
     /// Package metadata written into the manifests `perseid generate` creates.
     #[serde(default, rename = "metadata")]
     pub package: Package,
-    /// API base URL the clients default to.
+    /// API base URL the clients default to: the spec's first absolute server unless set, none
+    /// for `""`.
     pub base_url: Option<String>,
     /// Prefix of the SDK's own headers, such as `{prefix}-retry-count`: the kebab-case `name`
     /// by default.
@@ -79,6 +80,10 @@ pub struct Config {
     /// puts the method in `client.workspaces.peers`, `workspaces` in the top-level resource.
     #[serde(default)]
     pub resources: BTreeMap<String, String>,
+    /// Type names by schema name, over the schemas' own: `CreateChatCompletionResponse =
+    /// "ChatCompletion"`. References, discriminators and the names of nested types follow.
+    #[serde(default)]
+    pub models: BTreeMap<String, String>,
     /// Also generates the operations marked `x-internal: true`.
     #[serde(default)]
     pub internal: bool,
@@ -89,7 +94,7 @@ pub struct Config {
     #[serde(default)]
     pub exclude: Vec<String>,
     /// `false` pages only the operations that `x-pagination` or a `pagination` rule matches,
-    /// not the Stripe-style lists perseid detects.
+    /// not the Stripe- and OpenAI-style lists perseid detects.
     pub detect_pagination: Option<bool>,
     /// Paginated list operations, detected from their query parameter and response shape.
     #[serde(default, deserialize_with = "one_or_many")]
@@ -218,15 +223,23 @@ impl Language {
 #[serde(deny_unknown_fields)]
 pub struct TargetTable {
     /// What the target writes: the table's name by default, so `[targets.docs]` is a `docs`
-    /// target. Set it to name the table otherwise, such as two `docs` targets.
+    /// target. Set it to name the table otherwise, such as two `docs` targets. A pack target
+    /// takes `pack` instead.
     pub kind: Option<TargetKind>,
     /// `owner/name` of the repository the target writes to.
     pub repo: String,
-    /// The only folder perseid writes in `repo`, replaced whole: `api` by default.
+    /// The only folder perseid writes in `repo`: `api` by default, replaced whole. A pack renders
+    /// into the whole repository (`.`) by default.
     pub path: Option<String>,
     /// When its pull request opens: once every SDK generated from the current spec is released
-    /// (`sdks`, the default), or with the SDK pull requests (`generate`).
+    /// (`sdks`, the default), once the SDK of a language is (`rust`, the default of a pack, which
+    /// waits for no other), or with the SDK pull requests (`generate`).
     pub after: Option<After>,
+    /// The folder of a pack, relative to perseid.toml: a program wrapping the SDK `wraps` names,
+    /// rendered from the pack's templates against that SDK's model.
+    pub pack: Option<String>,
+    /// The SDK the pack wraps, among `sdks`.
+    pub wraps: Option<Language>,
 }
 
 /// What a target writes.
@@ -248,14 +261,73 @@ impl TargetKind {
 }
 
 /// When a target's pull request opens.
-#[derive(Clone, Copy, Debug, Default, Deserialize, JsonSchema, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum After {
     /// With the SDK pull requests, in the same run.
     Generate,
     /// Once every SDK generated from the current spec is released.
     #[default]
     Sdks,
+    /// Once the SDK of this language is released.
+    Sdk(Language),
+}
+
+impl After {
+    /// As perseid.toml writes it.
+    pub fn name(self) -> &'static str {
+        match self {
+            After::Generate => "generate",
+            After::Sdks => "sdks",
+            After::Sdk(language) => language.name(),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for After {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        use serde::de::{Error, IntoDeserializer, value};
+        let text = String::deserialize(d)?;
+        match text.as_str() {
+            "generate" => Ok(After::Generate),
+            "sdks" => Ok(After::Sdks),
+            other => Language::deserialize(other.into_deserializer())
+                .map(After::Sdk)
+                .map_err(|_: value::Error| {
+                    D::Error::custom(format!(
+                        "`after = {other:?}`: expected \"sdks\", \"generate\" or a language, among {}",
+                        LANGUAGES.join(", ")
+                    ))
+                }),
+        }
+    }
+}
+
+impl JsonSchema for After {
+    fn schema_name() -> String {
+        "After".into()
+    }
+
+    fn json_schema(generator: &mut schemars::r#gen::SchemaGenerator) -> schemars::schema::Schema {
+        /// When a target's pull request opens.
+        #[derive(JsonSchema)]
+        #[serde(untagged)]
+        #[allow(dead_code)]
+        enum After {
+            Stage(Stage),
+            Sdk(Language),
+        }
+        /// When a target's pull request opens, besides once the SDK of a language is released.
+        #[derive(JsonSchema)]
+        #[serde(rename_all = "lowercase")]
+        #[allow(dead_code)]
+        enum Stage {
+            /// With the SDK pull requests, in the same run.
+            Generate,
+            /// Once every SDK generated from the current spec is released.
+            Sdks,
+        }
+        After::json_schema(generator)
+    }
 }
 
 fn default_spec() -> String {
@@ -298,7 +370,7 @@ macro_rules! language {
             repo: Option<String>,
             #[doc = $package]
             package: Option<String>,
-            /// API base URL this client defaults to, over the top-level one.
+            /// API base URL this client defaults to, over the top-level one; none for `""`.
             base_url: Option<String>,
             /// Prefix of this SDK's own headers, over the top-level one.
             header_prefix: Option<String>,
@@ -556,6 +628,7 @@ impl Config {
         let mut config = Self::parse(&text, &path.display().to_string())?;
         let root = std::path::absolute(path)?.parent().unwrap().to_owned();
         config.home = Home::of(&root);
+        crate::targets::overlaps(&config).with_context(|| format!("in {}", path.display()))?;
         Ok((config, root))
     }
 
@@ -609,11 +682,26 @@ impl Config {
         for target in self.targets(&[])? {
             ensure!(
                 target.after == After::Generate || self.release != Some(false),
-                "[targets.{}] waits for the SDK releases (`after = \"sdks\"`), which `release = false` leaves to you: set `after = \"generate\"`",
-                target.name
+                "[targets.{}] waits for the SDK releases (`after = \"{}\"`), which `release = false` leaves to you: set `after = \"generate\"`",
+                target.name,
+                target.after.name()
             );
         }
-        Ok(())
+        for (name, table) in &self.targets {
+            let after = match table.after {
+                Some(After::Sdk(language)) => Some(language),
+                _ => None,
+            };
+            for (key, language) in [("wraps", table.wraps), ("after", after)] {
+                let Some(language) = language else { continue };
+                ensure!(
+                    self.sdks.contains(&language),
+                    "[targets.{name}] `{key} = \"{}\"` names an SDK that `sdks` doesn't list",
+                    language.name()
+                );
+            }
+        }
+        crate::targets::overlaps(self)
     }
 
     /// The `[targets]` named `selected`, or all of them.
@@ -633,7 +721,7 @@ impl Config {
 
     /// Whether a target waits for the SDK releases, which the release workflows then report.
     pub fn awaits_releases(&self) -> bool {
-        (self.targets.values()).any(|t| t.after.unwrap_or_default() == After::Sdks)
+        (self.targets.values()).any(|t| t.after.unwrap_or_default() != After::Generate)
     }
 
     /// The repository the SDK release workflows report their releases to: the one holding
@@ -710,6 +798,7 @@ impl Config {
             reserved: BTreeSet::new(),
             names: self.names.clone(),
             resources: self.resources.clone(),
+            models: self.models.clone(),
             uuid_strings: self.types.uuid == Some(UuidType::String),
         }
     }
@@ -808,6 +897,19 @@ impl Config {
             })
     }
 
+    /// Defaults `base_url` to the spec's first absolute server, the one `perseid init` writes.
+    pub fn default_to_spec_server(&mut self, spec: &str) {
+        #[derive(Deserialize)]
+        struct Servers {
+            #[serde(default)]
+            servers: Value,
+        }
+        if self.base_url.is_none() {
+            let servers = serde_json::from_str::<Servers>(spec).map(|doc| doc.servers);
+            self.base_url = servers.ok().and_then(|s| crate::spec::server_url(&s));
+        }
+    }
+
     /// Values exposed to templates as `sdk`, for an SDK checked out at `dir`.
     pub fn context(&self, sdk: &Sdk, dir: &Path) -> Value {
         let (language, target) = (sdk.language, sdk.target);
@@ -822,6 +924,7 @@ impl Config {
                 .or_else(|| shared.clone())
                 .unwrap_or_else(|| default.into())
         };
+        let base_url = pick(&target.base_url, &self.base_url, "");
         let mut context = json!({
             "client_name": self.name,
             "package_name": if language == "typescript" { &snake } else { &package },
@@ -829,8 +932,8 @@ impl Config {
             "java_package": if language == "java" { package.clone() } else { format!("com.{snake}") },
             "npm_package": if language == "typescript" { &package } else { &kebab },
             "go_module": self.go_module(sdk).unwrap_or_else(|| kebab.clone()),
-            "default_base_url": pick(&target.base_url, &self.base_url, ""),
-            "has_default_base_url": target.base_url.is_some() || self.base_url.is_some(),
+            "default_base_url": base_url,
+            "has_default_base_url": !base_url.is_empty(),
             "user_agent_prefix": pick(&target.user_agent, &self.user_agent, &kebab),
             "header_prefix": pick(&target.header_prefix, &self.header_prefix, &kebab),
             "idempotency_keys": self.idempotency_keys.unwrap_or(false),
@@ -1366,6 +1469,32 @@ mod tests {
         let toml = format!("base_url = \"https://a.test\"\n{toml}");
         assert_eq!(context(&toml, "go")["has_default_base_url"], true);
         assert_eq!(context(&toml, "go")["default_base_url"], "https://a.test");
+    }
+
+    #[test]
+    fn base_url_defaults_to_the_spec_s_first_absolute_server() {
+        let base_url = |toml: &str, spec: &str| {
+            let mut config: Config = toml::from_str(toml).unwrap();
+            config.default_to_spec_server(spec);
+            let sdk = config.sdks(&[]).unwrap().remove(0);
+            let context = config.context(&sdk, Path::new("/nonexistent"));
+            let url = context["default_base_url"].as_str().unwrap().to_owned();
+            assert_eq!(context["has_default_base_url"], !url.is_empty());
+            url
+        };
+        let toml = "name = \"A\"\nsdks = [\"python\"]\n";
+        let spec = r#"{"servers": [{"url": "https://{env}.a.test/v1/", "variables": {"env": {"default": "api"}}}, {"url": "https://b.test"}]}"#;
+        assert_eq!(base_url(toml, spec), "https://api.a.test/v1");
+        let top = format!("base_url = \"https://own.test\"\n{toml}");
+        assert_eq!(base_url(&top, spec), "https://own.test");
+        let table = format!("{toml}[python]\nbase_url = \"https://py.test\"\n");
+        assert_eq!(base_url(&table, spec), "https://py.test");
+        let none = format!("base_url = \"\"\n{toml}");
+        assert_eq!(base_url(&none, spec), "");
+        let none_here = format!("{toml}[python]\nbase_url = \"\"\n");
+        assert_eq!(base_url(&none_here, spec), "");
+        assert_eq!(base_url(toml, r#"{"servers": [{"url": "/v1"}]}"#), "");
+        assert_eq!(base_url(toml, r#"{"openapi": "3.0.3"}"#), "");
     }
 
     #[test]

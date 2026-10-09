@@ -17,7 +17,7 @@ repo = "acme/acme-{lang}"           # one repository per SDK ({lang}: typescript
 # release = false                   # no release-please files nor sdk-release.yml
 
 # Defaults of every SDK, each also settable in a language table
-base_url = "https://api.acme.com"   # first server of the spec by default
+base_url = "https://api.acme.com"   # first absolute server of the spec by default, "" for none
 timeout = 60                        # seconds
 webhooks = false                    # install the Standard Webhooks verifier
 tests = true                        # generate a test per operation
@@ -49,6 +49,9 @@ listWidgetEvents = "events"
 [resources]                         # resources by operation id, as dotted paths
 listWidgetEvents = "widgets.events"
 
+[models]                            # type names by schema name
+CreateWidgetResponse = "Widget"
+
 [pagination]                        # or [[pagination]] for several rules
 cursor = "starting_after"
 item_cursor = "id"
@@ -66,6 +69,12 @@ repo = "acme/acme-golang"           # its own repository name, over the top-leve
 repo = "acme/docs"                  # the repository it writes to, through pull requests
 path = "api"                        # the only folder perseid writes there, replaced whole
 after = "sdks"                      # once every SDK is released, or "generate": with the SDK PRs
+
+[targets.cli]                       # a pack: a program wrapping one SDK, in a repository of its own
+pack = "../packs/cli"   # the pack's folder, relative to perseid.toml
+wraps = "rust"                      # the SDK it wraps, among `sdks`
+repo = "acme/acme-cli"
+# after = "rust"                    # once that SDK is released, by default
 ```
 
 ## Editor completion
@@ -84,7 +93,7 @@ of every key with its description and allowed values.
 | `spec` | The OpenAPI document, a path relative to `perseid.toml` (`openapi.json` by default) or an `http(s)` URL |
 | `name` | The client name, in any form |
 | `sdks` | Among `rust`, `typescript`, `python`, `go`, `java`, `csharp` |
-| `idempotency_keys` | `true` when the API deduplicates POST requests by `Idempotency-Key`: the SDKs send one with every POST and retry them. `false` by default: a POST is only retried when the caller gives it a key, as replaying it could apply it twice |
+| `idempotency_keys` | `true` when the API deduplicates POST requests by `Idempotency-Key`: the SDKs send one with every POST and retry them. `false` by default: a POST is only retried when the caller gives it a key, as replaying it could apply it twice. A 429 is retried for every method |
 
 - The spec is Swagger 2.0 or OpenAPI 3.0, 3.1 or 3.2, JSON or YAML. `$ref`s to other files or URLs
   are bundled.
@@ -117,9 +126,11 @@ flow.
 | Key | Default | Description |
 |---|---|---|
 | `repo` | required | `owner/name` of the repository the target writes to |
-| `path` | `"api"` | The only folder perseid writes in `repo`. It owns it: files it no longer writes there are deleted. Nothing outside it is touched |
-| `after` | `"sdks"` | `"sdks"`: the pull request opens once every SDK generated from the current spec is released, with their versions. `"generate"`: with the SDK pull requests, in the same run |
+| `path` | `"api"`, `"."` for a pack | The only folder perseid writes in `repo`. A `docs` target owns it: files it no longer writes there are deleted. A pack only replaces and deletes the files it generated, as `.perseid/generation.json` records them. Nothing outside it is touched |
+| `after` | `"sdks"`, the language of `wraps` for a pack | `"sdks"`: the pull request opens once every SDK generated from the current spec is released, with their versions. A language, such as `"rust"`: once that SDK is released, the one a pack wraps for a pack. `"generate"`: with the SDK pull requests, in the same run |
 | `kind` | the table's name | What the target writes |
+| `pack` | | The folder of a [pack](customizing.md#packs), relative to `perseid.toml`: the table is then a pack target, without `kind` |
+| `wraps` | required with `pack` | The SDK the pack wraps, among `sdks` and the languages its `pack.toml` lists |
 
 The table's name is its kind, so `[targets.docs]` is a `docs` target. `kind` names it otherwise,
 for two targets of a kind:
@@ -134,9 +145,13 @@ path = "reference/api"
 | Kind | Writes in `path` |
 |---|---|
 | `docs` | `openapi.json`, the spec as perseid read it; `docs-data.json`, what [`perseid docs-data`](customizing.md#docs-data) prints for every SDK, with the `version` of each released SDK; `.gitattributes`, marking both as generated so GitHub collapses their diffs |
+| a pack (`pack`) | What its templates, runtime and scaffold render around the SDK it wraps, `.perseid/generation.json`, and `.perseid/openapi.json`, the spec it was generated from, which sizes the next pull request |
 
-Other kinds will take keys of their own in the same table. A name or `kind` perseid doesn't know
-is an error. `after = "sdks"` needs the release workflows, so it can't go with `release = false`.
+A name or `kind` perseid doesn't know is an error. `pack` is a folder for now: a reference to a
+repository, such as `gh:acme/packs/cli@v0`, is an error. `after` other than
+`"generate"` needs the release workflows, so it can't go with `release = false`. A pack target
+can't share its folder with an SDK or another target: in the same repository, neither `path`
+may hold the other (`.` holds every folder).
 
 ## SDK defaults
 
@@ -144,8 +159,8 @@ Each key is also a key of the [language tables](#language-tables), which overrid
 
 | Key | Default | Description |
 |---|---|---|
-| `base_url` | The spec's first server | API base URL of the clients |
-| `timeout` | `60` | Request timeout, in seconds |
+| `base_url` | The spec's first absolute server | API base URL of the clients; `""` for none, so callers must pass one |
+| `timeout` | `60` | Request timeout, in seconds. `perseid init` writes `600` for an API streaming its answers (`text/event-stream`), as LLM APIs do |
 | `webhooks` | `false` | `true` installs the [webhook verifier](customizing.md#webhooks) |
 | `tests` | `true` | `false` leaves out the [generated tests](languages.md#tests) |
 | `round_trips` | `false` | `true` adds the [round trips](languages.md#round-trips) of every model to the generated tests |
@@ -154,6 +169,7 @@ Each key is also a key of the [language tables](#language-tables), which overrid
 | `user_agent` | kebab-case `name` | Prefix of the `User-Agent` header |
 | `[methods]` | | Method names by operation id, over the [resource-style names](#method-names) |
 | `[resources]` | | Resources by operation id, over the [ones derived from tags and paths](#resources) |
+| `[models]` | | Type names by schema name, over the schema's own: `CreateChatCompletionResponse = "ChatCompletion"`. References and the types named after it (`ChatCompletionChoicesItem`) follow, the JSON keeps the schema's name as discriminator tag, and two schemas given one name fail generation. `perseid init --from stainless.yml` imports the resources' `models` |
 | `[context]` | | Values exposed to templates as `sdk.*` |
 
 `[types]` holds settings of every SDK only:
@@ -172,7 +188,7 @@ Every operation is generated, except those marked `x-internal: true`.
 | `exclude` | Operation ids left out of every SDK. In a language table, of that SDK only |
 | `only` | The only operation ids generated, `x-internal` or not |
 | `[pagination]` | [Pagination rules](features.md#pagination), one table or an array of tables |
-| `detect_pagination` | `false` leaves unpaged the Stripe-style lists no rule matches, which perseid [detects](features.md#pagination) by default |
+| `detect_pagination` | `false` leaves unpaged the Stripe- and OpenAI-style lists no rule matches, which perseid [detects](features.md#pagination) by default |
 
 ## Package metadata
 

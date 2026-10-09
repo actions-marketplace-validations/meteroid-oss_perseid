@@ -3,6 +3,7 @@
 {% set list = examples.list -%}
 {% set stream = examples.stream -%}
 {% set create = examples.create -%}
+{% set download = examples.download -%}
 {% set result = docs.var(call.result, "result") if call else "result" -%}
 {% macro call_of(opts="") %}{% if call %}{{ docs.call(call, opts) }}{% else %}client.SomeResource().SomeMethod(ctx{{ ", " ~ opts if opts }}){% endif %}{% endmacro -%}
 {% macro assign(ex, name) %}{% if ex and ex.result %}{{ name }}, err :={% else %}err :={% endif %}{% endmacro -%}
@@ -120,6 +121,22 @@ for event, err := range stream.All() {
 }
 ```
 {% endif %}
+{%- if download %}
+### Downloads
+
+Binary responses come as a `*BinaryResponse`, returned once the headers arrive: an
+`io.ReadCloser` over the body as it streams in, with its `Header`. Close it, or read it whole:
+
+```go
+file, err := {{ docs.call(download) }}
+if err != nil {
+	return err
+}
+data, err := file.Bytes() // or io.Copy(dst, file), or file.WriteToFile(path), then Close
+```
+
+The timeout covers the wait for the headers, then each read, not the whole download.
+{% endif %}
 ### Raw responses
 
 `WithResponseInto` gives the `*http.Response` of a call, for its status and headers:
@@ -134,10 +151,12 @@ log.Print(resp.Header.Get("X-Request-Id"))
 
 Connection errors, timeouts, 408, 429 and 5xx responses are retried twice with jittered backoff,
 honoring `Retry-After` and `retry-after-ms`, when the request is idempotent or carries an
-`Idempotency-Key`. Each attempt times out after `DefaultTimeout`.
+`Idempotency-Key`, and 429 responses of every request. Each attempt times out after `DefaultTimeout`.
 `Options` sets them for the client (`MaxRetries`, `Timeout`), and request options for one call:
 `@@PACKAGE_NAME@@.WithMaxRetries(0)`, `@@PACKAGE_NAME@@.WithTimeout(time.Minute)`,
 `@@PACKAGE_NAME@@.WithIdempotencyKey(key)`, `@@PACKAGE_NAME@@.WithHeader(name, value)`.
+`@@PACKAGE_NAME@@.WithQuery(name, value)` and `@@PACKAGE_NAME@@.WithJSONSet(path, value)` send a
+parameter or body property this SDK version does not know yet.
 `Options.Logger` logs every attempt at debug level.
 
 ```go

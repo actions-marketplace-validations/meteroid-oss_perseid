@@ -18,10 +18,14 @@ import com.fasterxml.jackson.datatype.jdk8.Jdk8Module;
 import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
 
 import java.io.IOException;
+import java.io.InterruptedIOException;
 import java.math.BigDecimal;
+import java.net.SocketTimeoutException;
 import java.time.OffsetDateTime;
 import java.time.format.DateTimeFormatter;
 import @@JAVA_PACKAGE@@.exceptions.@@CLIENT_NAME@@Exception;
+import @@JAVA_PACKAGE@@.exceptions.ApiConnectionException;
+import @@JAVA_PACKAGE@@.exceptions.ApiTimeoutException;
 import @@JAVA_PACKAGE@@.exceptions.InvalidDataException;
 import java.util.AbstractMap;
 import java.util.ArrayList;
@@ -526,6 +530,53 @@ public final class Utils {
         } catch (JsonProcessingException e) {
             throw new InvalidDataException(
                     "not a JSON " + type.getSimpleName() + ": " + e.getOriginalMessage(), e);
+        }
+    }
+
+    /**
+     * The message an error body gives: its {@code error.message}, {@code message} or {@code detail}
+     * string.
+     *
+     * @param json the error body, or null
+     * @return the message, or null when it has none
+     */
+    public static String errorMessage(JsonNode json) {
+        if (json == null || !json.isObject()) {
+            return null;
+        }
+        for (JsonNode candidate :
+                List.of(json.path("error").path("message"), json.path("message"), json.path("detail"))) {
+            if (candidate.isTextual() && !candidate.textValue().isBlank()) {
+                return candidate.textValue();
+            }
+        }
+        return null;
+    }
+
+    /**
+     * The exception of a failed exchange: an {@link ApiTimeoutException} when it timed out.
+     *
+     * @param e the failure
+     * @return the exception to throw
+     */
+    public static ApiConnectionException transportError(IOException e) {
+        boolean timeout =
+                e instanceof SocketTimeoutException
+                        || (e instanceof InterruptedIOException && "timeout".equals(e.getMessage()));
+        return timeout ? new ApiTimeoutException(e) : new ApiConnectionException(e);
+    }
+
+    /**
+     * {@code text} as JSON.
+     *
+     * @param text the text
+     * @return the JSON value, or null when the text is not JSON
+     */
+    public static JsonNode jsonOrNull(String text) {
+        try {
+            return MAPPER.readTree(text);
+        } catch (JsonProcessingException e) {
+            return null;
         }
     }
 

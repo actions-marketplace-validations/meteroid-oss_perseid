@@ -229,6 +229,12 @@ public class Smoke {
         expect(
                 client.streaming().uploadFile(body).status(),
                 "count=::2;file=a.txt:text/plain:hello;meta=:application/json:{\"status\":\"ok\"};name=::doc;tags=::a;tags=::b");
+        java.nio.file.Path csv = java.nio.file.Files.createTempFile("smoke", ".csv");
+        java.nio.file.Files.write(csv, bytes("a,b"));
+        Streaming.UploadFileBody fromPath = Streaming.UploadFileBody.builder().file(Upload.of(csv)).name("doc").build();
+        String uploaded = client.streaming().uploadFile(fromPath).status();
+        expect(uploaded.contains("file=" + csv.getFileName() + ":text/csv:a,b;"), true);
+        java.nio.file.Files.delete(csv);
         expect(client.streaming().uploadContent("f1", Upload.of(bytes("raw"))).status(), "application/octet-stream:raw");
         Upload streamed = Upload.of(new ByteArrayInputStream(bytes("streamed")), -1);
         expect(client.streaming().uploadContent("f1", streamed).status(), "application/octet-stream:streamed");
@@ -369,17 +375,27 @@ public class Smoke {
         expect(isNothing(client.content().retrieveScenariosNullableBody()), true);
         expect(client.content().retrieveScenariosText(), "hello text\n");
         expect(client.content().retrieveScenariosCsv(), "id,name\n1,alpha\n2,\"be,ta\"\n");
-        byte[] blob = client.content().downloadBlob();
-        expect(blob.length, 256);
+        byte[] all = new byte[256];
         for (int i = 0; i < 256; i++) {
-            expect((int) blob[i] & 0xFF, i);
+            all[i] = (byte) i;
         }
+        // The 250 ms timeout bounds each read, not the whole download.
+        RequestOptions perRead = RequestOptions.builder().timeout(java.time.Duration.ofMillis(250)).build();
+        try (com.features.streaming.BinaryResponse blob = client.content().downloadBlob(perRead)) {
+            expect(blob.contentType().orElse(""), "application/octet-stream");
+            expect(Arrays.equals(blob.inputStream().readNBytes(32), Arrays.copyOf(all, 32)), true);
+            expect(Arrays.equals(blob.bytes(), Arrays.copyOfRange(all, 32, 256)), true);
+        }
+        java.nio.file.Path blobFile = java.nio.file.Files.createTempFile("blob", ".bin");
+        client.content().downloadBlob().writeTo(blobFile);
+        expect(Arrays.equals(java.nio.file.Files.readAllBytes(blobFile), all), true);
+        java.nio.file.Files.delete(blobFile);
         byte[] image = new byte[24];
         System.arraycopy(new byte[] {(byte) 0x89, 'P', 'N', 'G', '\r', '\n', 0x1A, '\n'}, 0, image, 0, 8);
         for (int i = 0; i < 4; i++) {
             System.arraycopy(new byte[] {0x00, 0x01, (byte) 0xFE, (byte) 0xFF}, 0, image, 8 + 4 * i, 4);
         }
-        expect(Arrays.equals(client.content().downloadImage(), image), true);
+        expect(Arrays.equals(client.content().downloadImage().bytes(), image), true);
         raises(InvalidDataException.class, () -> client.content().retrieveScenariosMalformed());
         raises(InvalidDataException.class, () -> client.content().retrieveScenariosEmptyBody());
         Health extras = client.content().listScenariosExtraFields();
@@ -572,7 +588,7 @@ public class Smoke {
             client.items().delete("i1").get();
             expect(isNothing(client.content().retrieveScenariosNullableBody().get()), true);
             expect(client.content().retrieveScenariosText().get(), "hello text\n");
-            expect(client.content().downloadBlob().get().length, 256);
+            expect(client.content().downloadBlob().get().bytes().length, 256);
             expect(asyncCause(client.content().retrieveScenariosMalformed()) instanceof InvalidDataException, true);
             expect(asyncCause(client.content().retrieveScenariosEmptyBody()) instanceof InvalidDataException, true);
             expect(client.content().listScenariosExtraFields().get().status(), "ok");

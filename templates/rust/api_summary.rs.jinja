@@ -5,11 +5,14 @@ pub mod client;
 pub mod upload;
 #[path = "../event_stream.rs"]
 mod event_stream;
+#[path = "../binary_response.rs"]
+mod binary_response;
 #[path = "../middleware.rs"]
 pub mod middleware;
 #[path = "../call.rs"]
 mod call;
 pub use crate::connector::{http_client, HttpClient};
+pub use binary_response::BinaryResponse;
 pub use call::{ApiResponse, Call};
 pub use event_stream::{EventStream, SseEvent};
 pub use upload::{RequestBody, Upload};
@@ -66,27 +69,22 @@ pub use self::{
     {% endfor -%}
 };
 
-{% set patch = namespace(bodies=[]) -%}
-{% for resource in api.resources -%}
-{% for op in resource.operations if op.method == "patch" and op.request_body_schema_name is defined -%}
-{% set patch.bodies = patch.bodies + [op.request_body_schema_name | to_upper_camel_case] -%}
-{% endfor -%}
-{% endfor -%}
 {# An `Option<_>` expression reading the property at `path` from `root`, a reference to a
    `schema`: `&X` (`&mut X` with `mut`), `&str` (`str`), `bool` (`copy`) or `i64` (`i64`). -#}
 {% macro access(root, schema, path, kind="ref", mut=false) -%}
 {% set walk = namespace(schema=schema | to_upper_camel_case, expr=root, option=false, ty="") -%}
 {% set as = "as_mut()" if mut else "as_ref()" -%}
 {% for segment in path -%}
-{% set found = namespace(field=none) -%}
+{% set found = namespace(field=none, tri_state=false) -%}
 {% for _, t in api.types | items if (t.name | to_upper_camel_case) == walk.schema -%}
 {% for f in t.fields if f.name == segment %}{% set found.field = f %}{% endfor -%}
+{% set found.tri_state = walk.schema in tri_state_types -%}
 {% endfor -%}
 {% set member = walk.expr ~ ("?" if walk.option else "") ~ "." ~ (found.field.name | to_rust_ident) -%}
 {% set walk.ty = found.field.type.to_rust() -%}
 {% if found.field.required and not found.field.nullable -%}
 {% set walk.expr = member %}{% set walk.option = false -%}
-{% elif found.field.nullable and not found.field.required and walk.schema in patch.bodies -%}
+{% elif found.field.nullable and not found.field.required and found.tri_state -%}
 {% set walk.expr = member ~ "." ~ as ~ "?." ~ as %}{% set walk.option = true -%}
 {% else -%}
 {% set walk.expr = member ~ "." ~ as %}{% set walk.option = true -%}
@@ -333,7 +331,8 @@ impl {{ client }}Builder {
 
     /// How many times a failed request is retried: on connection errors, timeouts, and
     /// 408, 429 and 5xx responses. Only idempotent requests are retried, or those
-    /// with an `Idempotency-Key`{% if sdk.idempotency_keys %}, which POST requests get automatically{% endif %}.
+    /// with an `Idempotency-Key`{% if sdk.idempotency_keys %}, which POST requests get automatically{% endif %},
+    /// except on a 429, which every request retries.
     /// `Retry-After` is honored up to a minute, otherwise delays grow from 500ms to 8s with jitter.
     ///
     /// Default: 2.
@@ -449,7 +448,7 @@ impl {{ client }}Builder {
             user_agent: Some(format!("{{ sdk.user_agent_prefix }}-rust/{CRATE_VERSION}")),
             client: self
                 .http_client
-                .unwrap_or_else(|| super::http_client(crate::make_connector())),
+                .unwrap_or_else(crate::connector::default_client),
             timeout: self.timeout,
             base_path,
             bearer_access_token: self.token,

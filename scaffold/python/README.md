@@ -2,6 +2,7 @@
 {% set call = examples.call -%}
 {% set list = examples.list -%}
 {% set stream = examples.stream -%}
+{% set download = examples.download -%}
 {% set result = docs.var(call.result, "result") if call else "result" -%}
 {% macro call_of(kwargs="", raw=false) %}{% if call %}{{ docs.call(call, kwargs, raw) }}{% else %}client.{{ "with_raw_response." if raw }}some_resource.some_method({{ kwargs }}){% endif %}{% endmacro -%}
 {% set with_body = examples.create -%}
@@ -47,8 +48,8 @@ async with Async@@CLIENT_NAME@@() as client:
 
 ## Requests
 
-The fields of a JSON or form request body are keyword arguments, next to the query and header
-parameters; path parameters come first{% if with_body %}:
+The fields of a JSON, form or multipart request body are keyword arguments, next to the query and
+header parameters; path parameters come first{% if with_body %}:
 
 ```python
 {{ docs.imports([with_body]) }}{{ docs.call(with_body) }}
@@ -56,8 +57,9 @@ parameters; path parameters come first{% if with_body %}:
 {% else %}.
 {% endif %}
 An optional argument left out is not sent; `None` sends `null` where the API accepts it. An enum
-argument takes the enum or its value as a string. Other bodies (lists, unions, files) are one
-`body` argument.
+argument takes the enum or its value as a string. A model argument also takes its JSON as a
+dict, typed by the model's `...Param` `TypedDict`. Other bodies (lists, unions, binary files) are
+one `body` argument.
 
 Every method also takes, for that request only, `extra_headers=`, `extra_query=`, `extra_body=`
 (merged into the body), `timeout=` and `max_retries=`. These headers, like `default_headers`, win
@@ -65,10 +67,11 @@ over the client's credentials.
 
 ## Models
 
-Models are keyword-only dataclasses with `from_dict`/`to_dict`. In models requests send, an
-optional field that accepts `null` defaults to `UNSET` (from `@@PACKAGE_NAME@@.models`): it is
-left out of the request, while `None` sends `null`; in response models it is simply `None` when
-absent. A field holding a string or an object, such as an expandable id, is typed `str | Model`.
+Models are keyword-only dataclasses with `from_dict`/`to_dict`. In models only requests send
+and in PATCH bodies, an optional field that accepts `null` defaults to `UNSET` (from
+`@@PACKAGE_NAME@@.models`): it is left out of the request, while `None` sends `null`. In models
+responses carry too it is simply `None` when absent or `null`, and `None` is left out of the
+request; the keyword arguments of methods still send `null` for `None`. A field holding a string or an object, such as an expandable id, is typed `str | Model`.
 A discriminated union is the union of its variant models (`Circle | Square | UnknownVariant`),
 decoded into the variant the tag names; when its variants share fields, it is a model holding the
 discriminator and the variant, and passing `content=` alone fills in the tag.
@@ -119,6 +122,23 @@ with {{ docs.call(stream) }} as stream:
 
 Other streams yield `SseEvent`s.
 {% endif %}
+{%- if download %}
+## Downloads
+
+A binary response comes as a `BinaryResponse`, its body unread until you consume it: `read()`
+gives the bytes, `iter_bytes()` the chunks as they arrive and `write_to_file(path)` streams them
+to disk. Use it in a `with` block when the body may be left unread:
+
+```python
+{{ docs.imports([download]) }}content = {{ docs.call(download) }}.read()
+
+with {{ docs.call(download) }} as response:
+    response.write_to_file("download.bin")
+```
+
+An error status raises before any body, retries end once the headers arrive, and the timeout
+applies to each read, not to the whole download.
+{% endif %}
 Multipart bodies take `Upload(content, filename, content_type)` files, and binary bodies bytes or
 file objects.
 
@@ -159,7 +179,8 @@ A successful response that does not decode raises `APIResponseValidationError`.
 
 Connection errors, timeouts, 408, 429 and 5xx responses are retried twice with exponential
 backoff, honoring `Retry-After`, when replaying the request is safe: for idempotent methods
-and requests with an `Idempotency-Key` header. Requests time out after
+and requests with an `Idempotency-Key` header. A 429 is retried whatever the method, as the
+server refused the request. Requests time out after
 @@TIMEOUT@@ seconds.
 
 ```python

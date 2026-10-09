@@ -3,6 +3,7 @@
 {% set list = examples.list -%}
 {% set stream = examples.stream -%}
 {% set create = examples.create -%}
+{% set download = examples.download -%}
 {% set result = docs.var(call.result, "result") if call else "result" -%}
 {% macro call_of(raw=false, request_options="") %}{% if call %}{{ docs.call(call, raw=raw, request_options=request_options) }}{% else %}client.SomeResource{{ ".WithRawResponse" if raw }}.SomeMethodAsync({{ "requestOptions: " ~ request_options if request_options }}){% endif %}{% endmacro -%}
 {% macro models_using(ex) %}{% if ex and ex.body %}using @@PACKAGE_NAME@@.Models;
@@ -79,7 +80,8 @@ successful response the SDK cannot read throws an `ApiDecodeException`.
 
 Connection errors, timeouts, 408, 429 and 5xx responses are retried twice with jittered backoff
 (0.5s, then 1s), honoring `Retry-After` and `retry-after-ms` up to a minute (the backoff
-otherwise), when the request is idempotent or carries an `Idempotency-Key`. Each attempt times out after @@TIMEOUT@@ seconds.
+otherwise), when the request is idempotent or carries an `Idempotency-Key`, and 429 responses of
+every request. Each attempt times out after @@TIMEOUT@@ seconds.
 
 ```csharp
 var client = new @@CLIENT_NAME@@Client(options: new() { {% if not sdk.has_default_base_url %}BaseUrl = "https://api.example.com", {% endif %}MaxRetries = 5, Timeout = TimeSpan.FromSeconds(20) });
@@ -133,6 +135,22 @@ await foreach (var item in stream)
     Console.WriteLine(item);
 }
 ```
+{% endif %}
+{%- if download %}
+## Downloads
+
+Binary responses come as a `BinaryResponse`, returned once the headers arrive. Read the body
+whole, to a file, or as it streams in, disposing of it after use:
+
+```csharp
+{{ models_using(download) -}}
+byte[] data = await {{ docs.call(download) }}.ReadAsBytesAsync();
+await {{ docs.call(download) }}.WriteToFileAsync("download.bin");
+await using var file = await {{ docs.call(download) }};
+var stream = await file.OpenStreamAsync(); // file.Headers, ContentType, ContentLength
+```
+
+The timeout covers the wait for the headers, then each read, not the whole download.
 {% endif %}
 ## Raw responses
 

@@ -3,16 +3,17 @@ package @@JAVA_INTERNAL_PACKAGE@@;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.BeanDescription;
 import com.fasterxml.jackson.databind.JavaType;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.introspect.AnnotatedMember;
 import @@JAVA_PACKAGE@@.ApiResponse;
 import @@JAVA_PACKAGE@@.@@CLIENT_NAME@@Options;
 import @@JAVA_PACKAGE@@.RequestOptions;
 import @@JAVA_PACKAGE@@.exceptions.@@CLIENT_NAME@@Exception;
 import @@JAVA_PACKAGE@@.exceptions.ApiConnectionException;
 import @@JAVA_PACKAGE@@.exceptions.ApiException;
-import @@JAVA_PACKAGE@@.exceptions.ApiTimeoutException;
 import @@JAVA_PACKAGE@@.exceptions.AuthenticationException;
 import @@JAVA_PACKAGE@@.exceptions.BadRequestException;
 import @@JAVA_PACKAGE@@.exceptions.ConflictException;
@@ -22,11 +23,11 @@ import @@JAVA_PACKAGE@@.exceptions.NotFoundException;
 import @@JAVA_PACKAGE@@.exceptions.PermissionDeniedException;
 import @@JAVA_PACKAGE@@.exceptions.RateLimitException;
 import @@JAVA_PACKAGE@@.exceptions.UnprocessableEntityException;
+import @@JAVA_PACKAGE@@.streaming.BinaryResponse;
 import @@JAVA_PACKAGE@@.streaming.EventStream;
 import @@JAVA_PACKAGE@@.streaming.SseEvent;
 import java.io.IOException;
 import java.io.InterruptedIOException;
-import java.net.SocketTimeoutException;
 import java.time.Duration;
 import java.time.ZonedDateTime;
 import java.time.format.DateTimeFormatter;
@@ -218,6 +219,12 @@ public final class @@CLIENT_NAME@@HttpClient implements AutoCloseable {
             dispatcher.setMaxRequestsPerHost(64);
             builder.dispatcher(dispatcher);
         }
+        if (options.proxy().isPresent()) {
+            builder.proxy(options.proxy().get());
+        } else if (options.httpClient().isEmpty()) {
+            EnvProxy.fromEnv(System.getenv())
+                    .ifPresent(proxies -> builder.proxySelector(proxies).proxyAuthenticator(proxies));
+        }
         options.interceptors().forEach(builder::addInterceptor);
         builder.addInterceptor(logger(options.debug() ? System.Logger.Level.INFO : System.Logger.Level.DEBUG));
         builder.addInterceptor(RESTORE_RETRY_AFTER);
@@ -322,6 +329,16 @@ public final class @@CLIENT_NAME@@HttpClient implements AutoCloseable {
     @FunctionalInterface
     private interface BodyReader<T> {
         T read(Response response) throws IOException;
+    }
+
+    /**
+     * Whether a response is read whole, or handed over open: as events, whose reads have no
+     * timeout, or as binary content, whose reads keep the read timeout.
+     */
+    private enum Body {
+        READ,
+        EVENTS,
+        BINARY
     }
 
     /** One request, before its response type is set. */
@@ -458,7 +475,7 @@ public final class @@CLIENT_NAME@@HttpClient implements AutoCloseable {
          * @return the exchange
          */
         public <T> Exchange<T> returning(JavaType type) {
-            return new Exchange<>(this, false, response -> readJson(response, type, true));
+            return new Exchange<>(this, Body.READ, response -> readJson(response, type, true));
         }
 
         /**
@@ -484,7 +501,7 @@ public final class @@CLIENT_NAME@@HttpClient implements AutoCloseable {
         }
 
         private <T> Exchange<Optional<T>> returningOptional(JavaType type) {
-            return new Exchange<>(this, false, response -> Optional.ofNullable(readJson(response, type, false)));
+            return new Exchange<>(this, Body.READ, response -> Optional.ofNullable(readJson(response, type, false)));
         }
 
         /**
@@ -493,17 +510,16 @@ public final class @@CLIENT_NAME@@HttpClient implements AutoCloseable {
          * @return the exchange
          */
         public Exchange<Void> returningNothing() {
-            return new Exchange<>(this, false, response -> null);
+            return new Exchange<>(this, Body.READ, response -> null);
         }
 
         /**
-         * Expects a binary body.
+         * Expects a binary body, handed over unread once the headers arrive.
          *
          * @return the exchange
          */
-        public Exchange<byte[]> returningBytes() {
-            return new Exchange<>(
-                    this, false, response -> response.body() == null ? new byte[0] : response.body().bytes());
+        public Exchange<BinaryResponse> returningBinary() {
+            return new Exchange<>(this, Body.BINARY, BinaryResponse::of);
         }
 
         /**
@@ -513,7 +529,7 @@ public final class @@CLIENT_NAME@@HttpClient implements AutoCloseable {
          */
         public Exchange<String> returningText() {
             return new Exchange<>(
-                    this, false, response -> response.body() == null ? "" : response.body().string());
+                    this, Body.READ, response -> response.body() == null ? "" : response.body().string());
         }
 
         /**
@@ -522,7 +538,7 @@ public final class @@CLIENT_NAME@@HttpClient implements AutoCloseable {
          * @return the exchange
          */
         public Exchange<EventStream<SseEvent>> returningEvents() {
-            return new Exchange<>(this, true, EventStream::raw);
+            return new Exchange<>(this, Body.EVENTS, EventStream::raw);
         }
 
         /**
@@ -535,7 +551,10 @@ public final class @@CLIENT_NAME@@HttpClient implements AutoCloseable {
         public <T> Exchange<EventStream<T>> returningEvents(Class<T> type) {
             JavaType eventType = objectMapper.getTypeFactory().constructType(type);
             return new Exchange<>(
-                    this, true, response -> EventStream.typed(response, event -> decodeEvent(event, eventType)));
+                    this,
+                    Body.EVENTS,
+                    response -> EventStream.typed(
+                            response, event -> decodeEvent(event, eventType), item -> declaresError(item)));
         }
 
         /**
@@ -549,10 +568,13 @@ public final class @@CLIENT_NAME@@HttpClient implements AutoCloseable {
         public <T> Exchange<EventStream<T>> returningEvents(TypeReference<T> type) {
             JavaType eventType = objectMapper.getTypeFactory().constructType(type);
             return new Exchange<>(
-                    this, true, response -> EventStream.typed(response, event -> decodeEvent(event, eventType)));
+                    this,
+                    Body.EVENTS,
+                    response -> EventStream.typed(
+                            response, event -> decodeEvent(event, eventType), item -> declaresError(item)));
         }
 
-        private Request request(boolean streaming) {
+        private Request request(Body mode) {
             RequestBody content = body;
             if (json != null) {
                 try {
@@ -578,7 +600,7 @@ public final class @@CLIENT_NAME@@HttpClient implements AutoCloseable {
             if (headers != null) {
                 headers.forEach(pair -> setHeader(request, pair.getFirst(), pair.getSecond()));
             }
-            if (streaming) {
+            if (mode == Body.EVENTS) {
                 request.header("Accept", "text/event-stream");
             }
             options.headers().forEach((name, value) -> setHeader(request, name, value));
@@ -600,14 +622,17 @@ public final class @@CLIENT_NAME@@HttpClient implements AutoCloseable {
             return request.build();
         }
 
-        private OkHttpClient http(boolean streaming) {
-            if (!streaming && options.timeout().isEmpty()) {
+        private OkHttpClient http(Body mode) {
+            if (mode == Body.READ && options.timeout().isEmpty()) {
                 return client;
             }
             OkHttpClient.Builder builder = client.newBuilder();
             options.timeout().ifPresent(timeout -> withTimeout(builder, timeout));
-            if (streaming) {
-                builder.readTimeout(Duration.ZERO).callTimeout(Duration.ZERO);
+            if (mode == Body.EVENTS) {
+                builder.readTimeout(Duration.ZERO);
+            }
+            if (mode != Body.READ) {
+                builder.callTimeout(Duration.ZERO);
             }
             return builder.build();
         }
@@ -625,12 +650,12 @@ public final class @@CLIENT_NAME@@HttpClient implements AutoCloseable {
      */
     public final class Exchange<T> {
         private final Call call;
-        private final boolean streaming;
+        private final Body mode;
         private final BodyReader<T> reader;
 
-        private Exchange(Call call, boolean streaming, BodyReader<T> reader) {
+        private Exchange(Call call, Body mode, BodyReader<T> reader) {
             this.call = call;
-            this.streaming = streaming;
+            this.mode = mode;
             this.reader = reader;
         }
 
@@ -649,10 +674,10 @@ public final class @@CLIENT_NAME@@HttpClient implements AutoCloseable {
          * @return the status, headers and body
          */
         public ApiResponse<T> sendRaw() {
-            Request request = call.request(streaming);
+            Request request = call.request(mode);
             Response response;
             try {
-                response = execute(request, call.http(streaming), call.retries());
+                response = execute(request, call.http(mode), call.retries());
             } catch (IOException e) {
                 throw transportError(e);
             }
@@ -681,7 +706,7 @@ public final class @@CLIENT_NAME@@HttpClient implements AutoCloseable {
             CompletableFuture<R> out = new CompletableFuture<>();
             CompletableFuture<Response> responses;
             try {
-                responses = executeAsync(call.request(streaming), call.http(streaming), call.retries());
+                responses = executeAsync(call.request(mode), call.http(mode), call.retries());
             } catch (RuntimeException e) {
                 out.completeExceptionally(e);
                 return out;
@@ -715,11 +740,11 @@ public final class @@CLIENT_NAME@@HttpClient implements AutoCloseable {
                 if (!response.isSuccessful()) {
                     throw error(response, call.errors);
                 }
-                if (streaming) {
+                if (mode == Body.EVENTS) {
                     checkEventStream(response);
                 }
                 T body = reader.read(response);
-                keepOpen = streaming;
+                keepOpen = mode != Body.READ;
                 return new ApiResponse<>(response.code(), response.headers(), body);
             } catch (JsonProcessingException e) {
                 throw new InvalidDataException(
@@ -760,6 +785,30 @@ public final class @@CLIENT_NAME@@HttpClient implements AutoCloseable {
         return objectMapper.readValue(text, type);
     }
 
+    /** Whether {@code item} has an {@code error} property: a model, or the variant a union holds. */
+    private boolean declaresError(Object item) {
+        if (item == null
+                || item instanceof JsonNode
+                || item instanceof Map
+                || item instanceof Collection
+                || item.getClass().isEnum()
+                || item.getClass().getName().startsWith("java.")) {
+            return true;
+        }
+        BeanDescription bean =
+                objectMapper.getSerializationConfig().introspect(objectMapper.constructType(item.getClass()));
+        AnnotatedMember value = bean.findJsonValueAccessor();
+        if (value == null) {
+            return bean.findProperties().stream().anyMatch(property -> property.getName().equals("error"));
+        }
+        // A value no variant of a union decodes is `Unrecognized`.
+        if (item.getClass().getSimpleName().equals("Unrecognized")) {
+            return false;
+        }
+        value.fixAccess(true);
+        return declaresError(value.getValue(item));
+    }
+
     private <T> T decodeEvent(SseEvent event, JavaType type) {
         try {
             return objectMapper.readValue(event.data(), type);
@@ -791,22 +840,20 @@ public final class @@CLIENT_NAME@@HttpClient implements AutoCloseable {
     }
 
     private static ApiConnectionException transportError(IOException e) {
-        boolean timeout =
-                e instanceof SocketTimeoutException
-                        || (e instanceof InterruptedIOException && "timeout".equals(e.getMessage()));
-        return timeout ? new ApiTimeoutException(e) : new ApiConnectionException(e);
+        return Utils.transportError(e);
     }
 
     private ApiException error(Response response, Map<String, Class<?>> errors) throws IOException {
         String body = response.body() == null ? "" : response.body().string();
         int code = response.code();
+        String reported = Utils.errorMessage(Utils.jsonOrNull(body));
         String message =
                 response.request().method()
                         + " "
                         + response.request().url().encodedPath()
                         + " failed with status "
                         + code
-                        + (body.isEmpty() ? "" : ": " + abbreviate(body));
+                        + (body.isEmpty() ? "" : ": " + abbreviate(reported != null ? reported : body));
         Headers headers = response.headers();
         Object error = errorBody(body, code, errors);
         switch (code) {
@@ -876,12 +923,16 @@ public final class @@CLIENT_NAME@@HttpClient implements AutoCloseable {
         INSTANCE
     }
 
-    private static boolean retryable(Request request) {
+    /** Whether the body of {@code request}, if any, can be sent again. */
+    private static boolean replayable(Request request) {
         RequestBody body = request.body();
-        return (IDEMPOTENT_METHODS.contains(request.method())
-                        || request.tag(RetrySafe.class) != null
-                        || request.header("idempotency-key") != null)
-                && (body == null || !body.isOneShot());
+        return body == null || !body.isOneShot();
+    }
+
+    private static boolean idempotent(Request request) {
+        return IDEMPOTENT_METHODS.contains(request.method())
+                || request.tag(RetrySafe.class) != null
+                || request.header("idempotency-key") != null;
     }
 
     private static Request attempt(Request request, int attempt) {
@@ -893,20 +944,21 @@ public final class @@CLIENT_NAME@@HttpClient implements AutoCloseable {
     }
 
     /**
-     * Retries transport errors, 408, 429 and 5xx responses of requests that are safe to repeat:
-     * idempotent methods, or those carrying an idempotency key.
+     * Retries transport errors, 408 and 5xx responses of requests that are safe to repeat:
+     * idempotent methods, or those carrying an idempotency key; 429 responses whatever the method.
      */
     private Response execute(Request request, OkHttpClient http, int retries) throws IOException {
-        boolean retryable = retryable(request);
+        boolean replayable = replayable(request);
+        boolean idempotent = idempotent(request);
         // An access token the API rejects is replaced once, without using up a retry.
         boolean renewed = false;
         for (int attempt = 0; ; attempt++) {
-            boolean lastAttempt = !retryable || attempt >= retries;
+            boolean lastAttempt = !replayable || attempt >= retries;
             Response response;
             try {
                 response = http.newCall(attempt(request, attempt)).execute();
             } catch (IOException e) {
-                if (lastAttempt || Thread.currentThread().isInterrupted()) {
+                if (lastAttempt || !idempotent || Thread.currentThread().isInterrupted()) {
                     throw e;
                 }
                 sleep(backoff(attempt));
@@ -919,7 +971,7 @@ public final class @@CLIENT_NAME@@HttpClient implements AutoCloseable {
                 attempt--;
                 continue;
             }
-            Duration delay = lastAttempt ? null : retryDelay(response, attempt);
+            Duration delay = lastAttempt ? null : retryDelay(response, attempt, idempotent);
             if (delay == null) {
                 return response;
             }
@@ -930,16 +982,15 @@ public final class @@CLIENT_NAME@@HttpClient implements AutoCloseable {
 
     /** Whether {@code response} rejects the OAuth2 access token {@code request} carries. */
     private boolean rejectedToken(Request request, Response response) {
-        RequestBody body = request.body();
         return response.code() == 401
                 && auth != null
-                && (body == null || !body.isOneShot())
+                && replayable(request)
                 && auth.renewable(request);
     }
 
     private CompletableFuture<Response> executeAsync(Request request, OkHttpClient http, int retries) {
         CompletableFuture<Response> result = new CompletableFuture<>();
-        executeAsync(request, http, retryable(request) ? retries : 0, 0, false, result);
+        executeAsync(request, http, replayable(request) ? retries : 0, 0, false, result);
         return result;
     }
 
@@ -965,7 +1016,7 @@ public final class @@CLIENT_NAME@@HttpClient implements AutoCloseable {
                 new Callback() {
                     @Override
                     public void onFailure(okhttp3.Call call, IOException e) {
-                        if (lastAttempt) {
+                        if (lastAttempt || !idempotent(request)) {
                             result.completeExceptionally(transportError(e));
                         } else {
                             later(
@@ -989,7 +1040,7 @@ public final class @@CLIENT_NAME@@HttpClient implements AutoCloseable {
                                     });
                             return;
                         }
-                        Duration delay = lastAttempt ? null : retryDelay(response, attempt);
+                        Duration delay = lastAttempt ? null : retryDelay(response, attempt, idempotent(request));
                         if (delay == null) {
                             if (!result.complete(response)) {
                                 response.close();
@@ -1007,9 +1058,10 @@ public final class @@CLIENT_NAME@@HttpClient implements AutoCloseable {
     }
 
     /** The delay before retrying after {@code response}, or null to return it. */
-    private Duration retryDelay(Response response, int attempt) {
+    private Duration retryDelay(Response response, int attempt, boolean idempotent) {
         int status = response.code();
-        if (status != 408 && status != 429 && status < 500) {
+        // A 429 was refused before being processed, so resending it cannot apply it twice.
+        if (status != 429 && (!idempotent || (status != 408 && status < 500))) {
             return null;
         }
         Duration delay = retryAfter(response);

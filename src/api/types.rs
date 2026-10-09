@@ -18,6 +18,7 @@ use crate::spec::IncludeMode;
 use heck::{ToSnakeCase as _, ToUpperCamelCase as _};
 
 use super::{
+    constraints::Constraints,
     get_schema_name,
     resources::{self, Resource, Resources},
     unions::{self, Condition, JsonShape, UnionDecode, UnionMode},
@@ -83,6 +84,7 @@ pub(crate) fn from_referenced_components(
                         description: None,
                         deprecated: false,
                         discriminator_defaults: BTreeMap::new(),
+                        constraints: None,
                         data: TypeData::Alias {
                             target: Box::new(FieldType::JsonObject),
                         },
@@ -207,6 +209,7 @@ pub(crate) fn hoist_inline_variants(types: &mut Types) {
                     nullable: false,
                     deprecated: false,
                     example: None,
+                    constraints: Constraints::default(),
                     read_only: false,
                     write_only: false,
                     flatten: false,
@@ -221,6 +224,7 @@ pub(crate) fn hoist_inline_variants(types: &mut Types) {
                 description: None,
                 deprecated: false,
                 discriminator_defaults,
+                constraints: None,
                 data: TypeData::Struct {
                     fields: own,
                     additional_properties: None,
@@ -234,6 +238,57 @@ pub(crate) fn hoist_inline_variants(types: &mut Types) {
     }
     for ty in hoisted {
         types.insert(ty.name.clone(), ty);
+    }
+}
+
+/// Drops the shared fields of the tagged unions that a variant declares too. Rust flattens the
+/// variant next to the shared fields, and serde gives each property to only one of them, so a
+/// variant requiring it would never see it.
+pub(crate) fn leave_shared_fields_to_variants(types: &mut Types) {
+    let owned: BTreeMap<String, BTreeSet<String>> = types
+        .iter()
+        .filter_map(|(name, ty)| {
+            let TypeData::StructEnum { fields, repr, .. } = &ty.data else {
+                return None;
+            };
+            let (StructEnumRepr::AdjacentlyTagged { variants, .. }
+            | StructEnumRepr::InternallyTagged { variants }) = repr;
+            let declared: BTreeSet<&str> = variants
+                .iter()
+                .flat_map(|v| match &v.content {
+                    EnumVariantType::Struct { fields } => {
+                        fields.iter().map(|f| f.name.as_str()).collect()
+                    }
+                    EnumVariantType::Ref {
+                        schema_ref: Some(target),
+                        ..
+                    } => match types.get(target) {
+                        Some(
+                            variant @ Type {
+                                data: TypeData::Struct { fields, .. },
+                                ..
+                            },
+                        ) => (fields.iter().filter(|f| !f.flatten))
+                            .map(|f| f.name.as_str())
+                            .chain(variant.inherited_fields(types))
+                            .collect(),
+                        _ => Vec::new(),
+                    },
+                    EnumVariantType::Ref { .. } => Vec::new(),
+                })
+                .collect();
+            let dropped: BTreeSet<String> = (fields.iter())
+                .filter(|f| declared.contains(f.name.as_str()))
+                .map(|f| f.name.clone())
+                .collect();
+            (!dropped.is_empty()).then(|| (name.clone(), dropped))
+        })
+        .collect();
+    for (name, dropped) in owned {
+        if let Some(TypeData::StructEnum { fields, .. }) = types.get_mut(&name).map(|t| &mut t.data)
+        {
+            fields.retain(|f| !dropped.contains(&f.name));
+        }
     }
 }
 
@@ -477,6 +532,7 @@ pub(crate) fn set_discriminator_defaults(types: &mut Types) {
                 schema_ref: Some(target),
                 ..
             } = &variant.content
+                && declared_tag(types, target, discriminator_field, &variant.name).is_none()
             {
                 values
                     .entry((target.clone(), discriminator_field.clone()))
@@ -537,6 +593,30 @@ pub(crate) fn set_discriminator_defaults(types: &mut Types) {
             }
         }
     }
+}
+
+/// The constant the variant `target`, tagged `tag` by default, declares for `field` instead:
+/// OpenAI's `InputMessage` is tagged `message`, as its `type` says.
+pub(crate) fn declared_tag<'a>(
+    types: &'a Types,
+    target: &str,
+    field: &str,
+    tag: &str,
+) -> Option<&'a str> {
+    let Some(TypeData::Struct { fields, .. }) = types.get(target).map(|t| &t.data) else {
+        return None;
+    };
+    (tag == target)
+        .then(|| {
+            fields
+                .iter()
+                .find(|f| f.name == field)?
+                .constant
+                .as_ref()?
+                .as_str()
+        })
+        .flatten()
+        .filter(|constant| *constant != tag)
 }
 
 /// Makes `readOnly` fields optional in the schemas sent in requests, and `writeOnly` ones in
@@ -700,6 +780,7 @@ fn resolve_schema_ref_in_field_type(
                 description: None,
                 deprecated: false,
                 discriminator_defaults: BTreeMap::new(),
+                constraints: None,
                 data: TypeData::StringAlias,
             });
         }
@@ -718,6 +799,50 @@ fn resolve_schema_ref_in_field_type(
     }
 }
 
+/// Gives the fields and parameters referencing an alias, such as a constrained string or
+/// number, its constraints, which they keep once targets inline the alias.
+pub(crate) fn inherit_alias_constraints(types: &mut Types, resources: &mut Resources) {
+    let aliases = alias_constraints(types);
+    if aliases.is_empty() {
+        return;
+    }
+    for ty in types.values_mut() {
+        (ty.data).for_each_field(|f| f.constraints.inherit(&f.r#type, &aliases));
+    }
+    let mut stack: Vec<&mut Resource> = resources.values_mut().collect();
+    while let Some(resource) = stack.pop() {
+        for op in &mut resource.operations {
+            op.inherit_constraints(&aliases);
+        }
+    }
+}
+
+/// The constraints of each alias, with those of the aliases it leads to.
+fn alias_constraints(types: &Types) -> BTreeMap<String, Constraints> {
+    let target = |name: &str| match types.get(name).map(|t| &t.data) {
+        Some(TypeData::Alias { target }) => match target.non_null() {
+            FieldType::SchemaRef { name, .. } => types.get(name),
+            _ => None,
+        },
+        _ => None,
+    };
+    types
+        .iter()
+        .filter(|(_, ty)| matches!(ty.data, TypeData::Alias { .. } | TypeData::StringAlias))
+        .filter_map(|(name, ty)| {
+            let own = |ty: &Type| ty.constraints.as_deref().cloned().unwrap_or_default();
+            let mut constraints = own(ty);
+            let mut next = target(name);
+            for _ in 0..16 {
+                let Some(ty) = next else { break };
+                constraints = constraints.or(own(ty));
+                next = target(&ty.name);
+            }
+            (!constraints.is_empty()).then(|| (name.clone(), constraints))
+        })
+        .collect()
+}
+
 /// See [`super::Api::settle_object_unions`].
 pub(crate) fn settle_object_unions(types: &mut Types, best_match: bool) -> (usize, usize) {
     let mut counts = (0, 0);
@@ -728,14 +853,15 @@ pub(crate) fn settle_object_unions(types: &mut Types, best_match: bool) -> (usiz
     counts
 }
 
-/// Replaces the embedded `allOf` parts of every struct by their fields, for targets that
-/// cannot flatten a nested object when (de)serializing.
-pub(crate) fn inline_flattened_fields(types: &mut Types) -> anyhow::Result<()> {
+/// Replaces the embedded `allOf` parts of every struct by their fields. `strict` targets cannot
+/// flatten a nested object when (de)serializing, so a part that is not an object fails; the others
+/// keep it embedded.
+pub(crate) fn inline_flattened_fields(types: &mut Types, strict: bool) -> anyhow::Result<()> {
     let snapshot = types.clone();
     for (name, ty) in types.iter_mut() {
         let flat = |fields: &mut Vec<Field>| -> anyhow::Result<()> {
             if fields.iter().any(|f| f.flatten) {
-                *fields = flattened(&snapshot, name, fields, &mut BTreeSet::new())?;
+                *fields = flattened(&snapshot, name, fields, strict, &mut BTreeSet::new())?;
             }
             Ok(())
         };
@@ -772,6 +898,7 @@ fn flattened<'a>(
     types: &'a Types,
     owner: &str,
     fields: &'a [Field],
+    strict: bool,
     seen: &mut BTreeSet<&'a str>,
 ) -> anyhow::Result<Vec<Field>> {
     let mut out: Vec<Field> = Vec::new();
@@ -785,14 +912,18 @@ fn flattened<'a>(
         }
         let part = field.r#type.referenced_schema().unwrap_or_default();
         let Some(TypeData::Struct { fields: inner, .. }) = types.get(part).map(|t| &t.data) else {
-            bail!(
-                "schema `{owner}`: its `allOf` part `{part}` is not an object, which this target cannot embed"
-            );
+            if strict {
+                bail!(
+                    "schema `{owner}`: its `allOf` part `{part}` is not an object, which this target cannot embed"
+                );
+            }
+            out.push(field.clone());
+            continue;
         };
         if !seen.insert(part) {
             continue;
         }
-        for inherited in flattened(types, owner, inner, seen)? {
+        for inherited in flattened(types, owner, inner, strict, seen)? {
             if !out.iter().any(|f| f.name == inherited.name) {
                 out.push(inherited);
             }
@@ -989,7 +1120,7 @@ pub(crate) fn promote_inline_enums(
         by_values: types
             .iter()
             .filter_map(|(name, ty)| match &ty.data {
-                TypeData::StringEnum { values } => Some((values.clone(), name.clone())),
+                TypeData::StringEnum { values, .. } => Some((values.clone(), name.clone())),
                 _ => None,
             })
             .collect(),
@@ -1141,6 +1272,7 @@ fn add_promoted(
         description: None,
         deprecated: false,
         discriminator_defaults: BTreeMap::new(),
+        constraints: None,
         data,
     });
     name
@@ -1153,7 +1285,12 @@ fn promote_field_type(
     new_types: &mut BTreeMap<String, Type>,
 ) -> anyhow::Result<()> {
     match ft {
-        FieldType::StringEnum { values, title } => {
+        FieldType::StringEnum {
+            values,
+            title,
+            open,
+        } => {
+            let open = *open;
             let values = std::mem::take(values);
             if let Some(existing_name) = existing.by_values.get(&values) {
                 *ft = FieldType::SchemaRef {
@@ -1163,7 +1300,7 @@ fn promote_field_type(
                 return Ok(());
             }
             let title = title.take();
-            let data = TypeData::StringEnum { values };
+            let data = TypeData::StringEnum { values, open };
             let name = add_promoted(
                 title.as_deref().unwrap_or(base_name),
                 data,
@@ -1260,8 +1397,15 @@ pub(crate) struct Type {
     /// `{"type": "circle"}`, when every such union agrees: constructors can default it.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub(crate) discriminator_defaults: BTreeMap<String, String>,
+    /// The constraints of an alias, which the fields and parameters referencing it inherit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) constraints: Option<Box<Constraints>>,
     #[serde(flatten)]
     pub data: TypeData,
+}
+
+fn is_open_enum(extensions: &BTreeMap<String, serde_json::Value>) -> bool {
+    extensions.get(crate::spec::OPEN_ENUM) == Some(&serde_json::Value::Bool(true))
 }
 
 /// Whether a `oneOf`/`anyOf` part only states which properties are required, which constrains
@@ -1335,16 +1479,21 @@ impl Type {
     pub(crate) fn from_schema(name: String, mut s: SchemaObject) -> anyhow::Result<Self> {
         drop_required_only_alternatives(&mut s);
         let metadata = s.metadata.clone().unwrap_or_default();
+        let constraints = Some(Box::new(Constraints::from_schema(&s))).filter(|c| !c.is_empty());
         let ty = |data| Self {
             name: name.clone(),
             description: super::html::doc(metadata.description.clone()),
             deprecated: metadata.deprecated,
             discriminator_defaults: BTreeMap::new(),
+            constraints: match &data {
+                TypeData::Alias { .. } | TypeData::StringAlias => constraints.clone(),
+                _ => None,
+            },
             data,
         };
         let alias = |s: SchemaObject| -> anyhow::Result<Self> {
             Ok(ty(match FieldType::from_schema_object(s)? {
-                FieldType::StringEnum { values, .. } => TypeData::StringEnum { values },
+                FieldType::StringEnum { values, open, .. } => TypeData::StringEnum { values, open },
                 target => TypeData::Alias {
                     target: Box::new(target),
                 },
@@ -1402,7 +1551,7 @@ impl Type {
                 TypeData::from_integer_enum(values, enum_varnames(&s.extensions)?)?
             }
             Some(InstanceType::String) => match s.enum_values {
-                Some(values) => TypeData::from_string_enum(values)?,
+                Some(values) => TypeData::from_string_enum(values, is_open_enum(&s.extensions))?,
                 // A `format` types the alias like an inline schema of it: a date, a decimal...
                 None if !matches!(FieldType::from_schema_object(s.clone())?, FieldType::String) => {
                     return alias(s);
@@ -1559,8 +1708,18 @@ pub(super) fn extract_nullable_variant(variants: &[Schema]) -> Option<&Schema> {
     }
 }
 
+/// The description of `X` in a nullable `anyOf: [X, null]`, which documents the field.
+fn nullable_variant_description(obj: &SchemaObject) -> Option<String> {
+    let subschemas = obj.subschemas.as_ref()?;
+    let variants = subschemas.any_of.as_ref().or(subschemas.one_of.as_ref())?;
+    let Schema::Object(inner) = extract_nullable_variant(variants)? else {
+        return None;
+    };
+    inner.metadata.as_ref()?.description.clone()
+}
+
 /// The type implied by validation keywords when `type` is absent.
-fn implied_type(obj: &SchemaObject) -> Option<InstanceType> {
+pub(super) fn implied_type(obj: &SchemaObject) -> Option<InstanceType> {
     if obj.reference.is_some() || obj.const_value.is_some() {
         None
     } else if obj.array.is_some() {
@@ -1592,6 +1751,9 @@ pub(crate) enum TypeData {
     },
     StringEnum {
         values: Vec<String>,
+        /// Any other string is valid too: the spec lists the values next to a plain string.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        open: bool,
     },
     IntegerEnum {
         variants: Vec<(String, i64)>,
@@ -1765,6 +1927,7 @@ impl TypeData {
                 nullable: false,
                 deprecated: false,
                 example: None,
+                constraints: Constraints::default(),
                 read_only: false,
                 write_only: false,
                 flatten: true,
@@ -1912,8 +2075,9 @@ impl TypeData {
         })
     }
 
-    fn from_string_enum(values: Vec<serde_json::Value>) -> anyhow::Result<TypeData> {
+    fn from_string_enum(values: Vec<serde_json::Value>, open: bool) -> anyhow::Result<TypeData> {
         Ok(Self::StringEnum {
+            open,
             values: values
                 .into_iter()
                 .enumerate()
@@ -2021,8 +2185,11 @@ pub(crate) struct Field {
     pub(crate) required: bool,
     pub(crate) nullable: bool,
     deprecated: bool,
+    /// The `example` of the schema, else the first of its `examples`.
     #[serde(skip_serializing_if = "Option::is_none")]
     example: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Constraints::is_empty")]
+    pub(crate) constraints: Constraints,
     /// Only sent by the server (`readOnly`).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     read_only: bool,
@@ -2048,8 +2215,13 @@ impl Field {
             Schema::Bool(_) => SchemaObject::default(),
             Schema::Object(o) => o,
         };
-        let example = obj.extensions.get("example").cloned();
-        let metadata = obj.metadata.clone().unwrap_or_default();
+        let mut metadata = obj.metadata.clone().unwrap_or_default();
+        if metadata.description.is_none() {
+            metadata.description = nullable_variant_description(&obj);
+        }
+        let example =
+            (obj.extensions.get("example").cloned()).or_else(|| metadata.examples.first().cloned());
+        let constraints = Constraints::from_schema(&obj);
         let constant = obj
             .const_value
             .clone()
@@ -2086,6 +2258,7 @@ impl Field {
             nullable,
             deprecated: metadata.deprecated,
             example,
+            constraints,
             read_only: metadata.read_only,
             write_only: metadata.write_only,
             flatten: false,
@@ -2413,6 +2586,8 @@ pub(crate) enum FieldType {
         /// Title from the OpenAPI schema, used as the promoted type name when set.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         title: Option<String>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        open: bool,
     },
     /// An inline integer enum, promoted like a [`FieldType::StringEnum`].
     IntegerEnum {
@@ -2628,16 +2803,17 @@ impl FieldType {
                         return Ok((Self::String, nullable));
                     }
                     let title = obj.metadata.as_ref().and_then(|m| m.title.clone());
-                    return Ok((Self::StringEnum { values, title }, nullable));
+                    let open = is_open_enum(&obj.extensions);
+                    return Ok((
+                        Self::StringEnum {
+                            values,
+                            title,
+                            open,
+                        },
+                        nullable,
+                    ));
                 }
-                match obj.format.as_deref() {
-                    Some("decimal") => Self::Decimal,
-                    Some("date-time") => Self::DateTime,
-                    Some("date") => Self::Date,
-                    Some("uri") => Self::Uri,
-                    Some("uuid") => Self::Uuid,
-                    _ => Self::String,
-                }
+                Self::of_string_format(obj.format.as_deref())
             }
             Some(InstanceType::Array) => {
                 let array = obj.array.unwrap_or_default();
@@ -2685,6 +2861,18 @@ impl FieldType {
         };
 
         Ok((result, nullable))
+    }
+
+    /// The type of a string of `format`: [`Self::String`] unless the format makes it another.
+    pub(crate) fn of_string_format(format: Option<&str>) -> Self {
+        match format {
+            Some("decimal") => Self::Decimal,
+            Some("date-time") => Self::DateTime,
+            Some("date") => Self::Date,
+            Some("uri") => Self::Uri,
+            Some("uuid") => Self::Uuid,
+            _ => Self::String,
+        }
     }
 
     fn to_csharp_typename(&self) -> Cow<'_, str> {
@@ -4338,13 +4526,15 @@ mod tests {
         assert_eq!(
             types["Unit"].data,
             TypeData::StringEnum {
-                values: vec!["bps".into(), "Bps".into()]
+                values: vec!["bps".into(), "Bps".into()],
+                open: false,
             }
         );
         assert_eq!(
             types["Operator"].data,
             TypeData::StringEnum {
-                values: vec!["lt".into(), "gt".into()]
+                values: vec!["lt".into(), "gt".into()],
+                open: false,
             }
         );
     }
@@ -4439,7 +4629,7 @@ mod tests {
         ] {
             types.insert(name.into(), Type::from_schema(name.into(), schema).unwrap());
         }
-        inline_flattened_fields(&mut types).unwrap();
+        inline_flattened_fields(&mut types, true).unwrap();
         let TypeData::Struct { fields, .. } = &types["Composed"].data else {
             panic!("not a struct");
         };

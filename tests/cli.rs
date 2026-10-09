@@ -29,6 +29,10 @@ fn project_from(fixture: &str, languages: &[&str]) -> tempfile::TempDir {
     .unwrap();
     let (ok, out) = perseid(dir.path(), &["init", "--sdks", &languages.join(",")]);
     assert!(ok, "{out}");
+    // Tests check the generators' default timeout, not the one init gives streaming APIs.
+    let config = dir.path().join("perseid.toml");
+    let toml = fs::read_to_string(&config).unwrap();
+    fs::write(&config, toml.replace("timeout = 600\n", "")).unwrap();
     dir
 }
 
@@ -50,6 +54,53 @@ fn init_derives_names_from_the_spec() {
     assert!(ok, "{out}");
     assert!(dir.path().join("rust/src/error.rs").exists());
     assert!(dir.path().join("go/go.mod").exists());
+}
+
+#[test]
+fn init_gives_apis_streaming_their_answers_ten_minutes() {
+    let dir = tempfile::tempdir().unwrap();
+    let spec = "openapi: 3.1.0\ninfo: {title: Chat, version: '1'}\npaths:\n  /chat:\n    post:\n      \
+        operationId: chat\n      responses:\n        '200':\n          description: ok\n          \
+        content: {text/event-stream: {schema: {type: string}}}\n";
+    fs::write(dir.path().join("openapi.yaml"), spec).unwrap();
+    let (ok, out) = perseid(dir.path(), &["init", "--sdks", "python"]);
+    assert!(ok, "{out}");
+    let config = fs::read_to_string(dir.path().join("perseid.toml")).unwrap();
+    assert!(config.contains("\ntimeout = 600\n"), "{config}");
+    let config = fs::read_to_string(project().path().join("perseid.toml")).unwrap();
+    assert!(!config.contains("timeout"), "{config}");
+}
+
+#[test]
+fn init_keeps_a_title_word_in_mixed_case_one_word() {
+    let dir = tempfile::tempdir().unwrap();
+    let spec = "openapi: 3.1.0\ninfo: {title: OpenAI API, version: '1'}\npaths: {}\n";
+    fs::write(dir.path().join("openapi.yaml"), spec).unwrap();
+    let (ok, out) = perseid(dir.path(), &["init", "--sdks", "python,typescript,go"]);
+    assert!(ok, "{out}");
+    let config = fs::read_to_string(dir.path().join("perseid.toml")).unwrap();
+    for text in [
+        "name = \"OpenAI\"",
+        "header_prefix = \"openai\"",
+        "[python]\npackage = \"openai\"",
+        "[typescript]\npackage = \"openai\"",
+        "[go]\npackage = \"openai\"\nmodule = \"openai\"",
+        "[context]\nenv_prefix = \"OPENAI\"",
+    ] {
+        assert!(config.contains(text), "no `{text}` in {config}");
+    }
+    let (ok, out) = perseid(dir.path(), &["generate", "python", "--no-format"]);
+    assert!(ok, "{out}");
+    let spec = "openapi: 3.1.0\ninfo: {title: Unions, version: '1'}\npaths: {}\n";
+    fs::write(dir.path().join("openapi.yaml"), spec).unwrap();
+    fs::remove_file(dir.path().join("perseid.toml")).unwrap();
+    let (ok, out) = perseid(dir.path(), &["init", "--sdks", "python"]);
+    assert!(ok, "{out}");
+    let config = fs::read_to_string(dir.path().join("perseid.toml")).unwrap();
+    assert!(
+        config.contains("[python]\npackage = \"unions_sdk\""),
+        "a suffixed name keeps it: {config}"
+    );
 }
 
 #[test]
@@ -175,7 +226,7 @@ fn init_from_stainless_maps_targets_pagination_and_method_names() {
         "spec = \"openapi.yaml\"\nname = \"Knock\"\nsdks = [\"typescript\", \"python\", \"go\"]\nbase_url = \"https://api.knock.app\"\nidempotency_keys = true\nexclude = [\"notify\"]\n",
         "license = \"Apache-2.0\"\nhomepage = \"https://docs.knock.app\"\nauthors = [\"knock <support@knock.app>\"]\n",
         "[methods]\naddAudienceMembers = \"add_members\"\narchiveMessage = \"mark_as_archived\"\ngetUser = \"get\"\ngetUserFeed = \"list_items\"\n\n",
-        "[resources]\naddAudienceMembers = \"audiences\"\ngetUserFeed = \"users.feeds\"\nlistAudienceMembers = \"audiences\"\n\n",
+        "[resources]\naddAudienceMembers = \"audiences\"\ngetUserFeed = \"users.feeds\"\nlistAudienceMembers = \"audiences\"\n\n[models]\nSchedule = \"MessageSchedule\"\n\n",
         "# entries_cursor\ncursor = \"after\"\nitems = \"entries\"\nnext_cursor = \"page_info.after\"\n",
         "# items_cursor\ncursor = \"after\"\nitems = \"items\"\nnext_cursor = \"page_info.after\"\n",
         "[typescript]\npackage = \"@knocklabs/node\"\nrepo = \"knocklabs/knock-node\"\n",
@@ -195,6 +246,7 @@ fn init_from_stainless_maps_targets_pagination_and_method_names() {
     );
     assert!(
         out.contains("3 resource placements, 4 method names")
+            && out.contains("1 model name")
             && !out.contains("resources.users.feeds"),
         "{out}"
     );
@@ -204,7 +256,6 @@ fn init_from_stainless_maps_targets_pagination_and_method_names() {
         "client_settings.opts.branch: perseid clients take no custom options: send `X-Knock-Branch`",
         "pagination.entries_cursor.request.before: previous_cursor_param",
         "pagination.slack_channels_cursor: `query_options.cursor` is a nested parameter",
-        "resources.*.models: perseid names types after their schema, without resource namespaces: MessageSchedule is Schedule",
         "resources.users.list_schedules: `paginated: false`",
         "readme: ",
     ] {
@@ -228,7 +279,8 @@ fn init_from_stainless_maps_targets_pagination_and_method_names() {
         api.contains("client.users.get(userId: string)")
             && api.contains("client.messages.markAsArchived(")
             && api.contains("client.users.list(options?: UsersListOptions): PagePromise<")
-            && !api.contains("/v1/notify"),
+            && !api.contains("/v1/notify")
+            && api.contains("MessageSchedule"),
         "{api}"
     );
     let audiences =
@@ -410,6 +462,7 @@ fn commands_find_perseid_toml_from_a_subfolder_and_inspect_one_language() {
         api["resources"].is_object() || api["resources"].is_array(),
         "{out}"
     );
+    assert_eq!(api["model_version"], perseid::MODEL_VERSION, "{out}");
     let empty = tempfile::tempdir().unwrap();
     let (ok, out) = perseid(empty.path(), &["generate"]);
     assert!(
@@ -509,6 +562,49 @@ fn webhooks_verifier_is_opt_in() {
         "target setting wins, stale file removed"
     );
     assert!(dir.path().join("rust/src/webhooks.rs").exists());
+}
+
+#[test]
+fn base_url_defaults_to_the_spec_s_first_server_without_init() {
+    let dir = tempfile::tempdir().unwrap();
+    let spec = "openapi: 3.0.3\ninfo: {title: Acme, version: '1'}\nservers:\n\
+                - url: 'https://{region}.acme.test/v1/'\n  variables: {region: {default: eu}}\n\
+                - url: https://other.acme.test\npaths: {}\n";
+    fs::write(dir.path().join("openapi.yaml"), spec).unwrap();
+    let config = dir.path().join("perseid.toml");
+    let base = "spec = \"openapi.yaml\"\nname = \"Acme\"\nsdks = [\"rust\"]\n";
+    let generated = |toml: &str| {
+        fs::write(&config, toml).unwrap();
+        let (ok, out) = perseid(dir.path(), &["generate", "--no-format"]);
+        assert!(ok, "{out}");
+        let client = fs::read_to_string(dir.path().join("rust/src/api/client.rs")).unwrap();
+        let (ok, out) = perseid(dir.path(), &["docs-data"]);
+        assert!(ok, "{out}");
+        let docs: serde_json::Value = serde_json::from_str(&out).unwrap();
+        (client, docs["base_url"].clone())
+    };
+    let constant = |url: &str| format!("const DEFAULT_BASE_URL: Option<&str> = {url};");
+
+    let (client, docs) = generated(base);
+    assert!(client.contains(&constant("Some(\"https://eu.acme.test/v1\")")));
+    assert_eq!(docs, "https://eu.acme.test/v1");
+    let (client, docs) = generated(&format!("base_url = \"https://own.test\"\n{base}"));
+    assert!(client.contains(&constant("Some(\"https://own.test\")")));
+    assert_eq!(docs, "https://own.test");
+    let (client, _) = generated(&format!("{base}[rust]\nbase_url = \"https://rs.test\"\n"));
+    assert!(client.contains(&constant("Some(\"https://rs.test\")")));
+    let (client, docs) = generated(&format!("base_url = \"\"\n{base}"));
+    assert!(client.contains(&constant("None")));
+    assert!(docs.is_null());
+
+    fs::write(
+        dir.path().join("openapi.yaml"),
+        spec.replace("'https://{region}.acme.test/v1/'", "/v1"),
+    )
+    .unwrap();
+    let (client, docs) = generated(base);
+    assert!(client.contains(&constant("None")), "{client}");
+    assert!(docs.is_null());
 }
 
 #[test]
@@ -2080,13 +2176,16 @@ fn pagination_rules_use_the_response_values_it_has() {
 }
 
 #[test]
-fn stripe_style_lists_paginate_without_a_rule() {
+fn stripe_and_openai_style_lists_paginate_without_a_rule() {
     let list = |id: &str, cursor: &str, has_more: bool, extra: &str| {
-        let more = if has_more {
-            ", has_more: { type: boolean }"
-        } else {
-            ""
+        let more = match (has_more, extra) {
+            (true, "last_id") => {
+                ", has_more: { type: boolean }, last_id: { type: [string, \"null\"] }"
+            }
+            (true, _) => ", has_more: { type: boolean }",
+            _ => "",
         };
+        let extra = if extra == "last_id" { "" } else { extra };
         format!(
             r#"
   /{id}:
@@ -2108,12 +2207,14 @@ fn stripe_style_lists_paginate_without_a_rule() {
         )
     };
     let spec = format!(
-        "openapi: 3.1.0\ninfo: {{ title: Shop, version: \"1\" }}\npaths:{}{}{}{}\ncomponents:\n  \
+        "openapi: 3.1.0\ninfo: {{ title: Shop, version: \"1\" }}\npaths:{}{}{}{}{}{}\ncomponents:\n  \
          schemas:\n    Item: {{ type: object, required: [id], properties: {{ id: {{ type: string }} }} }}\n",
         list("customers", "starting_after", true, ""),
         list("completions", "after", true, ""),
         list("events", "starting_after", false, ""),
         list("invoices", "starting_after", true, "x-pagination: false"),
+        list("threads", "after", true, "last_id"),
+        list("batches", "after_id", true, "last_id"),
     );
     let dir = tempfile::tempdir().unwrap();
     fs::write(dir.path().join("openapi.yaml"), spec).unwrap();
@@ -2130,6 +2231,16 @@ fn stripe_style_lists_paginate_without_a_rule() {
     assert!(customers.get("before").is_none(), "{customers}");
     for id in ["completions", "events", "invoices"] {
         assert!(operation(&api, id).get("pagination").is_none(), "{id}");
+    }
+    for (id, param) in [("threads", "after"), ("batches", "after_id")] {
+        let threads = &operation(&api, id)["pagination"];
+        assert_eq!(threads["param"], param, "{id}");
+        assert_eq!(
+            threads["next_cursor"],
+            serde_json::json!(["last_id"]),
+            "{id}"
+        );
+        assert_eq!(threads["has_more"], serde_json::json!(["has_more"]), "{id}");
     }
 
     let rule = "\n[[pagination]]\ncursor = \"after\"\nitem_cursor = \"id\"\nbefore = \"limit\"\noperations = [\"completions\"]\n";
@@ -2534,10 +2645,65 @@ fn edit_config(dir: &Path, edit: impl FnOnce(String) -> String) {
     fs::write(path, edit(text)).unwrap();
 }
 
+/// The model `perseid inspect` prints, before the warnings that follow it.
 fn inspect(dir: &Path) -> serde_json::Value {
     let (ok, out) = perseid(dir, &["inspect"]);
     assert!(ok, "{out}");
-    serde_json::from_str(&out).unwrap()
+    let mut values = serde_json::Deserializer::from_str(&out).into_iter();
+    values.next().unwrap().unwrap()
+}
+
+#[test]
+fn inspect_shows_constraints_display_paths_and_path_parameter_descriptions() {
+    let dir = project_from("edge-types.yaml", &["rust", "typescript"]);
+    let model = inspect(dir.path());
+    let resource = model["resources"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["name"] == "constraints_api")
+        .unwrap();
+    assert_eq!(resource["renamed_from"], "constraints");
+    assert_eq!(resource["display_path"], json!(["constraints"]));
+    let op = operation(&model, "echo_constraints");
+    assert_eq!(op["path_styles"]["id"]["style"], "simple");
+    let id = &op["typed_path_params"][0];
+    assert_eq!(id["description"], "The id.");
+    assert_eq!(id["constraints"], json!({ "minimum": 1, "maximum": 999 }));
+    let limit = &op["query_params"][0];
+    assert_eq!(
+        (&limit["default"], &limit["example"]),
+        (&json!(20), &json!(10))
+    );
+    assert_eq!(op["query_params"][1]["constraints"]["format"], "email");
+    assert_eq!(op["header_params"][0]["deprecated"], true);
+    let fields: std::collections::BTreeMap<&str, &Value> = model["types"]["Constraints"]["fields"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| (f["name"].as_str().unwrap(), &f["constraints"]))
+        .collect();
+    assert_eq!(
+        fields["ratio"],
+        &json!({ "exclusive_minimum": 0, "exclusive_maximum": 1, "multiple_of": 0.25 })
+    );
+    assert_eq!(
+        fields["tags"],
+        &json!({ "min_items": 1, "max_items": 3, "unique_items": true,
+            "items": { "max_length": 8 } })
+    );
+    assert_eq!(
+        fields["emails"],
+        &json!({ "items": { "max_length": 254, "format": "email" } })
+    );
+    assert_eq!(fields["host"], &json!({ "format": "hostname" }));
+    assert_eq!(fields["legacy"], &Value::Null);
+
+    // OpenAPI 3.0 boolean `exclusiveMinimum` reads as 3.1's bound.
+    let dir = project_from("edge-legacy.yaml", &["rust"]);
+    let model = inspect(dir.path());
+    let n = &model["types"]["Bounded"]["fields"][0];
+    assert_eq!(n["constraints"], json!({ "exclusive_minimum": 1 }));
 }
 
 #[test]
@@ -2884,6 +3050,172 @@ fn rust_unions_and_tag_defaults_are_typed() {
 }
 
 #[test]
+fn rust_constructors_convert_large_variants_are_boxed_and_bodies_send_null() {
+    let dir = project_from("petstore.yaml", &["rust"]);
+    let big: String = (1..=12)
+        .map(|i| format!("        f{i}: {{ type: string }}\n"))
+        .collect();
+    let spec = format!(
+        r##"
+openapi: 3.1.0
+info: {{ title: Things, version: "1" }}
+paths:
+  /things:
+    post:
+      operationId: create_thing
+      tags: [things]
+      requestBody:
+        content: {{ application/json: {{ schema: {{ $ref: '#/components/schemas/Thing' }} }} }}
+      responses:
+        '204': {{ description: ok }}
+components:
+  schemas:
+    Thing:
+      type: object
+      required: [kind, shape]
+      properties:
+        kind: {{ type: string, enum: [a, b] }}
+        shape: {{ $ref: '#/components/schemas/Shape' }}
+        note: {{ type: [string, 'null'] }}
+    Shape:
+      oneOf: [{{ $ref: '#/components/schemas/Dot' }}, {{ $ref: '#/components/schemas/Blob' }}]
+      discriminator: {{ propertyName: type }}
+    Dot:
+      type: object
+      required: [type]
+      properties:
+        type: {{ type: string, enum: [dot] }}
+    Blob:
+      type: object
+      required: [type]
+      properties:
+        type: {{ type: string, enum: [blob] }}
+{big}"##
+    );
+    fs::write(dir.path().join("openapi.yaml"), spec).unwrap();
+    let (ok, out) = perseid(dir.path(), &["generate", "--no-format"]);
+    assert!(ok, "{out}");
+    let read = |path: &str| {
+        fs::read_to_string(dir.path().join("rust/src").join(path))
+            .unwrap()
+            .split_whitespace()
+            .collect::<String>()
+    };
+    let thing = read("models/thing.rs");
+    assert!(
+        thing.contains("kind:implInto<ThingKind>,shape:implInto<Shape>"),
+        "{thing}"
+    );
+    assert!(thing.contains("pubnote:Option<Option<String>>"), "{thing}");
+    let shape = read("models/shape.rs");
+    assert!(shape.contains("Dot(Dot),Blob(Box<Blob>),"), "{shape}");
+    assert!(shape.contains("implFrom<Blob>forShape"), "{shape}");
+    let things = read("api/things.rs");
+    assert!(
+        things.contains("thing:implInto<Option<crate::models::Thing>>"),
+        "{things}"
+    );
+}
+
+#[test]
+fn null_differs_from_absent_only_in_request_only_models_and_patch_bodies() {
+    let dir = project_from("petstore.yaml", &["rust", "python"]);
+    let spec = r##"
+openapi: 3.1.0
+info: { title: Things, version: "1" }
+paths:
+  /things:
+    post:
+      operationId: create_thing
+      tags: [things]
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: '#/components/schemas/Thing' } } }
+      responses:
+        '200': { description: ok, content: { application/json: { schema: { $ref: '#/components/schemas/Thing' } } } }
+  /things/{id}:
+    patch:
+      operationId: update_thing
+      tags: [things]
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: '#/components/schemas/ThingPatch' } } }
+      responses:
+        '200': { description: ok, content: { application/json: { schema: { $ref: '#/components/schemas/ThingPatch' } } } }
+  /drafts:
+    post:
+      operationId: create_draft
+      tags: [drafts]
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: '#/components/schemas/Draft' } } }
+      responses:
+        '204': { description: ok }
+components:
+  schemas:
+    Thing:
+      type: object
+      required: [id]
+      properties:
+        id: { type: string }
+        note: { type: [string, 'null'] }
+    ThingPatch:
+      type: object
+      properties:
+        note: { type: [string, 'null'] }
+    Draft:
+      type: object
+      properties:
+        note: { type: [string, 'null'] }
+"##;
+    fs::write(dir.path().join("openapi.yaml"), spec).unwrap();
+    let (ok, out) = perseid(dir.path(), &["generate", "--no-format"]);
+    assert!(ok, "{out}");
+    let rust = |path: &str| {
+        fs::read_to_string(dir.path().join("rust/src/models").join(path))
+            .unwrap()
+            .split_whitespace()
+            .collect::<String>()
+    };
+    let python =
+        |path: &str| fs::read_to_string(dir.path().join("python/petstore").join(path)).unwrap();
+
+    // A model responses carry too reads as a plain optional.
+    let thing = rust("thing.rs");
+    assert!(thing.contains("pubnote:Option<String>,"), "{thing}");
+    assert!(!thing.contains("clear_note"), "{thing}");
+    assert!(
+        python("models/thing.py").contains("    note: str | None = None\n"),
+        "{}",
+        python("models/thing.py")
+    );
+    for (rust_file, python_file) in [
+        ("thing_patch.rs", "models/thing_patch.py"),
+        ("draft.rs", "models/draft.py"),
+    ] {
+        let model = rust(rust_file);
+        assert!(model.contains("pubnote:Option<Option<String>>"), "{model}");
+        assert!(model.contains("pubfnclear_note(mutself)"), "{model}");
+        let model = python(python_file);
+        assert!(
+            model.contains("    note: str | None | Unset = UNSET\n"),
+            "{model}"
+        );
+    }
+
+    // An argument still tells `None` (sent as `null`) from left out, whatever its model.
+    let things = python("api/things.py");
+    for text in [
+        "note: str | None | Unset = UNSET,",
+        "with_nulls(Thing(id=id, note=None if isinstance(note, Unset) else note, ), note=note)",
+        "ThingPatch(note=note, )",
+    ] {
+        assert!(things.contains(text), "no `{text}` in {things}");
+    }
+}
+
+#[test]
 fn rust_timeout_stream_and_error_docs_follow_the_config() {
     let dir = project_from("torture.yaml", &["rust"]);
     let read = |path: &str| {
@@ -3000,6 +3332,117 @@ fn python_types_errors_unions_and_discriminator_defaults() {
 }
 
 #[test]
+fn python_bodies_are_keyword_arguments_and_enums_take_their_values() {
+    let dir = project_from("petstore.yaml", &["python"]);
+    let spec = r##"
+openapi: 3.1.0
+info: { title: Kw, version: "1.0.0" }
+servers: [{ url: https://x.example.com }]
+paths:
+  /chat:
+    post:
+      operationId: create_chat
+      tags: [chat]
+      parameters:
+        - { name: order, in: query, schema: { $ref: "#/components/schemas/Model" } }
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: "#/components/schemas/ChatRequest" } } }
+      responses:
+        "200":
+          description: ok
+          content:
+            application/json: { schema: { $ref: "#/components/schemas/Shared" } }
+            text/event-stream: { schema: { $ref: "#/components/schemas/Shared" } }
+  /transcribe:
+    post:
+      operationId: transcribe
+      tags: [audio]
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file, model]
+              properties:
+                file: { type: string, format: binary }
+                model: { $ref: "#/components/schemas/Model" }
+                stream: { type: boolean }
+      responses:
+        "200":
+          description: ok
+          content:
+            application/json: { schema: { $ref: "#/components/schemas/Shared" } }
+            text/event-stream: { schema: { $ref: "#/components/schemas/Shared" } }
+components:
+  schemas:
+    Model: { type: string, enum: [small, large] }
+    Shared:
+      type: object
+      properties: { temperature: { type: number } }
+    ChatRequest:
+      allOf:
+        - $ref: "#/components/schemas/Shared"
+        - type: object
+          required: [prompt]
+          properties:
+            prompt: { type: string }
+            stream: { type: boolean }
+            tier: { anyOf: [{ type: string }, { type: string, enum: [auto, flex] }] }
+            size: { $ref: "#/components/schemas/Model" }
+"##;
+    fs::write(dir.path().join("openapi.yaml"), spec).unwrap();
+    let (ok, out) = perseid(dir.path(), &["generate", "--no-format"]);
+    assert!(ok, "{out}");
+    let read =
+        |path: &str| fs::read_to_string(dir.path().join("python/petstore").join(path)).unwrap();
+    let chat = read("api/chat.py");
+    for text in [
+        "prompt: str,",
+        "temperature: float | None = None,",
+        "order: Model | ModelLiteral | None = None,",
+        "tier: ChatRequestTier | ChatRequestTierLiteral | str | None = None,",
+        "ChatRequest(temperature=temperature, prompt=prompt, size=",
+        "), ChatRequest), \"stream\": True}",
+    ] {
+        assert!(chat.contains(text), "no `{text}` in {chat}");
+    }
+    assert!(!chat.contains("        body: "), "{chat}");
+    let request = read("models/chat_request.py");
+    for text in [
+        "tier: ChatRequestTier | ChatRequestTierLiteral | str | None = None",
+        "size: Model | ModelLiteral | None = None",
+        "from .model import Model, ModelLiteral",
+        "class _ChatRequestParamRequired(t.TypedDict):\n\n    prompt: str\n",
+        "class ChatRequestParam(_ChatRequestParamRequired, total=False):",
+        "    tier: ChatRequestTier | ChatRequestTierLiteral | str",
+    ] {
+        assert!(request.contains(text), "no `{text}` in {request}");
+    }
+    assert!(!request.contains("_FLATTENED"), "{request}");
+    assert!(
+        read("models/shared.py").contains("temperature: float | None = None"),
+        "a model responses carry keeps its types"
+    );
+    let audio = read("api/audio.py");
+    for text in [
+        "file: FileInput,",
+        "model: Model | ModelLiteral,",
+        "(\"file\", file, True, None),",
+        "(\"stream\", True, False, None),",
+    ] {
+        assert!(audio.contains(text), "no `{text}` in {audio}");
+    }
+    assert!(
+        !audio.contains("stream: bool")
+            && !audio.contains("(\"stream\", stream")
+            && !audio.contains("class AudioTranscribeBody"),
+        "{audio}"
+    );
+}
+
+#[test]
 fn go_types_unions_initialisms_and_error_bodies() {
     let dir = project_from("realworld.yaml", &["go"]);
     let config = dir.path().join("perseid.toml");
@@ -3091,6 +3534,69 @@ fn java_enums_keep_unknown_values_and_docs_are_html() {
 const LANGUAGES: [&str; 6] = ["rust", "typescript", "python", "go", "java", "csharp"];
 
 #[test]
+fn header_parameters_are_documented_with_their_description_in_every_language() {
+    let dir = project_from("petstore.yaml", &LANGUAGES);
+    let spec = r##"
+openapi: 3.1.0
+info: { title: Shop, version: "1" }
+servers: [{ url: https://x.example.com }]
+paths:
+  /orders:
+    get:
+      operationId: list_orders
+      tags: [orders]
+      parameters:
+        - { name: X-Tenant, in: header, description: "The tenant to list the orders of.", schema: { type: string } }
+        - { name: X-Trace, in: header, schema: { type: string } }
+      responses:
+        '204': { description: ok }
+"##;
+    fs::write(dir.path().join("openapi.yaml"), spec).unwrap();
+    let (ok, out) = perseid(dir.path(), &["generate", "--no-format"]);
+    assert!(ok, "{out}");
+    let fallbacks = [
+        (
+            "rust",
+            "/// The `X-Tenant` header parameter.",
+            "/// The `X-Trace` header parameter.",
+        ),
+        (
+            "typescript",
+            "Sent as the `X-Tenant` header",
+            "Sent as the `X-Trace` header",
+        ),
+        ("python", "", ""),
+        (
+            "go",
+            "XTenant is sent as the X-Tenant header",
+            "XTrace is sent as the X-Trace header",
+        ),
+        (
+            "java",
+            "The {@code X-Tenant} parameter.",
+            "The {@code X-Trace} parameter.",
+        ),
+        (
+            "csharp",
+            "The <c>X-Tenant</c> header",
+            "The <c>X-Trace</c> header",
+        ),
+    ];
+    for (language, described, undescribed) in fallbacks {
+        let all = files(&dir.path().join(language));
+        let text: String = all.iter().map(|(_, text)| text.as_str()).collect();
+        assert!(
+            text.contains("The tenant to list the orders of."),
+            "{language}: the description is missing"
+        );
+        if !described.is_empty() {
+            assert!(!text.contains(described), "{language}: {described}");
+            assert!(text.contains(undescribed), "{language}: {undescribed}");
+        }
+    }
+}
+
+#[test]
 fn readme_examples_build_lists_and_nested_models_in_every_language() {
     let languages = ["rust", "typescript", "python", "go", "java", "csharp"];
     let dir = project_from("petstore.yaml", &languages);
@@ -3137,7 +3643,7 @@ components:
     let calls = [
         (
             "rust",
-            "OrderCreate::new(vec![Line::new(1, \"small\".into(), \"sku\")], Address::new(\"Paris\"), vec![\"tags\".to_owned()])",
+            "OrderCreate::new(vec![Line::new(1, \"small\", \"sku\")], Address::new(\"Paris\"), vec![\"tags\".to_owned()])",
         ),
         (
             "typescript",
@@ -4719,11 +5225,25 @@ fn targets_preview_writes_the_spec_and_docs_data_of_a_docs_target() {
 /// holding an older spec and a page perseid doesn't write.
 #[cfg(unix)]
 fn docs_repository(dir: &Path) -> String {
-    let work = dir.join("docs-work");
-    fs::create_dir_all(work.join("api")).unwrap();
-    fs::write(work.join("README.md"), "# Docs\n").unwrap();
-    fs::write(work.join("api/guide.md"), "stale\n").unwrap();
-    fs::write(work.join("api/openapi.json"), "{}\n").unwrap();
+    bare_repository(
+        dir,
+        "docs",
+        &[
+            ("README.md", "# Docs\n"),
+            ("api/guide.md", "stale\n"),
+            ("api/openapi.json", "{}\n"),
+        ],
+    )
+}
+
+/// A bare repository at `<dir>/<name>.git` holding `files` on `main`: its URL.
+#[cfg(unix)]
+fn bare_repository(dir: &Path, name: &str, files: &[(&str, &str)]) -> String {
+    let work = dir.join(format!("{name}-work"));
+    for (path, text) in files {
+        fs::create_dir_all(work.join(path).parent().unwrap()).unwrap();
+        fs::write(work.join(path), text).unwrap();
+    }
     let git = |args: &[&str]| git_in(&work, args);
     git(&["init", "--quiet", "--initial-branch", "main"]);
     git(&["add", "--all"]);
@@ -4736,7 +5256,7 @@ fn docs_repository(dir: &Path) -> String {
         "-qm",
         "docs",
     ]);
-    let bare = dir.join("docs.git");
+    let bare = dir.join(format!("{name}.git"));
     git_in(
         dir,
         &[
@@ -4745,7 +5265,7 @@ fn docs_repository(dir: &Path) -> String {
             "--bare",
             "--initial-branch",
             "main",
-            "docs.git",
+            bare.to_str().unwrap(),
         ],
     );
     git(&["push", "--quiet", bare.to_str().unwrap(), "main"]);
@@ -4819,4 +5339,286 @@ fn docs_targets_open_their_pull_request_with_the_sdks_or_once_they_are_released(
         "{}",
         run.output
     );
+}
+
+/// Appends `[targets.cli]`, the toy pack wrapping the Rust SDK, with `table`, to perseid.toml in
+/// `dir`.
+fn with_pack_target(dir: &Path, table: &str) {
+    let path = dir.join("perseid.toml");
+    let config = fs::read_to_string(&path).unwrap();
+    let toy = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/packs/toy");
+    let pack = format!("pack = {:?}\nwraps = \"rust\"\n", toy.display());
+    fs::write(&path, format!("{config}\n[targets.cli]\n{pack}{table}")).unwrap();
+}
+
+#[test]
+fn pack_targets_render_against_the_sdk_they_wrap_and_scaffold_once() {
+    let dir = project();
+    with_pack_target(dir.path(), "repo = \"acme/acme-cli\"\nafter = \"rust\"\n");
+    let (ok, out) = perseid(
+        dir.path(),
+        &["targets", "cli", "--out", "preview", "--no-format"],
+    );
+    assert!(ok, "{out}");
+    assert!(
+        out.contains("cli (preview/cli): 9 added, 0 modified, 0 removed\n"),
+        "{out}"
+    );
+    let cli = dir.path().join("preview/cli");
+    let read = |file: &str| fs::read_to_string(cli.join(file)).unwrap();
+    assert!(read(".github/workflows/release.yml").contains("cargo publish -p cli\n"));
+    assert_eq!(
+        read("src/commands/pets.rs"),
+        "// This file is @generated by perseid, from the toy pack.\n\
+         //! `cli pets`, calling the `petstore` crate.\n\
+         \n\
+         pub const METHODS: &[&str] = &[\n    \"list()\",\n    \"create()\",\n    \
+         \"retrieve(pet_id: String)\",\n    \"delete(pet_id: String)\",\n];\n"
+    );
+    assert_eq!(
+        read("src/commands/mod.rs"),
+        "// This file is @generated by perseid.\n//! The commands of the Petstore API.\n\npub mod pets;\n"
+    );
+    assert!(
+        read("src/runtime/output.rs")
+            .contains("//! Prints what `cli` commands return, for Petstore.\n")
+    );
+    assert!(
+        read("Cargo.toml").contains("name = \"cli\"\n")
+            && read("Cargo.toml").contains("petstore = \"0.1.0\"\n")
+    );
+    let spec: serde_json::Value = serde_json::from_str(&read(".perseid/openapi.json")).unwrap();
+    assert_eq!(spec["info"]["title"], "Petstore API");
+    let (ok, out) = perseid(dir.path(), &["targets", "--out", "preview", "--check"]);
+    assert!(ok && out.contains("cli (preview/cli): up to date"), "{out}");
+
+    let marker = "// this file is @generated\n";
+    fs::write(cli.join("src/commands/proto.rs"), marker).unwrap();
+    fs::write(cli.join("src/commands/mine.rs"), "// handwritten\n").unwrap();
+    fs::write(cli.join("Cargo.toml"), "# mine\n").unwrap();
+    fs::remove_file(cli.join("src/main.rs")).unwrap();
+    fs::remove_file(cli.join("src/commands/pets.rs")).unwrap();
+    let (ok, out) = perseid(dir.path(), &["targets", "--out", "preview", "--check"]);
+    assert!(
+        !ok && out.contains("+ src/commands/pets.rs") && out.contains("out of date"),
+        "{out}"
+    );
+    assert!(
+        !cli.join("src/commands/pets.rs").exists(),
+        "--check must not write"
+    );
+    let (ok, out) = perseid(dir.path(), &["targets", "--out", "preview", "--no-format"]);
+    assert!(
+        ok && out.contains("cli (preview/cli): 1 added, 0 modified, 0 removed\n"),
+        "{out}"
+    );
+    assert!(
+        cli.join("src/commands/proto.rs").exists(),
+        "a file perseid didn't generate stays"
+    );
+    assert!(cli.join("src/commands/mine.rs").exists());
+    assert_eq!(read("Cargo.toml"), "# mine\n");
+    assert!(
+        !cli.join("src/main.rs").exists(),
+        "the scaffold is written once"
+    );
+
+    fs::write(cli.join("src/commands/pets.rs"), "// handwritten\n").unwrap();
+    let (ok, out) = perseid(dir.path(), &["targets", "--out", "preview", "--no-format"]);
+    assert!(
+        !ok && out.contains(
+            "refusing to overwrite files without the `@generated` marker: src/commands/pets.rs"
+        ),
+        "{out}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn pack_targets_open_their_pull_request_once_the_sdk_they_wrap_is_released() {
+    let dir = pull_request_project();
+    let cli = bare_repository(dir.path(), "cli", &[("README.md", "# CLI\n")]);
+    with_pack_target(
+        dir.path(),
+        &format!("repo = {cli:?}\nafter = \"generate\"\n"),
+    );
+    let run = run_pr(dir.path(), &["--bump", "patch"], Answers::default(), &[]);
+    assert!(run.ok, "{}", run.output);
+    let created = run.request("POST", "/cli/pulls");
+    assert_eq!(created["head"], "perseid/targets/cli");
+    assert_eq!(created["title"], "fix(api): update to Petstore API 1.0.0");
+    let body = created["body"].as_str().unwrap();
+    assert!(
+        body.contains("cli: 8 added, 0 modified, 0 removed\n")
+            && !body.contains("+ .github")
+            && body.contains("SDK versions: rust (unreleased)."),
+        "{body}"
+    );
+    assert!(
+        body.contains(
+            "The scaffold also writes these workflows, which pull requests from CI can't carry:\n\n\
+             - `.github/workflows/release.yml`\n\n\
+             Add them by hand: `perseid targets cli --out <dir>`, then commit them from `<dir>/cli`."
+        ),
+        "{body}"
+    );
+    let bare = dir.path().join("cli.git");
+    let tree = git_in(
+        &bare,
+        &["ls-tree", "-r", "--name-only", "perseid/targets/cli"],
+    );
+    assert_eq!(
+        tree.lines().collect::<Vec<_>>(),
+        [
+            ".perseid/generation.json",
+            ".perseid/openapi.json",
+            "Cargo.toml",
+            "README.md",
+            "api.md",
+            "src/commands/mod.rs",
+            "src/commands/pets.rs",
+            "src/main.rs",
+            "src/runtime/output.rs",
+        ]
+    );
+
+    let config = dir.path().join("perseid.toml");
+    let text = fs::read_to_string(&config).unwrap();
+    fs::write(
+        &config,
+        text.replace("after = \"generate\"", "after = \"rust\""),
+    )
+    .unwrap();
+    let run = run_pr(dir.path(), &["--bump", "patch"], Answers::default(), &[]);
+    assert!(run.ok, "{}", run.output);
+    assert!(
+        run.requests("POST", "/cli/pulls").is_empty(),
+        "{:#?}",
+        run.calls
+    );
+    assert!(
+        run.output
+            .contains("[targets.cli]: waits for the release of rust (")
+            && !run.output.contains("go ("),
+        "{}",
+        run.output
+    );
+}
+
+#[test]
+fn models_rename_types_in_every_sdk_and_keep_their_wire_names() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(dir.path().join("openapi.yaml"), ZOO).unwrap();
+    let languages = "rust,typescript,python,go,java,csharp";
+    let (ok, out) = perseid(dir.path(), &["init", "--sdks", languages]);
+    assert!(ok, "{out}");
+    let config = dir.path().join("perseid.toml");
+    let models = "\n[models]\nCreateAnimalResponse = \"AnimalRecord\"\nCat = \"Kitty\"\n";
+    fs::write(&config, fs::read_to_string(&config).unwrap() + models).unwrap();
+    let (ok, out) = perseid(dir.path(), &["generate", "--no-format"]);
+    assert!(ok, "{out}");
+    for language in languages.split(',') {
+        let generated = files(&dir.path().join(language));
+        let text = |needle: &str| generated.iter().any(|(_, t)| t.contains(needle));
+        assert!(
+            text("AnimalRecordOwner") && text("Kitty") && !text("CreateAnimalResponse"),
+            "{language}"
+        );
+    }
+    let kitty = fs::read_to_string(dir.path().join("python/zoo/models/kitty.py")).unwrap();
+    assert!(kitty.contains("kind: str = \"Cat\""), "{kitty}");
+
+    fs::write(
+        &config,
+        fs::read_to_string(&config).unwrap() + "Dog = \"Kitty\"\n",
+    )
+    .unwrap();
+    let (ok, out) = perseid(dir.path(), &["generate", "--no-format"]);
+    assert!(!ok && out.contains("Kitty: Cat, Dog"), "{out}");
+}
+
+const ZOO: &str = r#"openapi: 3.1.0
+info: {title: Zoo, version: '1'}
+servers: [{url: 'https://zoo.example.com'}]
+paths:
+  /animals:
+    post:
+      operationId: createAnimal
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/CreateAnimalRequest'}}}
+      responses:
+        '200':
+          description: ok
+          content: {application/json: {schema: {$ref: '#/components/schemas/CreateAnimalResponse'}}}
+components:
+  schemas:
+    CreateAnimalRequest:
+      type: object
+      required: [animal]
+      properties:
+        animal: {$ref: '#/components/schemas/Animal'}
+    CreateAnimalResponse:
+      type: object
+      required: [id, animal]
+      properties:
+        id: {type: string}
+        animal: {$ref: '#/components/schemas/Animal'}
+        owner:
+          type: object
+          properties:
+            name: {type: string}
+    Animal:
+      oneOf:
+        - {$ref: '#/components/schemas/Cat'}
+        - {$ref: '#/components/schemas/Dog'}
+      discriminator: {propertyName: kind}
+    Cat:
+      type: object
+      required: [kind]
+      properties:
+        kind: {type: string}
+        lives: {type: integer}
+    Dog:
+      type: object
+      required: [kind]
+      properties:
+        kind: {type: string}
+        good: {type: boolean}
+"#;
+
+#[test]
+fn init_from_stainless_writes_one_env_prefix() {
+    let dir = tempfile::tempdir().unwrap();
+    let spec = r#"{"openapi":"3.1.0","info":{"title":"OpenAI API","version":"1"},"paths":{}}"#;
+    fs::write(dir.path().join("openapi.json"), spec).unwrap();
+    let stainless = "targets:\n  python:\n    package_name: foo\nclient_settings:\n  default_env_prefix: FOO_\n";
+    fs::write(dir.path().join("stainless.yml"), stainless).unwrap();
+    let args = ["init", "--from", "stainless.yml", "--spec", "openapi.json"];
+    let (ok, out) = perseid(dir.path(), &args);
+    assert!(ok, "{out}");
+    let config = fs::read_to_string(dir.path().join("perseid.toml")).unwrap();
+    assert_eq!(config.matches("[context]").count(), 1, "{config}");
+    assert!(config.contains("env_prefix = \"FOO\""), "{config}");
+}
+
+#[test]
+fn rust_union_variants_of_one_type_through_an_alias_convert_into_neither() {
+    let dir = tempfile::tempdir().unwrap();
+    let spec = r##"{"openapi":"3.1.0","info":{"title":"Alias","version":"1"},
+"paths":{"/e":{"post":{"operationId":"send","requestBody":{"required":true,"content":{"application/json":{"schema":{"$ref":"#/components/schemas/Event"}}}},"responses":{"200":{"description":""}}}}},
+"components":{"schemas":{
+"Event":{"oneOf":[{"$ref":"#/components/schemas/Created"},{"$ref":"#/components/schemas/Updated"}],"discriminator":{"propertyName":"type","mapping":{"created":"#/components/schemas/Created","updated":"#/components/schemas/Updated"}}},
+"Created":{"type":"object","properties":{"type":{"type":"string"},"id":{"type":"string"}},"required":["type"]},
+"Updated":{"$ref":"#/components/schemas/Created"}}}}"##;
+    fs::write(dir.path().join("openapi.json"), spec).unwrap();
+    let (ok, out) = perseid(
+        dir.path(),
+        &["init", "--sdks", "rust", "--spec", "openapi.json"],
+    );
+    assert!(ok, "{out}");
+    let (ok, out) = perseid(dir.path(), &["generate", "--no-format"]);
+    assert!(ok, "{out}");
+    let event = fs::read_to_string(dir.path().join("rust/src/models/event.rs")).unwrap();
+    assert!(!event.contains("impl From<"), "{event}");
 }

@@ -45,6 +45,7 @@ internal sealed class ApiTransport : IDisposable
     private readonly IReadOnlyList<TimeSpan>? _retrySchedule;
     private readonly int _maxRetries;
     private readonly string _userAgent;
+    private readonly Action<ApiAttempt>? _log;
 
     public ApiTransport(
         ApiAuth auth,
@@ -81,6 +82,7 @@ internal sealed class ApiTransport : IDisposable
         _retrySchedule = options.RetrySchedule;
         _maxRetries = Math.Max(0, options.MaxRetries);
         _userAgent = options.UserAgent ?? $"@@USER_AGENT_PREFIX@@-csharp/{Version}";
+        _log = options.Log;
     }
 
     internal static string? NonEmpty(string? value) => string.IsNullOrEmpty(value) ? null : value;
@@ -219,15 +221,23 @@ internal sealed class ApiTransport : IDisposable
         return text.Length == 0 || text == "null";
     }
 
-    public async Task<ApiResponse<byte[]>> SendBytesAsync(
+    /// <summary>Opens a binary response. The timeout covers the response headers, then each read of
+    /// the body.</summary>
+    public async Task<ApiResponse<BinaryResponse>> SendBinaryAsync(
         ApiRequest request,
         RequestOptions? options,
         CancellationToken cancellationToken
     )
     {
-        var result = await SendWithRetriesAsync(request, options, false, cancellationToken)
+        var result = await SendWithRetriesAsync(request, options, true, cancellationToken)
             .ConfigureAwait(false);
-        return new(result.Response, result.Body);
+        var body = new BinaryResponse(
+            result.Stream!,
+            options?.Timeout ?? _timeout,
+            $"{request.Method} {request.Path}",
+            cancellationToken
+        );
+        return new(result.Response, body);
     }
 
     public async Task<ApiResponse<string>> SendTextAsync(
@@ -273,7 +283,7 @@ internal sealed class ApiTransport : IDisposable
     )
     {
         var raw = await SendEventStreamAsync(request, options, cancellationToken).ConfigureAwait(false);
-        return new(raw, new EventStream<T>(raw.Value, typeInfo));
+        return new(raw, new EventStream<T>(raw.Value, raw, typeInfo));
     }
 
     private readonly record struct Result(ApiResponse Response, byte[] Body, HttpResponseMessage? Stream);
@@ -330,20 +340,39 @@ internal sealed class ApiTransport : IDisposable
         }
 
         var uri = request.BuildUri(_baseUrl, authQuery);
-        var retryable =
-            (request.IsRetrySafe || IsIdempotent(request.Method) || headers.ContainsKey("Idempotency-Key"))
-            && !request.IsOneShot;
-        var retries = retryable
+        var idempotent =
+            request.IsRetrySafe || IsIdempotent(request.Method) || headers.ContainsKey("Idempotency-Key");
+        var retries = !request.IsOneShot
             ? Math.Max(0, options?.MaxRetries ?? _retrySchedule?.Count ?? _maxRetries)
             : 0;
         var timeout = options?.Timeout ?? _timeout;
         using var activity = s_activities.StartActivity(request.Operation, ActivityKind.Client);
         activity?.SetTag("http.request.method", request.Method.Method);
         activity?.SetTag("url.full", uri.GetLeftPart(UriPartial.Path));
+        var logUrl = _log is null
+            ? ""
+            : uri.GetComponents(UriComponents.SchemeAndServer | UriComponents.Path, UriFormat.UriEscaped);
         // An access token the API rejects is replaced once, without using up a retry.
         var renewed = false;
         for (var attempt = 0; ; attempt++)
         {
+            var started = Stopwatch.GetTimestamp();
+            HttpStatusCode? status = null;
+            string? failure = null;
+            void Log(TimeSpan? retryIn, bool tokenRenewed = false) =>
+                _log?.Invoke(
+                    new ApiAttempt(
+                        request.Operation,
+                        request.Method.Method,
+                        logUrl,
+                        attempt,
+                        status,
+                        failure,
+                        Stopwatch.GetElapsedTime(started),
+                        retryIn,
+                        tokenRenewed
+                    )
+                );
             if (attempt > 0)
             {
                 headers["@@HEADER_PREFIX@@-retry-count"] = attempt.ToString(
@@ -375,6 +404,7 @@ internal sealed class ApiTransport : IDisposable
                         .SendAsync(message, attemptToken.Token)
                         .ConfigureAwait(false);
                     activity?.SetTag("http.response.status_code", (int)response.StatusCode);
+                    status = response.StatusCode;
                     var meta = new ApiResponse(
                         response.StatusCode,
                         response.Headers,
@@ -382,6 +412,7 @@ internal sealed class ApiTransport : IDisposable
                     );
                     if (response.IsSuccessStatusCode && stream)
                     {
+                        Log(null);
                         return new(meta, [], response);
                     }
                     byte[] body;
@@ -393,6 +424,7 @@ internal sealed class ApiTransport : IDisposable
                     }
                     if (response.IsSuccessStatusCode)
                     {
+                        Log(null);
                         return new(meta, body, null);
                     }
                     if (
@@ -406,9 +438,10 @@ internal sealed class ApiTransport : IDisposable
                     {
                         renew = true;
                     }
-                    else if (last || !ShouldRetry((int)response.StatusCode))
+                    else if (last || !ShouldRetry((int)response.StatusCode, idempotent))
                     {
                         activity?.SetStatus(ActivityStatusCode.Error);
+                        Log(null);
                         throw ApiExceptionExtensions.ForResponse(
                             response.StatusCode,
                             System.Text.Encoding.UTF8.GetString(body),
@@ -423,9 +456,11 @@ internal sealed class ApiTransport : IDisposable
                 }
                 catch (Exception e) when (e is HttpRequestException or IOException)
                 {
-                    if (last)
+                    failure = e.Message;
+                    if (last || !idempotent)
                     {
                         activity?.SetStatus(ActivityStatusCode.Error, e.Message);
+                        Log(null);
                         throw new ApiConnectionException(
                             $"{request.Method} {request.Path} failed: {e.Message}",
                             e
@@ -434,9 +469,11 @@ internal sealed class ApiTransport : IDisposable
                 }
                 catch (OperationCanceledException e) when (!cancellationToken.IsCancellationRequested)
                 {
-                    if (last)
+                    failure = "timeout";
+                    if (last || !idempotent)
                     {
                         activity?.SetStatus(ActivityStatusCode.Error, "timeout");
+                        Log(null);
                         throw new ApiTimeoutException(
                             $"{request.Method} {request.Path} timed out after {timeout}",
                             e
@@ -446,13 +483,16 @@ internal sealed class ApiTransport : IDisposable
             }
             if (renew)
             {
+                Log(null, tokenRenewed: true);
                 renewed = true;
                 oauthUse = await _auth.RenewAsync(oauthUse!, _credentials, cancellationToken).ConfigureAwait(false);
                 headers["Authorization"] = $"Bearer {oauthUse.Token}";
                 attempt--;
                 continue;
             }
-            await Task.Delay(wait ?? Backoff(attempt), cancellationToken).ConfigureAwait(false);
+            wait ??= Backoff(attempt);
+            Log(wait);
+            await Task.Delay(wait.Value, cancellationToken).ConfigureAwait(false);
         }
     }
 
@@ -464,7 +504,9 @@ internal sealed class ApiTransport : IDisposable
         || method == HttpMethod.Options
         || method == HttpMethod.Trace;
 
-    private static bool ShouldRetry(int status) => status is 408 or 429 or >= 500;
+    // A 429 was refused before being processed, so resending it cannot apply it twice.
+    private static bool ShouldRetry(int status, bool idempotent) =>
+        status is 429 || (idempotent && status is 408 or >= 500);
 
     /// <summary>The server's <c>retry-after-ms</c> or <c>Retry-After</c> when within a minute, else
     /// the backoff.</summary>

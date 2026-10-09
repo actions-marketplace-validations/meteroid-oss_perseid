@@ -130,7 +130,8 @@ enum Command {
         no_format: bool,
     },
     /// Write the targets perseid.toml lists besides the SDKs, `[targets.<name>]`: for `docs`, the
-    /// spec and the docs data, in the folder `path` of its repository.
+    /// spec and the docs data, in the folder `path` of its repository; for a pack, the program it
+    /// renders around an SDK.
     Targets {
         /// Targets to write (default: all).
         names: Vec<String>,
@@ -141,6 +142,12 @@ enum Command {
         /// out its repository.
         #[arg(long, conflicts_with = "pr", required_unless_present = "pr")]
         out: Option<PathBuf>,
+        /// Fail if the targets under `--out` are out of date, without writing anything.
+        #[arg(long, requires = "out")]
+        check: bool,
+        /// Skip the formatters of pack targets.
+        #[arg(long)]
+        no_format: bool,
         /// Open or update the pull request of each target whose `after` holds, from
         /// `perseid/targets/<name>`, as `generate --pr` does after the SDK pull requests.
         #[arg(long)]
@@ -370,9 +377,10 @@ fn run(cli: Cli) -> Result<ExitCode> {
             dispatch,
             no_format,
         } => {
-            let (config, root) = Config::load(&config_path)?;
+            let (mut config, root) = Config::load(&config_path)?;
             let location = spec.unwrap_or_else(|| config.spec.clone());
             let spec = generate::load_spec(&config, &root, Some(&location))?;
+            config.default_to_spec_server(&spec);
             let options = Options {
                 check,
                 format: !no_format,
@@ -491,6 +499,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
                     bump: asked,
                     relax_enum_additions,
                     auto_merge,
+                    format: !no_format,
                 };
                 targets::deliver(&github, &config, &root, &targets, &spec, &request)?;
             }
@@ -499,6 +508,8 @@ fn run(cli: Cli) -> Result<ExitCode> {
             names,
             spec,
             out,
+            check,
+            no_format,
             pr: _,
             bump,
             relax_enum_additions,
@@ -514,17 +525,27 @@ fn run(cli: Cli) -> Result<ExitCode> {
             match out {
                 Some(out) => {
                     let out = cwd.join(out);
-                    let changes = targets::preview(&config, &root, &targets, &spec, &out)?;
+                    let options = Options {
+                        check,
+                        format: !no_format,
+                    };
+                    let changes =
+                        targets::preview(&config, &root, &targets, &spec, &out, &options)?;
                     let places = (targets.iter())
                         .map(|t| (t.name.clone(), shown(&out.join(&t.name), &cwd)))
                         .collect();
                     println!("{}", generate::summary(&changes, &places));
+                    if check && changes.values().any(|c| !c.is_empty()) {
+                        eprintln!("\ntargets are out of date, run `perseid targets --out`");
+                        return Ok(ExitCode::FAILURE);
+                    }
                 }
                 None => {
                     let request = targets::Request {
                         bump,
                         relax_enum_additions,
                         auto_merge,
+                        format: !no_format,
                     };
                     let github = pr::Client::default();
                     targets::deliver(&github, &config, &root, &targets, &spec, &request)?;
@@ -586,8 +607,9 @@ fn run(cli: Cli) -> Result<ExitCode> {
             spec,
             out,
         } => {
-            let (config, root) = Config::load(&config_path)?;
+            let (mut config, root) = Config::load(&config_path)?;
             let spec = generate::load_spec(&config, &root, spec.as_deref())?;
+            config.default_to_spec_server(&spec);
             let sdks = config.sdks(&languages)?;
             let data = perseid::docs_data::run(&config, &root, &sdks, &spec, &BTreeMap::new())?;
             let text = serde_json::to_string_pretty(&data)? + "\n";

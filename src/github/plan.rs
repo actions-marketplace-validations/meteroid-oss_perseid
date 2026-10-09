@@ -299,7 +299,10 @@ fn plan_hub(cx: &Session, plan: &mut Plan, hub: Hub, here_info: &Value) -> Resul
     let targets = hub.config.targets(&[])?;
     plan.targets = layout::targets(&sdks, &hub.repo);
     plan.targets
-        .extend(targets.iter().map(|t| format!("{} ({}/)", t.repo, t.path)));
+        .extend(targets.iter().map(|t| match t.path.as_str() {
+            "." => t.repo.clone(),
+            path => format!("{} ({path}/)", t.repo),
+        }));
     let hub_owner = owner_of(&hub.repo).to_owned();
     let owner = remote
         .first()
@@ -354,6 +357,12 @@ fn plan_hub(cx: &Session, plan: &mut Plan, hub: Hub, here_info: &Value) -> Resul
         }
     }
     let reached: Vec<String> = repos.iter().chain(&written).cloned().collect();
+    // Pack targets release themselves with the credentials of sdk-release.yml.
+    let (releasing, opened): (Vec<String>, Vec<String>) = written.iter().cloned().partition(|r| {
+        targets
+            .iter()
+            .any(|t| same(&t.repo, r) && matches!(t.kind, crate::targets::Kind::Pack { .. }))
+    });
     let hub_base = default_branch(&hub.info);
     let app_set = hub.info.is_some()
         && secrets::variable(api, &hub.repo, "SDK_APP_ID")
@@ -376,11 +385,12 @@ fn plan_hub(cx: &Session, plan: &mut Plan, hub: Hub, here_info: &Value) -> Resul
             );
         }
         let name = hub.config.name.to_kebab_case();
-        plan_app(cx, plan, &hub.repo, repos.clone(), installed, who, name)?;
-        if !written.is_empty() {
+        let configured = repos.iter().chain(&releasing).cloned().collect();
+        plan_app(cx, plan, &hub.repo, configured, installed, who, name)?;
+        if !opened.is_empty() {
             plan.warnings.push(format!(
                 "install your GitHub App on {} too: the targets' pull requests are opened as it",
-                written.join(", ")
+                opened.join(", ")
             ));
         }
     } else if repos
@@ -396,6 +406,14 @@ fn plan_hub(cx: &Session, plan: &mut Plan, hub: Hub, here_info: &Value) -> Resul
             format!("{}: {TOKEN} set{also}", repos.join(", ")),
             None,
         );
+        for repo in &releasing {
+            if !secrets::has_secret(api, repo, TOKEN).unwrap_or(false) {
+                plan.warnings.push(format!(
+                    "{repo} releases with {TOKEN}, which isn't set there: `gh secret set {TOKEN} -R {repo}`"
+                ));
+                plan.attention = true;
+            }
+        }
     } else {
         if !same(&owner, &hub_owner) {
             bail!(

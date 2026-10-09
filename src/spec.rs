@@ -27,6 +27,7 @@ use crate::api::Api;
 
 mod external;
 mod normalize;
+pub(crate) use normalize::OPEN_ENUM;
 mod swagger2;
 mod upgrade;
 
@@ -55,6 +56,8 @@ pub struct Filters {
     pub names: BTreeMap<String, String>,
     /// Resource paths (`workspaces.peers`) by operation id.
     pub resources: BTreeMap<String, String>,
+    /// Type names by schema name.
+    pub models: BTreeMap<String, String>,
     /// Types `format: uuid` values as strings.
     pub uuid_strings: bool,
 }
@@ -173,7 +176,7 @@ pub(crate) fn api_with_renames(
         doc["openapi"] = Value::from("3.1.0");
     }
     upgrade::boolean_schemas(&mut doc);
-    normalize::normalize(&mut doc)?;
+    normalize::normalize(&mut doc, &filters.models)?;
     if filters.uuid_strings {
         normalize::drop_format(&mut doc, "uuid");
     }
@@ -204,6 +207,20 @@ fn warn_ignored_servers(doc: &Value, filters: &Filters) {
         let _span = tracing::warn_span!("operation", name = %id).entered();
         tracing::warn!("{message}");
     }
+}
+
+/// The first of the spec's `servers` when absolute, its `{variables}` set to their defaults.
+pub(crate) fn server_url(servers: &Value) -> Option<String> {
+    let server = &servers[0];
+    let mut url = server["url"].as_str()?.to_owned();
+    if let Some(variables) = server["variables"].as_object() {
+        for (name, variable) in variables {
+            if let Some(default) = variable["default"].as_str() {
+                url = url.replace(&format!("{{{name}}}"), default);
+            }
+        }
+    }
+    (url.starts_with("http") && !url.contains('{')).then(|| url.trim_end_matches('/').to_owned())
 }
 
 fn ignored_servers(doc: &Value, filters: &Filters) -> Vec<(String, String)> {
@@ -536,6 +553,18 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn server_variables_take_their_defaults() {
+        let servers = json!([{
+            "url": "https://{region}.acme.com/{version}/",
+            "variables": { "region": { "default": "eu" }, "version": { "default": "v2" } }
+        }]);
+        let url = super::server_url(&servers);
+        assert_eq!(url.as_deref(), Some("https://eu.acme.com/v2"));
+        assert_eq!(super::server_url(&json!([{ "url": "/v1" }])), None);
+        assert_eq!(super::server_url(&serde_json::Value::Null), None);
+    }
+
+    #[test]
     fn specs_over_ten_megabytes_download() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://{}/spec.json", listener.local_addr().unwrap());
@@ -620,6 +649,7 @@ mod tests {
             reserved: Default::default(),
             names: Default::default(),
             resources: Default::default(),
+            models: Default::default(),
             uuid_strings: false,
         };
         super::api(&text, &filters).unwrap();
@@ -657,6 +687,7 @@ mod tests {
             reserved: Default::default(),
             names: Default::default(),
             resources: Default::default(),
+            models: Default::default(),
             uuid_strings: false,
         };
         let warned: Vec<String> = super::ignored_servers(&doc, &filters)
