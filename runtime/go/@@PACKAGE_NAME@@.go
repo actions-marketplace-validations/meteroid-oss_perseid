@@ -19,9 +19,9 @@ const (
 	DefaultServerURL = "@@DEFAULT_BASE_URL@@"
 
 	// DefaultMaxRetries is how many times a request is retried when it fails
-	// transiently: connection errors, timeouts, 408, 429 and 5xx responses, as
-	// long as the request is idempotent or carries an Idempotency-Key, which POSTs get when
-	// the API deduplicates by it.
+	// transiently: connection errors, timeouts, 408 and 5xx responses, as long
+	// as the request is idempotent or carries an Idempotency-Key, which POSTs get when
+	// the API deduplicates by it, and 429 responses of every request.
 	DefaultMaxRetries = 2
 
 	// APIKeyEnv names the environment variable [New] reads the API token from
@@ -57,7 +57,8 @@ type Options struct {
 	Middleware []Middleware
 
 	// Timeout bounds a single attempt, from dialing until the response body has
-	// been read. Zero selects DefaultTimeout; a negative value disables it.
+	// been read; an event stream until its headers, a [BinaryResponse] until its
+	// headers then each read. Zero selects DefaultTimeout; negative disables it.
 	Timeout time.Duration
 
 	// MaxRetries is the number of retries attempted on transient failures,

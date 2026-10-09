@@ -11,7 +11,7 @@ cp "$here/../fixtures/petstore.yaml" "$work/openapi.yaml"
 cd "$work"
 perseid init --sdks "$lang"
 sed -i '/^name = /a webhooks = true' perseid.toml
-if [ "$lang" = rust ]; then sed -i '/^base_url = /d' perseid.toml; fi
+if [ "$lang" = rust ]; then sed -i 's/^base_url = .*/base_url = ""/' perseid.toml; fi
 if [ "$lang" = go ]; then sed -i '/^\[go\]$/a module = "github.com/petstore/petstore-go"' perseid.toml; fi
 if [ "$lang" = csharp ]; then printf '\n[csharp.context]\ndependency_injection = true\n' >> perseid.toml; fi
 perseid generate "$lang"
@@ -21,7 +21,7 @@ cd "$lang"
 case "$lang" in
   rust)
     export CARGO_TARGET_DIR="$work/target"
-    cargo test --features webhooks
+    cargo test --features webhooks,tracing
     # The tests of tests/sdk/rust/torture run on the SDK of tests/fixtures/torture.yaml.
     (mkdir "$work/torture" && cd "$work/torture" \
       && perseid init --sdks rust --spec "$here/../fixtures/torture.yaml" > /dev/null \
@@ -41,7 +41,19 @@ case "$lang" in
       && perseid init --sdks rust --spec "$here/../fixtures/edge-unions.yaml" > /dev/null \
       && perseid generate rust > /dev/null \
       && mkdir -p rust/tests && cp "$here/rust/unions/"*.rs rust/tests/ \
-      && cd rust && cargo test --test models --test client) ;;
+      && cd rust && cargo test --test models --test client --test approvals)
+    # Union variants sharing a tag, which Rust, Python and Java send as they declare it.
+    (mkdir "$work/tags" && cd "$work/tags" \
+      && perseid init --sdks rust --spec "$here/rust/tags/openapi.yaml" > /dev/null \
+      && perseid generate rust > /dev/null \
+      && mkdir -p rust/tests && cp "$here/rust/tags/tags.rs" rust/tests/ \
+      && cd rust && cargo test --test tags)
+    # The multipart `_stream` twin of tests/fixtures/edge-operations.yaml.
+    (mkdir "$work/operations" && cd "$work/operations" \
+      && perseid init --sdks rust --spec "$here/../fixtures/edge-operations.yaml" > /dev/null \
+      && perseid generate rust > /dev/null \
+      && mkdir -p rust/tests && cp "$here/rust/operations/"*.rs rust/tests/ \
+      && cd rust && cargo test --test twins) ;;
   typescript)
     # The tests generate more SDKs themselves (features, torture, realworld and, with
     # `int64 = "bigint"` and `"string"`, the round trips of torture and every edge fixture).
@@ -73,6 +85,12 @@ case "$lang" in
       && perseid init --sdks go --spec "$here/../fixtures/edge-unions.yaml" > /dev/null \
       && perseid generate go > /dev/null \
       && cp "$here/go/_unions/"*_test.go go/ \
+      && cd go && go vet ./... && go test ./...)
+    # Union variants sharing a tag, on the spec of the Rust tests.
+    (mkdir "$work/tags" && cd "$work/tags" \
+      && perseid init --sdks go --spec "$here/rust/tags/openapi.yaml" > /dev/null \
+      && perseid generate go > /dev/null \
+      && cp "$here/go/_tags/"*_test.go go/ \
       && cd go && go vet ./... && go test ./...) ;;
   java)
     gradle_test() {
@@ -85,7 +103,7 @@ test { useJUnitPlatform(); testLogging { events "passed", "skipped", "failed"; e
 GRADLE
       gradle test --no-daemon
     }
-    rm -rf _torture _oauth _unions && gradle_test
+    rm -rf _torture _oauth _unions _tags _forms && gradle_test
     mkdir "$work/torture" && cp "$here/../fixtures/torture.yaml" "$work/torture/openapi.yaml"
     # Without servers, the client has no default base URL.
     sed -i '/^servers:/,/^paths:/{/^paths:/!d}' "$work/torture/openapi.yaml"
@@ -103,15 +121,25 @@ GRADLE
     (mkdir "$work/unions" && cd "$work/unions" \
       && perseid init --sdks java --spec "$here/../fixtures/edge-unions.yaml" > /dev/null \
       && perseid generate java > /dev/null \
-      && cp -r "$here/java/_unions/." java/ && cd java && gradle_test) ;;
+      && cp -r "$here/java/_unions/." java/ && cd java && gradle_test)
+    # Union variants sharing a tag, on the spec of the Rust tests.
+    (mkdir "$work/tags" && cd "$work/tags" \
+      && perseid init --sdks java --spec "$here/rust/tags/openapi.yaml" > /dev/null \
+      && perseid generate java > /dev/null \
+      && cp -r "$here/java/_tags/." java/ && cd java && gradle_test)
+    # A form operation that also answers an event stream, and file uploads.
+    (mkdir "$work/forms" && cd "$work/forms" \
+      && perseid init --sdks java --spec "$here/java/_forms/openapi.yaml" > /dev/null \
+      && perseid generate java > /dev/null \
+      && cp -r "$here/java/_forms/src" java/ && cd java && gradle_test) ;;
   csharp)
-    rm -rf _torture _oauth _unions && dotnet test Tests
+    rm -rf _torture _oauth _unions _tags _twins && dotnet test Tests
     # The tests of tests/sdk/csharp/_torture run on the SDK of tests/fixtures/torture.yaml, with no
     # default base URL.
     (mkdir "$work/torture" && cd "$work/torture" \
       && perseid init --sdks csharp --spec "$here/../fixtures/torture.yaml" > /dev/null \
       && sed -i '/^name = /a idempotency_keys = true' perseid.toml \
-      && sed -i '/^base_url/d' perseid.toml \
+      && sed -i 's/^base_url = .*/base_url = ""/' perseid.toml \
       && perseid generate csharp > /dev/null \
       && cp -r "$here/csharp/_torture/." csharp/ && cd csharp && dotnet test Tests)
     # The OAuth2 client credentials tests run on the SDK of tests/fixtures/oauth.yaml.
@@ -124,5 +152,15 @@ GRADLE
     (mkdir "$work/unions" && cd "$work/unions" \
       && perseid init --sdks csharp --spec "$here/../fixtures/edge-unions.yaml" > /dev/null \
       && perseid generate csharp > /dev/null \
-      && cp -r "$here/csharp/_unions/." csharp/ && cd csharp && dotnet test Tests) ;;
+      && cp -r "$here/csharp/_unions/." csharp/ && cd csharp && dotnet test Tests)
+    # Union variants sharing a tag.
+    (mkdir "$work/tags" && cd "$work/tags" \
+      && perseid init --sdks csharp --spec "$here/rust/tags/openapi.yaml" > /dev/null \
+      && perseid generate csharp > /dev/null \
+      && cp -r "$here/csharp/_tags/." csharp/ && cd csharp && dotnet test Tests)
+    # A multipart body with a `_stream` twin.
+    (mkdir "$work/twins" && cd "$work/twins" \
+      && perseid init --sdks csharp --spec "$here/csharp/_twins/openapi.yaml" > /dev/null \
+      && perseid generate csharp > /dev/null \
+      && cp -r "$here/csharp/_twins/Tests" csharp/ && cd csharp && dotnet test Tests) ;;
 esac

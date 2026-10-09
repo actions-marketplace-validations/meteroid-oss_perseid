@@ -12,7 +12,7 @@
       "type": "boolean"
     },
     "base_url": {
-      "description": "API base URL the clients default to.",
+      "description": "API base URL the clients default to: the spec's first absolute server unless set, none for `\"\"`.",
       "type": "string"
     },
     "context": {
@@ -30,7 +30,7 @@
       ]
     },
     "detect_pagination": {
-      "description": "`false` pages only the operations that `x-pagination` or a `pagination` rule matches, not the Stripe-style lists perseid detects.",
+      "description": "`false` pages only the operations that `x-pagination` or a `pagination` rule matches, not the Stripe- and OpenAI-style lists perseid detects.",
       "type": "boolean"
     },
     "exclude": {
@@ -80,6 +80,14 @@
     },
     "methods": {
       "description": "Method names by operation id, over the resource-style names.",
+      "default": {},
+      "type": "object",
+      "additionalProperties": {
+        "type": "string"
+      }
+    },
+    "models": {
+      "description": "Type names by schema name, over the schemas' own: `CreateChatCompletionResponse = \"ChatCompletion\"`. References, discriminators and the names of nested types follow.",
       "default": {},
       "type": "object",
       "additionalProperties": {
@@ -233,7 +241,7 @@
       "type": "object",
       "properties": {
         "base_url": {
-          "description": "API base URL this client defaults to, over the top-level one.",
+          "description": "API base URL this client defaults to, over the top-level one; none for `\"\"`.",
           "type": "string"
         },
         "context": {
@@ -311,7 +319,7 @@
       "type": "object",
       "properties": {
         "base_url": {
-          "description": "API base URL this client defaults to, over the top-level one.",
+          "description": "API base URL this client defaults to, over the top-level one; none for `\"\"`.",
           "type": "string"
         },
         "context": {
@@ -420,7 +428,7 @@
       "type": "object",
       "properties": {
         "base_url": {
-          "description": "API base URL this client defaults to, over the top-level one.",
+          "description": "API base URL this client defaults to, over the top-level one; none for `\"\"`.",
           "type": "string"
         },
         "context": {
@@ -642,7 +650,7 @@
       "type": "object",
       "properties": {
         "base_url": {
-          "description": "API base URL this client defaults to, over the top-level one.",
+          "description": "API base URL this client defaults to, over the top-level one; none for `\"\"`.",
           "type": "string"
         },
         "context": {
@@ -720,7 +728,7 @@
       "type": "object",
       "properties": {
         "base_url": {
-          "description": "API base URL this client defaults to, over the top-level one.",
+          "description": "API base URL this client defaults to, over the top-level one; none for `\"\"`.",
           "type": "string"
         },
         "context": {
@@ -875,7 +883,7 @@
       "type": "object",
       "properties": {
         "base_url": {
-          "description": "API base URL this client defaults to, over the top-level one.",
+          "description": "API base URL this client defaults to, over the top-level one; none for `\"\"`.",
           "type": "string"
         },
         "context": {

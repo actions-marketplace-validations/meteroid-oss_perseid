@@ -1,4 +1,4 @@
-{% from "types/macros.py.jinja" import field_ident, field_type, named_type, page_class, param_type, py_ident, py_type -%}
+{% from "types/macros.py.jinja" import field_ident, flat_multipart, py_field, field_type, named_type, page_class, param_type, py_ident, py_type -%}
 {% import "docs.jinja" as docs -%}
 {% set _ = set_summary_filename("api.md") -%}
 {% macro model(name) -%}
@@ -50,6 +50,12 @@
             {%- if op.request_body_is_list %}{% set body_type = "list[" ~ body_type ~ "]" %}{% endif -%}
         {%- elif op.request_body_kind == "binary" -%}
             {%- set body_type = "UploadContent" -%}
+        {%- elif op.request_body_kind == "multipart" and flat_multipart(op) | trim -%}
+            {%- for f in op.multipart_fields -%}
+                {%- set annotation = "list[FileInput]" if f.is_file and f.is_file_list else ("FileInput" if f.is_file else py_type(f.type)) -%}
+                {%- if f.required and not f.nullable %}{% set args.required = args.required + [py_field(f.name) ~ ": " ~ annotation] %}{% else %}{% set args.optional = args.optional + [py_field(f.name) ~ "=..."] %}{% endif -%}
+            {%- endfor -%}
+            {%- set body_type = none -%}
         {%- elif op.request_body_kind == "multipart" -%}
             {%- set body_type = (resource.name | to_upper_camel_case) ~ (op.name | to_upper_camel_case) ~ "Body" -%}
         {%- else -%}
@@ -79,7 +85,7 @@
     {%- elif op.response_is_event_stream -%}
         {%- set returned = "Stream[" ~ (op.event_schema_name | to_upper_camel_case) ~ "]" if op.event_schema_name is defined else "EventStream" -%}
     {%- elif op.response_is_binary -%}
-        {%- set returned = "bytes" -%}
+        {%- set returned = "BinaryResponse" -%}
     {%- elif op.response_is_text -%}
         {%- set returned = "str" -%}
     {%- elif response -%}
@@ -92,7 +98,7 @@
 {% macro returns(op) -%}
     {%- if op.pagination is defined %}{{ model(op.response_body_schema_name) }} pages of {{ model(op.pagination.item_schema) }}
     {%- elif op.response_is_event_stream %}{% if op.event_schema_name is defined %}stream of {{ model(op.event_schema_name) }}{% else %}event stream{% endif %}
-    {%- elif op.response_is_binary %}bytes
+    {%- elif op.response_is_binary %}bytes, streamed
     {%- elif op.response_is_text %}text
     {%- elif op.response_body_schema_name is defined %}{{ model(op.response_body_schema_name) }}{% if op.response_body_is_list %} list{% endif %}
     {%- elif op.response_body_json_type is defined %}`{{ (named_type(op.response_body_json_type, op.response_body_union | to_upper_camel_case) if op.response_body_union is defined else py_type(op.response_body_json_type)) | replace("|", "\\|") }}`
@@ -119,6 +125,13 @@ marks optional keyword arguments. Models are in [`{{ docs.package() }}/models`](
 A list method returns its first page, such as a `{{ paged.page }}`: a subclass of the response
 model (`{{ paged.model }}`) with the paging members `items`, `has_next_page()`, `get_next_page()`,
 `iter_pages()` and `body`, which iterates every item. The page classes are in `{{ docs.package() }}.api`.
+{%- endif %}
+{%- set binary = namespace(any=false) %}
+{%- for resource in api.resources %}{% for op in resource.operations if op.response_is_binary %}{% set binary.any = true %}{% endfor %}{% endfor %}
+{%- if binary.any %}
+A method answering a file returns a `BinaryResponse` (`AsyncBinaryResponse`), its body unread:
+`read()` gives the bytes, `iter_bytes()` the chunks as they arrive and `write_to_file(path)`
+streams them to disk. Use it in a `with` block when the body may be left unread.
 {%- endif %}
 {% if api.resources | length > 1 %}
 {{ docs.contents(api.resources) }}

@@ -75,7 +75,8 @@ const { data, response, requestId } = await client.users.get("dnedry").withRespo
 - Model properties and parameters are camelCase (`createdAt`, `pageSize`), not the JSON names.
   The SDK converts them on the wire.
 - `date-time` values are `Date`s.
-- Types are named after the spec's schemas and exported from the package root, without the
+- Types are named after the spec's schemas, or as `[models]` in `perseid.toml` renames them
+  (`init` imports the resources' `models`), and exported from the package root, without the
   resource namespaces Stainless adds.
 
 ### Python
@@ -100,7 +101,7 @@ user = raw.parse()
   pydantic models: `model_dump()` and `model_validate()` are gone, and `to_dict()` and
   `to_json()` take no options (no `indent`, `exclude_unset` or `mode`): `to_json()` is compact,
   not indented.
-- Types live in `knockapi.models`, named after the spec's schemas.
+- Types live in `knockapi.models`, named after the spec's schemas or as `[models]` renames them.
 - There is no `with_streaming_response`.
 
 ### Go, Java and C#
@@ -260,7 +261,7 @@ files without its `@generated` marker.
 |---|---|
 | Resources nested at any depth, methods on the client (`$client`) | Resources three deep at most, from the spec's first tag and its paths, and no methods on the client |
 | Types namespaced by resource | Types named after the spec's schemas |
-| Every request retried, POST included, on connection errors, 408, 409, 429 and 5xx | POST retried only with an `Idempotency-Key`: `idempotency_keys = true` sends one with every POST. 409 is not retried |
+| Every request retried, POST included, on connection errors, 408, 409, 429 and 5xx | POST retried only with an `Idempotency-Key`, except on 429: `idempotency_keys = true` sends one with every POST. 409 is not retried |
 | `environment` option between named base URLs | One default base URL, overridden by `baseURL` / `base_url` or `KNOCK_BASE_URL` |
 | Custom client options, sent as headers or parameters | Default headers, or a parameter on each call |
 | Pagination by next-page URL, backwards, or in the body | By a query parameter, backwards only from an item cursor (`before`) |

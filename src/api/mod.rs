@@ -234,8 +234,13 @@ impl Api {
         types::hoist_inline_variants(&mut self.types);
     }
 
-    pub(crate) fn inline_flattened_fields(&mut self) -> anyhow::Result<()> {
-        types::inline_flattened_fields(&mut self.types)
+    /// Leaves the shared fields of tagged unions their variants declare to the variants, for Rust.
+    pub(crate) fn leave_shared_fields_to_variants(&mut self) {
+        types::leave_shared_fields_to_variants(&mut self.types);
+    }
+
+    pub(crate) fn inline_flattened_fields(&mut self, strict: bool) -> anyhow::Result<()> {
+        types::inline_flattened_fields(&mut self.types, strict)
     }
 
     /// Types string-alias bodies and parameters as plain strings, for Java.

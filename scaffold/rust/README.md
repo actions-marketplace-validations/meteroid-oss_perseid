@@ -2,6 +2,7 @@
 {% set call = examples.call -%}
 {% set list = examples.list -%}
 {% set stream = examples.stream -%}
+{% set download = examples.download -%}
 {% set create = examples.create -%}
 {% set result = docs.var(call.result, "result") if call else "result" -%}
 {% macro call_of(options="") %}{% if call %}{{ docs.call(call, options=options) }}{% else %}client.some_resource(){{ ".with_options(" ~ options ~ ")" if options }}.some_method(){% endif %}{% endmacro -%}
@@ -101,7 +102,7 @@ other.
 
 Connection errors, timeouts, 408, 429 and 5xx responses are retried twice with jittered
 backoff, honoring `Retry-After`, when the request is idempotent: GET, PUT, DELETE, or any request
-with an `Idempotency-Key`. Each attempt times out after 60
+with an `Idempotency-Key`, and 429 responses of every request. Each attempt times out after 60
 seconds by default.
 
 ```rust
@@ -156,9 +157,30 @@ while let Some(event) = events.next().await {
 }
 ```
 {% endif %}
+{%- if download %}
+## Downloads
+
+A binary response comes as a `BinaryResponse`, its body unread until you consume it: `bytes()`
+reads it whole, `chunk()` (or the `Stream`) gives its chunks as they arrive, and as a
+`tokio::io::AsyncRead` it streams to a file:
+
+```rust
+{{ docs.uses(download) }}let content = {{ docs.call(download) }}.await?.bytes().await?;
+
+let mut response = {{ docs.call(download) }}.await?;
+tokio::io::copy(&mut response, &mut tokio::fs::File::create("download.bin").await?).await?;
+```
+
+An error status fails the call before any body, retries end once the headers arrive, and the
+timeout covers the headers, then each read, not the whole download.
+{% endif %}
 ## Features
 
-`rustls-tls` (default) or `native-tls`, `http2`, and `webhooks` for the webhook verifier.
+`rustls-tls` (default) or `native-tls`, `http2`, `webhooks` for the webhook verifier, and
+`tracing` for debug logs of each attempt and retry.
+
+The default client goes through the proxy of `HTTPS_PROXY`, `HTTP_PROXY` or `ALL_PROXY`, except
+for the hosts of `NO_PROXY`.
 
 - Source: @@REPOSITORY@@
 - License: @@LICENSE@@

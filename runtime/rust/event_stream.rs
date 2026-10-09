@@ -5,6 +5,7 @@ use crate::{
     request::{decode_error, transport_error},
 };
 use bytes::{Buf, Bytes};
+use http::{HeaderMap, StatusCode};
 use hyper::body::{Body as _, Incoming};
 use serde::de::DeserializeOwned;
 use std::{
@@ -65,7 +66,10 @@ impl SseEvent {
 /// What one raw event decodes to.
 enum Step<T> {
     Item(T),
+    Skip,
     Done,
+    /// The API reported an error in the stream, with this body.
+    Failed(Bytes),
 }
 
 type Decode<T> = fn(&SseEvent) -> Result<Step<T>, Error>;
@@ -75,10 +79,27 @@ fn raw(event: &SseEvent) -> Result<Step<SseEvent>, Error> {
     Ok(Step::Item(event.clone()))
 }
 
-fn json<T: DeserializeOwned>(event: &SseEvent) -> Result<Step<T>, Error> {
-    match event.data.as_str() {
-        "[DONE]" => Ok(Step::Done),
-        data => serde_json::from_str(data).map(Step::Item).map_err(decode_error),
+/// An `error` event, or data that is an object with an `error` which is not a `T` or a `T` that
+/// does not declare `error` (`DECLARES_ERROR`), is the API's error; a keepalive that is not a `T`
+/// is skipped.
+fn json<T: DeserializeOwned, const DECLARES_ERROR: bool>(event: &SseEvent) -> Result<Step<T>, Error> {
+    if event.data == "[DONE]" {
+        return Ok(Step::Done);
+    }
+    if event.event == "error" {
+        return Ok(Step::Failed(Bytes::from(event.data.clone())));
+    }
+    let reported = || {
+        event.data.contains("\"error\"")
+            && serde_json::from_str::<serde_json::Value>(&event.data)
+                .is_ok_and(|value| value.get("error").is_some_and(|error| !error.is_null()))
+    };
+    match serde_json::from_str(&event.data) {
+        Ok(_) if !DECLARES_ERROR && reported() => Ok(Step::Failed(Bytes::from(event.data.clone()))),
+        Ok(item) => Ok(Step::Item(item)),
+        Err(_) if reported() => Ok(Step::Failed(Bytes::from(event.data.clone()))),
+        Err(_) if matches!(event.event.as_str(), "ping" | "keepalive") => Ok(Step::Skip),
+        Err(error) => Err(decode_error(error)),
     }
 }
 
@@ -88,10 +109,15 @@ fn json<T: DeserializeOwned>(event: &SseEvent) -> Result<Step<T>, Error> {
 /// A typed stream ends at a `[DONE]` event, and [`last_event`](Self::last_event) gives the raw
 /// event of the last item, with its type and id.
 ///
+/// An error the API sends in a typed stream, as an `error` event or an object with an `error`,
+/// is returned as [`Error::Api`](crate::error::Error::Api) with the response's status.
+///
 /// The client timeout covers opening this stream. Use `tokio::time::timeout`
-/// around `next()` when an idle timeout is desired. On a body or parsing error,
-/// one error is returned and the stream terminates. EOF discards incomplete events.
+/// around `next()` when an idle timeout is desired. On an error, one error is
+/// returned and the stream terminates. EOF discards incomplete events.
 pub struct EventStream<T = SseEvent> {
+    status: StatusCode,
+    headers: HeaderMap,
     body: Option<Incoming>,
     pending: Bytes,
     parser: Parser,
@@ -101,8 +127,15 @@ pub struct EventStream<T = SseEvent> {
 
 impl EventStream<SseEvent> {
     /// The stream of `pending` bytes, then of `body` when the server left it open.
-    pub(crate) fn new(body: Option<Incoming>, pending: Bytes) -> Self {
+    pub(crate) fn new(
+        status: StatusCode,
+        headers: HeaderMap,
+        body: Option<Incoming>,
+        pending: Bytes,
+    ) -> Self {
         Self {
+            status,
+            headers,
             body,
             pending,
             parser: Parser::default(),
@@ -111,14 +144,17 @@ impl EventStream<SseEvent> {
         }
     }
 
-    pub(crate) fn typed<T: DeserializeOwned>(self) -> EventStream<T> {
-        self.decoding(json::<T>)
+    /// The stream of `T`s, whose model declares an `error` property when `declares_error`.
+    pub(crate) fn typed<T: DeserializeOwned>(self, declares_error: bool) -> EventStream<T> {
+        self.decoding(if declares_error { json::<T, true> } else { json::<T, false> })
     }
 }
 
 impl<T> EventStream<T> {
     fn decoding<U>(self, decode: Decode<U>) -> EventStream<U> {
         EventStream {
+            status: self.status,
+            headers: self.headers,
             body: self.body,
             pending: self.pending,
             parser: self.parser,
@@ -164,24 +200,30 @@ impl<T> EventStream<T> {
     }
 
     fn poll_item(&mut self, cx: &mut Context<'_>) -> Poll<Option<Result<T, Error>>> {
-        let event = match std::task::ready!(self.poll_event(cx)) {
-            Some(Ok(event)) => event,
-            Some(Err(error)) => return Poll::Ready(Some(Err(error))),
-            None => return Poll::Ready(None),
-        };
-        let step = (self.decode)(&event);
-        self.last = Some(event);
-        Poll::Ready(match step {
-            Ok(Step::Item(item)) => Some(Ok(item)),
-            Ok(Step::Done) => {
-                self.close();
-                None
+        loop {
+            let event = match std::task::ready!(self.poll_event(cx)) {
+                Some(Ok(event)) => event,
+                Some(Err(error)) => return Poll::Ready(Some(Err(error))),
+                None => return Poll::Ready(None),
+            };
+            let step = (self.decode)(&event);
+            if !matches!(step, Ok(Step::Skip)) {
+                self.last = Some(event);
             }
-            Err(error) => {
-                self.close();
-                Some(Err(error))
-            }
-        })
+            let error = match step {
+                Ok(Step::Item(item)) => return Poll::Ready(Some(Ok(item))),
+                Ok(Step::Skip) => continue,
+                Ok(Step::Done) => None,
+                Ok(Step::Failed(body)) => Some(Error::from_response(
+                    self.status,
+                    self.headers.clone(),
+                    body,
+                )),
+                Err(error) => Some(error),
+            };
+            self.close();
+            return Poll::Ready(error.map(Err));
+        }
     }
 
     fn close(&mut self) {
@@ -342,5 +384,30 @@ impl Parser {
         };
         self.line.clear();
         Ok(result)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(serde::Deserialize, Debug)]
+    struct Reply {
+        error: Option<String>,
+    }
+
+    async fn first(body: &'static str, declares_error: bool) -> Result<Reply, Error> {
+        let stream = EventStream::new(StatusCode::OK, HeaderMap::new(), None, Bytes::from(body));
+        stream.typed::<Reply>(declares_error).next().await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn an_error_property_is_an_api_error_unless_the_model_declares_it() {
+        let body = "data: {\"text\":\"a\",\"error\":\"partial\"}\n\n";
+        let item = first(body, true).await.unwrap();
+        assert_eq!(item.error.as_deref(), Some("partial"));
+        assert!(first(body, false).await.unwrap_err().api().is_some());
+        let error = first("event: error\ndata: {\"error\":\"x\"}\n\n", true).await.unwrap_err();
+        assert!(error.api().is_some(), "an `error` event always is");
     }
 }

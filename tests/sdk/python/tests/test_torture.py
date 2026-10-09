@@ -180,6 +180,92 @@ torture = generate("torture")
 paged = generate("paged", spec=PAGED_SPEC)
 expandable = generate("expandable", spec=EXPANDABLE_SPEC)
 adjacent = generate("adjacent", spec=ADJACENT_SPEC, base_url=None)
+
+# OpenAI's `InputItem`: three variants whose `type` is `message`, two of them in a nested union.
+SHARED_TAG_SPEC = """
+openapi: 3.1.0
+info: {title: Shared, version: "1"}
+paths:
+  /items:
+    post:
+      operationId: create_item
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/Holder'}}}
+      responses: {"204": {description: ok}}
+components:
+  schemas:
+    Holder:
+      type: object
+      required: [items]
+      properties: {items: {type: array, items: {$ref: '#/components/schemas/InputItem'}}}
+    InputItem:
+      oneOf: [{$ref: '#/components/schemas/Easy'}, {$ref: '#/components/schemas/Item'}]
+      discriminator: {propertyName: type}
+    Item:
+      oneOf: [{$ref: '#/components/schemas/Input'}, {$ref: '#/components/schemas/Output'}, {$ref: '#/components/schemas/Call'}]
+      discriminator: {propertyName: type}
+    Easy:
+      type: object
+      required: [content]
+      properties: {type: {type: string, enum: [message]}, content: {type: string}}
+    Input:
+      type: object
+      required: [role]
+      properties: {type: {type: string, enum: [message]}, role: {type: string}}
+    Output:
+      type: object
+      required: [id, type]
+      properties: {type: {type: string, enum: [message]}, id: {type: string}}
+    Call:
+      type: object
+      required: [type, name]
+      properties: {type: {type: string, enum: [call]}, name: {type: string}}
+"""
+shared = generate("shared", spec=SHARED_TAG_SPEC, base_url=None)
+
+NULLS_SPEC = """
+openapi: 3.1.0
+info: {title: Nulls, version: "1"}
+paths:
+  /notes:
+    post:
+      operationId: create_note
+      tags: [notes]
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/Note'}}}
+      responses:
+        "200":
+          description: ok
+          content: {application/json: {schema: {$ref: '#/components/schemas/Note'}}}
+  /notes/{id}:
+    patch:
+      operationId: update_note
+      tags: [notes]
+      parameters: [{name: id, in: path, required: true, schema: {type: string}}]
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/NotePatch'}}}
+      responses:
+        "200":
+          description: ok
+          content: {application/json: {schema: {$ref: '#/components/schemas/NotePatch'}}}
+components:
+  schemas:
+    Note:
+      type: object
+      required: [id]
+      properties:
+        id: {type: string}
+        text: {type: [string, 'null']}
+        color: {type: [string, 'null']}
+        model: {type: [string, 'null']}
+    NotePatch:
+      type: object
+      properties: {text: {type: [string, 'null']}}
+"""
+nulls = generate("nulls", spec=NULLS_SPEC)
 from torture import RateLimitError, Torture, models  # noqa: E402
 from torture import (  # noqa: E402
     APIConnectionError,
@@ -366,9 +452,18 @@ class ModelTest(unittest.TestCase):
         untitled = models.ObjectUnions.from_dict({"document": {"body": "b"}}).document
         self.assertIsInstance(untitled, UnknownVariant)
 
+    def test_variants_sharing_a_tag_are_sent_with_the_tag_they_declare(self) -> None:
+        m = shared.models
+        items = [m.Easy(content="hi"), m.Input(role="user"), m.Output(id="o"), m.Call(name="f")]
+        sent = m.Holder(items=items).to_dict()["items"]
+        self.assertEqual([item["type"] for item in sent], ["message", "message", "message", "call"])
+        decoded = m.Holder.from_dict({"items": sent}).items
+        self.assertEqual([type(item) for item in decoded], [m.Easy, m.Input, m.Output, m.Call])
+
     def test_unknown_properties_stay_with_the_model_that_owns_them(self) -> None:
         composed = models.Composed.from_dict({**SAMPLES["Composed"], "new": 1})
-        self.assertEqual((composed.extra_fields, composed.base.extra_fields), ({"new": 1}, {}))
+        self.assertEqual(composed.extra_fields, {"new": 1})
+        self.assertEqual((composed.id, composed.extra), ("b1", "e"), "allOf parts are inlined")
         composed.extra = "changed"
         self.assertEqual(composed.to_dict()["extra"], "changed")
         data = {"type": "circle", "radius": 1.0, "color": "red"}
@@ -480,6 +575,15 @@ class ClientTest(unittest.TestCase):
         self.assertEqual(json.loads(self.requests[0].content), [{"name": "n"}])
         self.assertEqual(self.requests[1].url.params["DateCreated<"], "2024-01-01")
 
+    def test_models_of_arguments_also_take_their_json_as_a_dict(self) -> None:
+        widget = {"id": "w", "name": "n"}
+        with client(self.respond(httpx.Response(200, json=[widget]))) as api:
+            api.widgets.bulk([{"name": "n"}, models.WidgetUpdate(name="m")])
+            api.widgets.bulk((models.WidgetUpdate(name="m"),))
+        bodies = [json.loads(r.content) for r in self.requests]
+        self.assertEqual(bodies, [[{"name": "n"}, {"name": "m"}], [{"name": "m"}]])
+        self.assertIn("name", models.WidgetUpdateParam.__annotations__)
+
     def test_object_bodies_are_keyword_arguments(self) -> None:
         with client(self.respond(httpx.Response(200, json=THING))) as api:
             api.things.create(name="n", kind="beta-2", priority=10)
@@ -544,12 +648,17 @@ class ClientTest(unittest.TestCase):
             self.assertEqual(len(self.requests), 2)
             self.assertEqual(api.things.retrieve("t", max_retries=1).id, "a/b")
 
-    def test_non_idempotent_requests_are_not_replayed_on_429(self) -> None:
-        responses = (httpx.Response(429, headers={"retry-after": "0"}), httpx.Response(200))
+    def test_every_request_is_replayed_on_429_as_the_server_refused_it(self) -> None:
+        responses = (httpx.Response(429, headers={"retry-after": "0"}), httpx.Response(200, json=THING))
+        with client(self.respond(*responses), max_retries=1) as api:
+            self.assertEqual(api.things.update("t").id, "a/b")
+        self.assertEqual(len(self.requests), 2)
+        self.assertNotIn("idempotency-key", self.requests[1].headers)
+        responses = (httpx.Response(429, headers={"retry-after": "0"}),) * 2
         with client(self.respond(*responses), max_retries=1) as api:
             with self.assertRaises(RateLimitError):
                 api.things.update("t")
-        self.assertEqual(len(self.requests), 1)
+        self.assertEqual(len(self.requests), 4)
 
     def test_non_idempotent_requests_are_not_replayed_on_5xx(self) -> None:
         responses = (
@@ -896,6 +1005,41 @@ class ScoresTest(unittest.TestCase):
             api.things.update("a/b")
         self.assertEqual(thing.id, "a/b")
         self.assertEqual([r.method for r in self.requests], ["GET", "PATCH"])
+
+
+class SharedModelNullsTest(unittest.TestCase):
+    """A model responses carry too reads an optional nullable field as `None`, PATCH bodies keep UNSET."""
+
+    def setUp(self) -> None:
+        self.bodies: list[object] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            body = json.loads(request.content)
+            self.bodies.append(body)
+            return httpx.Response(200, json=body)
+
+        self.api = nulls.Nulls(api_key="k", http_client=httpx.Client(transport=httpx.MockTransport(handler)))
+
+    def test_shared_models_read_none(self) -> None:
+        Note = nulls.models.Note
+        self.assertIsNone(Note(id="1").text)
+        self.assertEqual(Note(id="1", text=None).to_dict(), {"id": "1"})
+        self.assertEqual(Note.from_dict({"id": "1", "text": None}).to_dict(), {"id": "1", "text": None})
+        self.assertIs(nulls.models.NotePatch().text, nulls.models.UNSET)
+
+    def test_arguments_still_send_null_when_passed_none(self) -> None:
+        note = self.api.notes.create(id="1", text=None)
+        self.assertEqual(self.bodies[-1], {"id": "1", "text": None})
+        self.assertIsNone(note.text)
+        self.assertEqual(note.to_dict(), {"id": "1", "text": None})
+        self.api.notes.create(id="1", color="red")
+        self.assertEqual(self.bodies[-1], {"id": "1", "color": "red"})
+        self.api.notes.create(id="1", model=None)
+        self.assertEqual(self.bodies[-1], {"id": "1", "model": None})
+        self.api.notes.update("1", text=None)
+        self.assertEqual(self.bodies[-1], {"text": None})
+        self.api.notes.update("1")
+        self.assertEqual(self.bodies[-1], {})
 
 
 if __name__ == "__main__":

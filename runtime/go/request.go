@@ -45,10 +45,14 @@ type request struct {
 	oneShot bool
 	// replayable marks a POST that is safe to retry without an Idempotency-Key.
 	replayable bool
-	// stream keeps the response open in response, until cancel.
+	// stream keeps the response open in response, until cancel. expire cancels it as timed
+	// out after timeout, and fail turns its read errors into the SDK's.
 	stream   bool
 	response *http.Response
 	cancel   context.CancelFunc
+	expire   func()
+	timeout  time.Duration
+	fail     func(error) error
 }
 
 // autoIdempotencyKey is whether the API deduplicates POSTs by Idempotency-Key, so that each gets
@@ -172,6 +176,44 @@ func (r *request) SetJSONBody(v any) {
 	}
 	r.body = body
 	r.contentType = "application/json"
+}
+
+// setJSON applies the settings of WithJSONSet to the JSON body, an object.
+func (r *request) setJSON(settings []jsonSetting) error {
+	if len(settings) == 0 {
+		return nil
+	}
+	if r.newBody != nil || r.contentType != "" && r.contentType != "application/json" {
+		return requestError("WithJSONSet needs a JSON body, not %s", r.contentType)
+	}
+	body := json.RawMessage(r.body)
+	for _, setting := range settings {
+		var err error
+		if body, err = setJSONPath(body, setting.path, setting.value); err != nil {
+			return requestError("WithJSONSet %q: %w", strings.Join(setting.path, "."), err)
+		}
+	}
+	r.body, r.contentType = body, "application/json"
+	return nil
+}
+
+func setJSONPath(object json.RawMessage, path []string, value any) (json.RawMessage, error) {
+	fields := map[string]json.RawMessage{}
+	if len(object) > 0 && string(object) != "null" {
+		if err := json.Unmarshal(object, &fields); err != nil {
+			return nil, err
+		}
+	}
+	var err error
+	if len(path) == 1 {
+		fields[path[0]], err = json.Marshal(value)
+	} else {
+		fields[path[0]], err = setJSONPath(fields[path[0]], path[1:], value)
+	}
+	if err != nil {
+		return nil, err
+	}
+	return json.Marshal(fields)
 }
 
 // AddStructuredQueryParam sends the JSON value of v: objects as name[key]=value,
@@ -421,13 +463,6 @@ func (c *Client) execute(ctx context.Context, req *request, out any) error {
 	return nil
 }
 
-// executeBinary performs the request and returns the raw response body, for
-// endpoints that serve PDFs or other binary content.
-func (c *Client) executeBinary(ctx context.Context, req *request) ([]byte, error) {
-	body, _, err := c.do(ctx, req)
-	return body, err
-}
-
 // executeText performs the request and returns the response body as text.
 func (c *Client) executeText(ctx context.Context, req *request) (string, error) {
 	body, _, err := c.do(ctx, req)
@@ -446,6 +481,12 @@ func (c *Client) do(ctx context.Context, req *request) ([]byte, int, error) {
 
 	cfg := c.cfg
 	call := cfg.callConfig(req.options)
+	for name, values := range call.query {
+		req.query[name] = values
+	}
+	if err := req.setJSON(call.jsonSet); err != nil {
+		return nil, 0, err
+	}
 	security := req.security
 	if security == nil {
 		security = defaultSecurity
@@ -509,7 +550,9 @@ func (c *Client) do(ctx context.Context, req *request) ([]byte, int, error) {
 			attempt--
 			continue
 		}
-		if !res.retryable || !idempotent || req.oneShot || attempt >= len(call.retrySchedule) || ctx.Err() != nil {
+		// A 429 was refused before being processed, so resending it cannot apply it twice.
+		safe := idempotent || res.status == http.StatusTooManyRequests
+		if !res.retryable || !safe || req.oneShot || attempt >= len(call.retrySchedule) || ctx.Err() != nil {
 			return nil, 0, res.err
 		}
 
@@ -537,6 +580,7 @@ func (c *Client) attempt(ctx context.Context, req *request, endpoint string, att
 	cfg := c.cfg
 
 	cancel := context.CancelFunc(func() {})
+	expire := func() {}
 	keep := false
 	switch {
 	case req.stream:
@@ -544,8 +588,9 @@ func (c *Client) attempt(ctx context.Context, req *request, endpoint string, att
 		var cancelCause context.CancelCauseFunc
 		ctx, cancelCause = context.WithCancelCause(ctx)
 		cancel = func() { cancelCause(context.Canceled) }
+		expire = func() { cancelCause(context.DeadlineExceeded) }
 		if timeout > 0 {
-			defer time.AfterFunc(timeout, func() { cancelCause(context.DeadlineExceeded) }).Stop()
+			defer time.AfterFunc(timeout, expire).Stop()
 		}
 	case timeout > 0:
 		ctx, cancel = context.WithTimeout(ctx, timeout)
@@ -595,7 +640,8 @@ func (c *Client) attempt(ctx context.Context, req *request, endpoint string, att
 	}
 	if req.stream && resp.StatusCode >= 200 && resp.StatusCode < 300 {
 		keep = true
-		req.response, req.cancel = resp, cancel
+		req.response, req.cancel, req.expire, req.timeout = resp, cancel, expire, timeout
+		req.fail = func(err error) error { return failure(ctx, req, err) }
 		return attemptResult{status: resp.StatusCode, response: resp}
 	}
 	defer func() { _ = resp.Body.Close() }()
@@ -612,8 +658,7 @@ func (c *Client) attempt(ctx context.Context, req *request, endpoint string, att
 	}
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		apiErr := newAPIError(resp.StatusCode, respBody)
-		apiErr.setHeader(resp.Header)
+		apiErr := newResponseError(req.method, req.path, resp.StatusCode, resp.Header, respBody)
 		apiErr.Body = req.errors.decode(resp.StatusCode, respBody)
 		return attemptResult{
 			status:     resp.StatusCode,

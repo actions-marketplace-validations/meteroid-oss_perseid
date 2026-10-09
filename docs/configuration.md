@@ -17,7 +17,7 @@ repo = "acme/acme-{lang}"           # one repository per SDK ({lang}: typescript
 # release = false                   # no release-please files nor sdk-release.yml
 
 # Defaults of every SDK, each also settable in a language table
-base_url = "https://api.acme.com"   # first server of the spec by default
+base_url = "https://api.acme.com"   # first absolute server of the spec by default, "" for none
 timeout = 60                        # seconds
 webhooks = false                    # install the Standard Webhooks verifier
 tests = true                        # generate a test per operation
@@ -48,6 +48,9 @@ listWidgetEvents = "events"
 
 [resources]                         # resources by operation id, as dotted paths
 listWidgetEvents = "widgets.events"
+
+[models]                            # type names by schema name
+CreateWidgetResponse = "Widget"
 
 [pagination]                        # or [[pagination]] for several rules
 cursor = "starting_after"
@@ -90,7 +93,7 @@ of every key with its description and allowed values.
 | `spec` | The OpenAPI document, a path relative to `perseid.toml` (`openapi.json` by default) or an `http(s)` URL |
 | `name` | The client name, in any form |
 | `sdks` | Among `rust`, `typescript`, `python`, `go`, `java`, `csharp` |
-| `idempotency_keys` | `true` when the API deduplicates POST requests by `Idempotency-Key`: the SDKs send one with every POST and retry them. `false` by default: a POST is only retried when the caller gives it a key, as replaying it could apply it twice |
+| `idempotency_keys` | `true` when the API deduplicates POST requests by `Idempotency-Key`: the SDKs send one with every POST and retry them. `false` by default: a POST is only retried when the caller gives it a key, as replaying it could apply it twice. A 429 is retried for every method |
 
 - The spec is Swagger 2.0 or OpenAPI 3.0, 3.1 or 3.2, JSON or YAML. `$ref`s to other files or URLs
   are bundled.
@@ -156,8 +159,8 @@ Each key is also a key of the [language tables](#language-tables), which overrid
 
 | Key | Default | Description |
 |---|---|---|
-| `base_url` | The spec's first server | API base URL of the clients |
-| `timeout` | `60` | Request timeout, in seconds |
+| `base_url` | The spec's first absolute server | API base URL of the clients; `""` for none, so callers must pass one |
+| `timeout` | `60` | Request timeout, in seconds. `perseid init` writes `600` for an API streaming its answers (`text/event-stream`), as LLM APIs do |
 | `webhooks` | `false` | `true` installs the [webhook verifier](customizing.md#webhooks) |
 | `tests` | `true` | `false` leaves out the [generated tests](languages.md#tests) |
 | `round_trips` | `false` | `true` adds the [round trips](languages.md#round-trips) of every model to the generated tests |
@@ -166,6 +169,7 @@ Each key is also a key of the [language tables](#language-tables), which overrid
 | `user_agent` | kebab-case `name` | Prefix of the `User-Agent` header |
 | `[methods]` | | Method names by operation id, over the [resource-style names](#method-names) |
 | `[resources]` | | Resources by operation id, over the [ones derived from tags and paths](#resources) |
+| `[models]` | | Type names by schema name, over the schema's own: `CreateChatCompletionResponse = "ChatCompletion"`. References and the types named after it (`ChatCompletionChoicesItem`) follow, the JSON keeps the schema's name as discriminator tag, and two schemas given one name fail generation. `perseid init --from stainless.yml` imports the resources' `models` |
 | `[context]` | | Values exposed to templates as `sdk.*` |
 
 `[types]` holds settings of every SDK only:
@@ -184,7 +188,7 @@ Every operation is generated, except those marked `x-internal: true`.
 | `exclude` | Operation ids left out of every SDK. In a language table, of that SDK only |
 | `only` | The only operation ids generated, `x-internal` or not |
 | `[pagination]` | [Pagination rules](features.md#pagination), one table or an array of tables |
-| `detect_pagination` | `false` leaves unpaged the Stripe-style lists no rule matches, which perseid [detects](features.md#pagination) by default |
+| `detect_pagination` | `false` leaves unpaged the Stripe- and OpenAI-style lists no rule matches, which perseid [detects](features.md#pagination) by default |
 
 ## Package metadata
 

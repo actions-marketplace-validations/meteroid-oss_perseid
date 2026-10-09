@@ -20,7 +20,7 @@ import {
 } from "./auth.js";
 import { parseJson, stringifyJson } from "./json.js";
 import { type Middleware, withMiddleware } from "./middleware.js";
-import { EventStream, type MultipartBody, Stream, type UploadBody } from "./streaming.js";
+import { BinaryResponse, EventStream, type MultipartBody, Stream, type UploadBody } from "./streaming.js";
 
 export const LIB_VERSION = "@@VERSION@@"; // x-release-please-version
 const USER_AGENT = `@@USER_AGENT_PREFIX@@-typescript/${LIB_VERSION}`;
@@ -257,6 +257,7 @@ function checkedPath(name: string, path: string): string {
 /** @internal */
 export class @@CLIENT_NAME@@Request {
   private body?: BodyInit;
+  private multipart: MultipartBody | undefined;
   private oneShot = false;
   private retrySafe = false;
   private security?: Security;
@@ -394,9 +395,9 @@ export class @@CLIENT_NAME@@Request {
     this.oneShot = typeof ReadableStream !== "undefined" && value instanceof ReadableStream;
   }
 
-  /** Sets a `multipart/form-data` body. */
+  /** Sets a `multipart/form-data` body, read before the first attempt. */
   public setMultipartBody(value: MultipartBody) {
-    this.body = value.blob();
+    this.multipart = value;
     this.headers["content-type"] = `multipart/form-data; boundary=${value.boundary}`;
   }
 
@@ -406,9 +407,9 @@ export class @@CLIENT_NAME@@Request {
    *
    * A non-2xx response throws an `APIError`, of a subclass such as `NotFoundError` for common
    * statuses; no response an `APIConnectionError`, or `APIConnectionTimeoutError` once the
-   * last attempt timed out. Connection errors, timeouts, 408, 429 and 5xx responses are
-   * retried with exponential backoff, honouring `Retry-After`, when the request is idempotent
-   * or carries an `Idempotency-Key`.
+   * last attempt timed out. Connection errors, timeouts, 408 and 5xx responses are retried with
+   * exponential backoff, honouring `Retry-After`, when the request is idempotent or carries an
+   * `Idempotency-Key`; 429 responses whatever the method.
    */
   public send<R>(
     ctx: @@CLIENT_NAME@@RequestContext,
@@ -454,12 +455,16 @@ export class @@CLIENT_NAME@@Request {
     });
   }
 
-  /** Same as `send`, returning the response body as bytes. */
-  public sendBinary(ctx: @@CLIENT_NAME@@RequestContext, options?: RequestOptions): APIPromise<Uint8Array> {
-    return new APIPromise(
-      this.sendInner(ctx, options),
-      async (response) => new Uint8Array(await read(response, (r) => r.arrayBuffer(), options?.signal))
-    );
+  /**
+   * Same as `send`, returning the response with its body unread. Retries end once the headers
+   * arrive; the timeout covers them, then each read of the body.
+   */
+  public sendBinary(ctx: @@CLIENT_NAME@@RequestContext, options?: RequestOptions): APIPromise<BinaryResponse> {
+    const reading = new AbortController();
+    return new APIPromise(this.sendInner(ctx, options, true, reading.signal), async (response) => {
+      const body = guardBody(response.body, attemptTimeout(ctx, options), reading, options?.signal);
+      return new BinaryResponse(response, body);
+    });
   }
 
   /** Same as `send`, returning the response body as text. */
@@ -477,13 +482,25 @@ export class @@CLIENT_NAME@@Request {
     return new APIPromise(this.openEventStream(ctx, options), async (response) => new EventStream(response));
   }
 
-  /** Same as `sendEventStream`, decoding the JSON `data` of each event, up to `[DONE]`. */
+  /**
+   * Same as `sendEventStream`, decoding the JSON `data` of each event, up to `[DONE]`. An `error`
+   * event throws an `APIError`, and so does data with an `error` property unless `declaresError`:
+   * the event model declares that property.
+   */
   public sendJsonStream<T>(
     ctx: @@CLIENT_NAME@@RequestContext,
     parse: (json: any) => T,
-    options?: RequestOptions
+    options?: RequestOptions,
+    declaresError = false
   ): APIPromise<Stream<T>> {
-    return new APIPromise(this.openEventStream(ctx, options), async (response) => Stream.json(response, parse));
+    return new APIPromise(this.openEventStream(ctx, options), async (response) =>
+      Stream.json(
+        response,
+        parse,
+        (data, json) => this.errorOf(ctx, response.status, data, response.headers, json),
+        declaresError
+      )
+    );
   }
 
   /** Same as `send`, discarding the response body. */
@@ -507,8 +524,13 @@ export class @@CLIENT_NAME@@Request {
   private async sendInner(
     ctx: @@CLIENT_NAME@@RequestContext,
     options: RequestOptions = {},
-    stream = false
+    stream = false,
+    reading?: AbortSignal
   ): Promise<Response> {
+    if (this.multipart !== undefined) {
+      this.body = await this.multipart.blob();
+      this.multipart = undefined;
+    }
     const url = new URL(/^[a-z][a-z0-9+.-]*:\/\//i.test(this.path) ? this.path : ctx.baseUrl + this.path);
     const baseName = (name: string) => name.split("[")[0] ?? name;
     const overrides = options.query ?? {};
@@ -552,19 +574,19 @@ export class @@CLIENT_NAME@@Request {
       headers["idempotency-key"] = `auto_${randomUUID()}`;
     }
 
+    const replayable = !this.oneShot;
     const retryable =
-      !this.oneShot &&
+      replayable &&
       (this.retrySafe || IDEMPOTENT_METHODS.has(this.method) || headers["idempotency-key"] !== undefined);
     const maxRetries =
       options.maxRetries ?? ctx.maxRetries ?? ctx.retryScheduleInMs?.length ?? DEFAULT_RETRIES;
     const fetchImpl = withMiddleware(ctx.fetch, ctx.middleware) ?? fetch;
-    const configured = options.timeout ?? ctx.timeout;
-    const timeout = configured !== undefined && Number.isFinite(configured) ? configured : undefined;
+    const timeout = attemptTimeout(ctx, options);
     // Cloudflare Workers fail if the credentials option is used in a fetch call.
     const credentials = "credentials" in Request.prototype ? "same-origin" : undefined;
     const log = (message: string) => {
       if (ctx.debug) {
-        console.error(`@@PACKAGE_NAME@@: ${this.method} ${url} ${message}`);
+        console.error(`@@NPM_PACKAGE@@: ${this.method} ${url} ${message}`);
       }
     };
 
@@ -584,9 +606,8 @@ export class @@CLIENT_NAME@@Request {
       const openTimer = opening && setTimeout(() => opening.abort(), timeout);
       try {
         const init: RequestInit & { duplex?: "half" } = { method: this.method, headers };
-        const signal = opening
-          ? anySignal(options.signal, opening.signal)
-          : attemptSignal(options.signal, timeout);
+        const caller = reading === undefined ? options.signal : anySignal(options.signal, reading);
+        const signal = opening ? anySignal(caller, opening.signal) : attemptSignal(caller, timeout);
         if (signal !== undefined) {
           init.signal = signal;
         }
@@ -632,7 +653,7 @@ export class @@CLIENT_NAME@@Request {
           attempt--;
           continue;
         }
-        if (attempt >= maxRetries || !shouldRetry(response.status, retryable)) {
+        if (attempt >= maxRetries || !shouldRetry(response.status, retryable, replayable)) {
           throw await this.error(ctx, response, options.signal);
         }
         response.body?.cancel().catch(() => {});
@@ -653,7 +674,12 @@ export class @@CLIENT_NAME@@Request {
     } catch {
       return apiError(response.status, body, response.headers, undefined);
     }
-    const parse = errorParser(this.errors, response.status) ?? ctx.parseError;
+    return this.errorOf(ctx, response.status, body, response.headers, json);
+  }
+
+  /** The `APIError` of `status`, its JSON `body` parsed with the error schema of the status. */
+  private errorOf(ctx: @@CLIENT_NAME@@RequestContext, status: number, body: string, headers: Headers, json: unknown) {
+    const parse = errorParser(this.errors, status) ?? ctx.parseError;
     let error: unknown = json;
     if (parse && json !== undefined) {
       try {
@@ -662,7 +688,7 @@ export class @@CLIENT_NAME@@Request {
         error = json;
       }
     }
-    return apiError(response.status, body, response.headers, error);
+    return apiError(status, body, headers, error);
   }
 }
 
@@ -709,12 +735,57 @@ async function read<T>(response: Response, body: (response: Response) => Promise
   }
 }
 
+/**
+ * The body of a binary response, failing with the SDK's errors. A read that takes longer than
+ * `timeout` aborts the request with an `APIConnectionTimeoutError`.
+ */
+function guardBody(
+  source: ReadableStream<Uint8Array> | null,
+  timeout: number | undefined,
+  request: AbortController,
+  signal?: AbortSignal
+): ReadableStream<Uint8Array> {
+  const reader = source?.getReader();
+  return new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      if (reader === undefined) {
+        controller.close();
+        return;
+      }
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const idle = new Promise<never>((_, reject) => {
+        if (timeout !== undefined) {
+          timer = setTimeout(() => reject(new APIConnectionTimeoutError()), timeout);
+        }
+      });
+      try {
+        const chunk = await Promise.race([reader.read(), idle]);
+        if (chunk.done) {
+          controller.close();
+        } else {
+          controller.enqueue(chunk.value);
+        }
+      } catch (error) {
+        request.abort();
+        reader.cancel().catch(() => undefined);
+        controller.error(transportError(error, signal));
+      } finally {
+        clearTimeout(timer);
+      }
+    },
+    cancel(reason) {
+      return reader?.cancel(reason);
+    },
+  }, { highWaterMark: 0 });
+}
+
 function errorParser(errors: ErrorParsers | undefined, status: number) {
   return errors?.[status] ?? errors?.[`${Math.floor(status / 100)}XX`] ?? errors?.default;
 }
 
-function shouldRetry(status: number, retryable: boolean): boolean {
-  return retryable && (status === 408 || status === 429 || status >= 500);
+// A 429 was refused before being processed, so resending it cannot apply it twice.
+function shouldRetry(status: number, retryable: boolean, replayable: boolean): boolean {
+  return status === 429 ? replayable : retryable && (status === 408 || status >= 500);
 }
 
 function retryDelay(attempt: number, schedule?: number[], response?: Response): number {
@@ -743,6 +814,12 @@ function parseRetryAfter(headers: Headers | undefined): number | undefined {
   const seconds = Number(value);
   const ms = Number.isNaN(seconds) ? Date.parse(value) - Date.now() : seconds * 1000;
   return Number.isNaN(ms) ? undefined : Math.max(ms, 0);
+}
+
+/** The timeout of each attempt in milliseconds, if any. */
+function attemptTimeout(ctx: @@CLIENT_NAME@@RequestContext, options: RequestOptions = {}): number | undefined {
+  const configured = options.timeout ?? ctx.timeout;
+  return configured !== undefined && Number.isFinite(configured) ? configured : undefined;
 }
 
 function attemptSignal(signal?: AbortSignal, timeout?: number): AbortSignal | undefined {

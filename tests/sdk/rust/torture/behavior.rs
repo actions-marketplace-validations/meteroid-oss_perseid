@@ -318,3 +318,73 @@ async fn a_success_body_that_does_not_decode_is_a_decode_error() {
         assert_eq!(script.attempts(), 1, "a decode error is not retried");
     }
 }
+
+const EVENTS: (&str, &str) = ("content-type", "text/event-stream");
+
+#[tokio::test]
+async fn errors_sent_in_a_stream_are_api_errors() {
+    let cases = [
+        "event: error\ndata: {\"error\":{\"message\":\"overloaded\"}}\n\n",
+        "data: {\"error\":{\"message\":\"overloaded\",\"type\":\"server_error\"}}\n\n",
+        // An item of the model, with an `error` the model does not declare.
+        "data: {\"text\":\"x\",\"error\":{\"message\":\"overloaded\"}}\n\n",
+    ];
+    for error in cases {
+        let body = format!("data: {{\"text\":\"a\"}}\n\n{error}data: {{\"text\":\"b\"}}\n\n");
+        let step = Step::Reply(200, vec![EVENTS, ("x-request-id", "req_s")], body.leak());
+        let script = Script::new(vec![step]);
+        let mut stream = script.client(0).chats().create_stream(None).await.unwrap();
+        assert_eq!(stream.next().await.unwrap().unwrap().text, "a");
+        let error = stream.next().await.unwrap().unwrap_err();
+        let api = error.api().unwrap_or_else(|| panic!("{error:?}"));
+        assert_eq!(api.status, StatusCode::OK);
+        assert_eq!(api.request_id(), Some("req_s"));
+        assert_eq!(api.message().as_deref(), Some("overloaded"));
+        assert_eq!(error.to_string(), "API error (200 OK): overloaded");
+        assert!(stream.next().await.is_none(), "the stream ends at the error");
+    }
+
+    let script = Script::new(vec![Step::Reply(200, vec![EVENTS], "event: error\ndata: overloaded\n\n")]);
+    let mut stream = script.client(0).chats().create_stream(None).await.unwrap();
+    let error = stream.next().await.unwrap().unwrap_err();
+    assert_eq!(error.api().unwrap_or_else(|| panic!("{error:?}")).text(), "overloaded");
+}
+
+#[tokio::test]
+async fn keepalives_that_are_not_items_are_skipped() {
+    let body = ": comment\n\nevent: ping\ndata: {}\n\nevent: keepalive\ndata: {\"type\":\"keepalive\"}\n\n\
+        event: ping\ndata: alive\n\ndata: {\"text\":\"a\"}\n\nevent: ping\n\nevent: ping\ndata: {\"text\":\"b\"}\n\ndata: [DONE]\n\n";
+    let script = Script::new(vec![Step::Reply(200, vec![EVENTS], body)]);
+    let mut stream = script.client(0).chats().create_stream(None).await.unwrap();
+    assert_eq!(stream.next().await.unwrap().unwrap().text, "a");
+    assert_eq!(stream.next().await.unwrap().unwrap().text, "b", "a keepalive that is an item");
+    assert!(stream.next().await.is_none());
+
+    let body = "data: {\"text\":\"a\"}\n\nevent: ping\ndata: {}\n\n";
+    let script = Script::new(vec![Step::Reply(200, vec![EVENTS], body)]);
+    let mut stream = script.client(0).chats().create_stream(None).await.unwrap();
+    stream.next().await.unwrap().unwrap();
+    assert!(stream.next().await.is_none());
+    assert_eq!(stream.last_event().unwrap().data, "{\"text\":\"a\"}", "of the last item");
+
+    let script = Script::new(vec![Step::Reply(200, vec![EVENTS], "data: {\"other\":1}\n\n")]);
+    let mut stream = script.client(0).chats().create_stream(None).await.unwrap();
+    let error = stream.next().await.unwrap().unwrap_err();
+    assert!(matches!(error, Error::Decode(_)), "{error:?}");
+}
+
+#[tokio::test]
+async fn error_messages_show_the_message_of_the_body() {
+    let cases = [
+        (r#"{"error":{"message":"No such thing","code":"missing"}}"#, "No such thing"),
+        (r#"{"message":"Thing not found"}"#, "Thing not found"),
+        (r#"{"detail":"Not found."}"#, "Not found."),
+        (r#"{"error":{"code":404}}"#, r#"{"error":{"code":404}}"#),
+    ];
+    for (body, shown) in cases {
+        let script = Script::new(vec![reply(404, body)]);
+        let error = script.client(0).things().retrieve("t").await.unwrap_err();
+        assert_eq!(error.to_string(), format!("API error (404 Not Found): {shown}"));
+        assert_eq!(error.api().unwrap().text(), body, "the raw body stays available");
+    }
+}

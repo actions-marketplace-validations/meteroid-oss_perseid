@@ -399,14 +399,20 @@ async fn content_is_decoded_by_its_type() {
     assert_eq!(content.retrieve_scenarios_text().await.unwrap(), "hello text\n");
     assert_eq!(content.retrieve_scenarios_csv().await.unwrap(), "id,name\n1,alpha\n2,\"be,ta\"\n");
 
-    let blob = content.download_blob().await.unwrap();
+    let download = content.download_blob().await.unwrap();
+    assert_eq!(download.status(), StatusCode::OK);
+    assert_eq!(download.headers()["content-type"], "application/octet-stream");
+    let blob = download.bytes().await.unwrap();
     assert_eq!(blob.len(), 256);
     assert_eq!(&blob[..], (0..=255u8).collect::<Vec<_>>().as_slice());
     let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
     for _ in 0..4 {
         png.extend_from_slice(&[0x00, 0x01, 0xfe, 0xff]);
     }
-    assert_eq!(&content.download_image().await.unwrap()[..], png.as_slice());
+    let chunks: Vec<_> = content.download_blob().await.unwrap().try_collect().await.unwrap();
+    assert_eq!(chunks.concat(), blob);
+    let image = content.download_image().await.unwrap().bytes().await.unwrap();
+    assert_eq!(&image[..], png.as_slice());
 }
 
 #[tokio::test]
@@ -436,6 +442,7 @@ async fn unknown_fields_and_nulls_are_kept() {
     assert_eq!(nulls.name, None);
     assert_eq!(nulls.tags, [Some("a".to_owned()), None, Some("b".to_owned())]);
     assert_eq!(nulls.counts, HashMap::from([("x".to_owned(), Some(1)), ("y".to_owned(), None)]));
+    // `NullBag` is also a response: a `null` reads as `None`, as an absent field does.
     assert_eq!(nulls.note, None);
 
     // `name` is an explicit null, `note` is unset: the server checks the exact body.

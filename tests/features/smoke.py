@@ -4,6 +4,7 @@ import io
 import itertools
 import json
 import os
+import tempfile
 import time
 import urllib.parse
 import urllib.request
@@ -23,7 +24,7 @@ from features import (
     PermissionDeniedError,
     UnprocessableEntityError,
 )
-from features.api import AsyncWidgetsListPage, GadgetsListPage, RecordsListPage, StreamingUploadFileBody, Upload, WidgetsListPage
+from features.api import AsyncWidgetsListPage, GadgetsListPage, RecordsListPage, Upload, WidgetsListPage
 from features.models import (
     UNSET,
     ChargeItemsItem,
@@ -34,6 +35,7 @@ from features.models import (
     Filter,
     FilterAmount,
     Health,
+    ItemPatch,
     RangeQuerySpecs,
     SearchRange,
     WidgetList,
@@ -171,14 +173,14 @@ assert [(e.event, e.data, e.id, e.retry) for e in events] == [
     ("message", "line1\nline2", "1", None),
     ("message", '{"n": 3}', "3", 1500),
 ], events
-body = StreamingUploadFileBody(
+uploaded = client.streaming.upload_file(
     file=Upload(b"hello", "a.txt", "text/plain"),
     name="doc",
     count=2,
     meta=Health(status="ok"),
     tags=["a", "b"],
 )
-assert client.streaming.upload_file(body).status == (
+assert uploaded.status == (
     'count=::2;file=a.txt:text/plain:hello;meta=:application/json:{"status": "ok"}'
     ";name=::doc;tags=::a;tags=::b"
 )
@@ -230,14 +232,22 @@ item = client.items.retrieve("i1")
 assert (item.id, item.name, item.note) == ("i1", "first", "hi"), item
 patched = client.items.update("i1", name="renamed")
 assert (patched.name, patched.note) == ("renamed", None), patched
+assert ItemPatch(name="renamed").note is UNSET
 assert client.items.delete("i1") is None
 
 # Content and decoding.
 assert client.content.retrieve_scenarios_nullable_body() is None
 assert client.content.retrieve_scenarios_text() == "hello text\n"
 assert client.content.retrieve_scenarios_csv() == 'id,name\n1,alpha\n2,"be,ta"\n'
-assert client.content.download_blob() == bytes(range(256))
-assert client.content.download_image() == b"\x89PNG\r\n\x1a\n" + b"\x00\x01\xfe\xff" * 4
+assert client.content.download_blob().read() == bytes(range(256))
+assert client.content.download_image().read() == b"\x89PNG\r\n\x1a\n" + b"\x00\x01\xfe\xff" * 4
+with client.content.download_blob() as blob:
+    assert blob.status_code == 200 and blob.content_type == "application/octet-stream", blob.headers
+    assert [len(chunk) for chunk in blob.iter_bytes(100)] == [100, 100, 56]
+with tempfile.TemporaryDirectory() as directory:
+    client.content.download_blob().write_to_file(os.path.join(directory, "blob.bin"))
+    with open(os.path.join(directory, "blob.bin"), "rb") as written:
+        assert written.read() == bytes(range(256))
 for malformed in (client.content.retrieve_scenarios_malformed, client.content.retrieve_scenarios_empty_body):
     decode_error = raises(APIResponseValidationError, malformed)
     assert isinstance(decode_error, FeaturesError) and decode_error.status_code == 200, decode_error
@@ -250,7 +260,7 @@ assert nulls.name is None and nulls.note is None, nulls
 assert nulls.tags == ["a", None, "b"] and nulls.counts == {"x": 1, "y": None}, nulls
 echoed = client.content.nulls.create(name=None, tags=["a", None], counts={"x": None, "y": 2})
 assert (echoed.name, echoed.tags, echoed.counts) == (None, ["a", None], {"x": None, "y": 2}), echoed
-assert echoed.note is UNSET, echoed
+assert echoed.note is None, echoed
 assert echoed.to_dict() == {"name": None, "tags": ["a", None], "counts": {"x": None, "y": 2}}, echoed
 bag = client.content.retrieve_scenarios_bag()
 assert bag.id == "b1" and bag.extra_fields == {"a": 1, "b": 2}, bag
@@ -413,7 +423,9 @@ async def main():
         assert await client.items.delete("i1") is None
         assert await client.content.retrieve_scenarios_nullable_body() is None
         assert await client.content.retrieve_scenarios_text() == "hello text\n"
-        assert await client.content.download_blob() == bytes(range(256))
+        assert await (await client.content.download_blob()).read() == bytes(range(256))
+        async with await client.content.download_blob() as blob:
+            assert b"".join([chunk async for chunk in blob.iter_bytes(100)]) == bytes(range(256))
         await araises(APIResponseValidationError, client.content.retrieve_scenarios_malformed())
         await araises(APIResponseValidationError, client.content.retrieve_scenarios_empty_body())
         assert (await client.content.list_scenarios_extra_fields()).status == "ok"

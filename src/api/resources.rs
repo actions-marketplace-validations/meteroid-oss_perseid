@@ -728,6 +728,11 @@ pub(crate) struct Operation {
     /// Boolean body property the `_stream` twin sets to `true`, such as OpenAI's `stream`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     stream_property: Option<String>,
+    /// Boolean multipart part asking for the event stream, such as the `stream` of OpenAI's
+    /// transcriptions: the `_stream` twin sends it as `true`, the other leaves it out. Neither
+    /// lists it in `multipart_fields`, so callers cannot set it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    stream_part: Option<String>,
     /// Schemas of the JSON bodies this operation returns on 4xx/5xx responses.
     ///
     /// Not rendered per operation: collected so that `referenced_components` pulls the error
@@ -1034,6 +1039,11 @@ impl Operation {
             .as_deref()
             .filter(|_| response.also_event_stream)
             .and_then(|name| stream_property(name, component_schemas));
+        let mut multipart_fields = request.multipart_fields;
+        let stream_part = match response.also_event_stream {
+            true => take_stream_part(&mut multipart_fields),
+            false => None,
+        };
         let x_pagination = op.extensions.get("x-pagination").cloned();
         let x_perseid_name = match op.extensions.get("x-perseid-name") {
             None => None,
@@ -1084,7 +1094,7 @@ impl Operation {
             request_body_content_type: request.content_type,
             form_deep_object: request.form_deep_object,
             form_unexploded: request.form_unexploded,
-            multipart_fields: request.multipart_fields,
+            multipart_fields,
             response_body_schema_name: response.schema_name,
             response_body_is_list: response.is_list,
             response_body_json_type: response.json_type,
@@ -1096,6 +1106,7 @@ impl Operation {
             event_schema_name: response.event_schema_name,
             event_json_type: None,
             stream_property: None,
+            stream_part,
             json_or_event_stream: response.also_event_stream,
             body_stream_property,
             error_response_schema_names,
@@ -1107,8 +1118,8 @@ impl Operation {
         Ok(Some((tag, op)))
     }
 
-    /// The `{name}_stream` twin of an operation answering JSON or an event stream, for the
-    /// requests that ask for the stream (such as OpenAI's `stream: true`).
+    /// The `{name}_stream` twin of an operation answering JSON, binary content or text, or an
+    /// event stream, for the requests that ask for the stream (such as OpenAI's `stream: true`).
     fn event_stream_variant(&self) -> Option<Self> {
         self.json_or_event_stream.then(|| Self {
             name: format!("{}_stream", self.name),
@@ -1118,6 +1129,8 @@ impl Operation {
             response_body_json_type: None,
             response_body_union: None,
             response_is_event_stream: true,
+            response_is_binary: false,
+            response_is_text: false,
             response_may_be_empty: false,
             stream_property: self.body_stream_property.clone(),
             json_or_event_stream: false,
@@ -1252,10 +1265,10 @@ impl Operation {
                         Err(_) => {}
                     }
                 }
-                let detected = super::pagination::detected();
                 found.or_else(|| {
-                    let detected = detect.then_some(&detected)?;
-                    Pagination::resolve(detected, &candidate, types, true).ok()
+                    let detected = detect.then(super::pagination::detected).unwrap_or_default();
+                    (detected.iter())
+                        .find_map(|rule| Pagination::resolve(rule, &candidate, types, true).ok())
                 })
             }
         };
@@ -1841,6 +1854,15 @@ fn stream_property(
     .then(|| "stream".to_owned())
 }
 
+/// Removes the boolean `stream` part of a multipart body, which switches the response from JSON
+/// to an event stream, and returns its name.
+fn take_stream_part(fields: &mut Vec<MultipartField>) -> Option<String> {
+    let index = fields.iter().position(|f| {
+        f.field.name == "stream" && !f.is_file && f.field.r#type == FieldType::Bool
+    })?;
+    Some(fields.remove(index).field.name)
+}
+
 /// Picks the body the SDK decodes on success: the lowest 2xx status with content, or `default`
 /// when no 2xx is declared. Returns it with the JSON error schemas of 4xx, 5xx and `default`,
 /// by status.
@@ -1932,7 +1954,8 @@ impl ResponseBody {
                 Schema::Bool(_) => None,
             })
             .filter(|name| schemas.contains_key(name));
-        if also_event_stream && !content.contains_key("application/json") {
+        // Only an event stream; else the other content, with a `_stream` twin for the stream.
+        if also_event_stream && content.keys().all(|k| k == "text/event-stream") {
             return Ok(Self {
                 event_schema_name,
                 ..kind(ResponseKind::EventStream)
@@ -1972,10 +1995,19 @@ impl ResponseBody {
                 ..Self::default()
             });
         }
-        if content.keys().any(|k| k.starts_with("text/")) {
-            return Ok(kind(ResponseKind::Text));
+        let other = |kind| Self {
+            kind,
+            also_event_stream,
+            event_schema_name: event_schema_name.clone(),
+            ..Self::default()
+        };
+        if content
+            .keys()
+            .any(|k| k.starts_with("text/") && k != "text/event-stream")
+        {
+            return Ok(other(ResponseKind::Text));
         }
-        Ok(kind(ResponseKind::Binary))
+        Ok(other(ResponseKind::Binary))
     }
 }
 
@@ -2395,6 +2427,29 @@ mod tests {
     }
 
     #[test]
+    fn binary_or_event_stream_responses_are_binary_with_a_stream_twin() {
+        let content = json!({ "audio/mpeg": {}, "text/event-stream": {} });
+        let op = serde_json::from_value(json!({ "operationId": "speech", "responses": {
+            "200": { "description": "", "content": content } } }))
+        .unwrap();
+        let (_, op) = Operation::from_openapi(
+            "/speech",
+            "post",
+            op,
+            &schemas(json!({})),
+            IncludeMode::OnlyPublic,
+            &BTreeSet::new(),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(op.response_is_binary && !op.response_is_event_stream);
+        let stream = op.event_stream_variant().unwrap();
+        assert!(stream.response_is_event_stream && !stream.response_is_binary);
+        let only = json!({ "200": { "description": "", "content": { "text/event-stream": {} } } });
+        assert_eq!(responses(only).unwrap().0.kind, ResponseKind::EventStream);
+    }
+
+    #[test]
     fn stream_twins_type_their_events_and_ask_for_the_stream() {
         let op = serde_json::from_value(json!({
             "operationId": "chat",
@@ -2425,6 +2480,51 @@ mod tests {
         let stream = op.event_stream_variant().unwrap();
         assert_eq!(stream.event_schema_name.as_deref(), Some("Chunk"));
         assert_eq!(stream.stream_property.as_deref(), Some("stream"));
+        assert_eq!(stream.stream_part, None);
+    }
+
+    #[test]
+    fn multipart_stream_twins_send_the_stream_part_themselves() {
+        let op = |stream: serde_json::Value| {
+            let op = serde_json::from_value(json!({
+                "operationId": "transcribe",
+                "requestBody": { "content": { "multipart/form-data": { "schema": {
+                    "type": "object",
+                    "properties": { "file": { "type": "string", "format": "binary" }, "stream": stream },
+                } } } },
+                "responses": { "200": { "description": "", "content": {
+                    "application/json": { "schema": widget() }, "text/event-stream": {},
+                } } },
+            }))
+            .unwrap();
+            let schemas = schemas(json!({ "Widget": { "type": "object", "properties": {} } }));
+            let (_, op) = Operation::from_openapi(
+                "/transcriptions",
+                "post",
+                op,
+                &schemas,
+                IncludeMode::OnlyPublic,
+                &BTreeSet::new(),
+            )
+            .unwrap()
+            .unwrap();
+            let stream = op.event_stream_variant().unwrap();
+            let names = |op: &Operation| -> Vec<String> {
+                let fields = op.multipart_fields.iter();
+                fields.map(|f| f.field.name.clone()).collect()
+            };
+            assert_eq!(names(&op), names(&stream));
+            assert_eq!(op.stream_part, stream.stream_part);
+            assert_eq!(stream.stream_property, None);
+            (names(&stream), stream.stream_part)
+        };
+        let boolean = op(json!({ "type": ["boolean", "null"] }));
+        assert_eq!(
+            boolean,
+            (vec!["file".to_owned()], Some("stream".to_owned()))
+        );
+        let string = op(json!({ "type": "string" }));
+        assert_eq!(string, (vec!["file".to_owned(), "stream".to_owned()], None));
     }
 
     #[test]

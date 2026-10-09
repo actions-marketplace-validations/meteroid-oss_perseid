@@ -32,6 +32,17 @@
     {%- endif -%}
 {%- endmacro %}
 
+{#- `yes` when the schema `name`, or a variant of it, has the property `property`. -#}
+{% macro declares(name, property) -%}
+    {%- set t = types[name] | default(none) -%}
+    {%- if t and t.fields is defined -%}
+        {%- for f in t.fields if f.name == property or (f.flatten and f.type.schema_name() and declares(f.type.schema_name(), property)) %}{% if loop.first %}yes{% endif %}{% endfor -%}
+    {%- endif -%}
+    {%- if t and t.variants is defined and t.kind == "struct_enum" -%}
+        {%- for v in t.variants if (v.schema_ref is defined and declares(v.schema_ref, property)) or (v.fields is defined and property in (v.fields | map(attribute="name") | list)) %}{% if loop.first %}yes{% endif %}{% endfor -%}
+    {%- endif -%}
+{%- endmacro %}
+
 {#- `page.a?.b` for the path `["a", "b"]` of a property of the response. -#}
 {% macro at(path) -%}
     page{% for key in path %}{{ "." if loop.first else "?." }}{{ key | ident("camel") }}{% endfor -%}
@@ -52,6 +63,7 @@
 {% set streams = resource.operations | selectattr("response_is_event_stream") | list -%}
 {% set typed_streams = streams | selectattr("event_schema_name", "defined") | list | length > 0 -%}
 {% set raw_streams = streams | rejectattr("event_schema_name", "defined") | list | length > 0 -%}
+{% set binaries = resource.operations | selectattr("response_is_binary") | list | length > 0 -%}
 
 {% set body -%}
 {% for op in resource.operations -%}
@@ -112,7 +124,7 @@ export class {{ resource_type_name }} {
         {% elif op.response_is_event_stream -%}
             {% set response_type = runtime("EventStream") -%}
         {% elif op.response_is_binary | default(false) -%}
-            {% set response_type = "Uint8Array" -%}
+            {% set response_type = runtime("BinaryResponse") -%}
         {% elif op.response_is_text | default(false) -%}
             {% set response_type = "string" -%}
         {% elif op.response_body_json_type is defined -%}
@@ -142,7 +154,9 @@ export class {{ resource_type_name }} {
                 {{ p.name | ident("camel", "typescript") }}: {% if p.name in op.path_styles and op.path_styles[p.name].type is defined %}{{ m.js_type(op.path_styles[p.name].type) }}{% else %}{{ text_type(p.type) }}{% endif %},
             {% endfor -%}
             {% if op.request_body_schema_name is defined -%}
-                {{ body_arg }}: {{ op.request_body_schema_name | to_upper_camel_case }}{% if op.request_body_is_list %}[]{% endif %},
+                {#- The `stream` property is the `_stream` twin's to set. -#}
+                {% set twin = resource.operations | selectattr("name", "equalto", op.name ~ "_stream") | selectattr("stream_property", "defined") | first -%}
+                {{ body_arg }}: {% if twin and not op.request_body_is_list %}{% set body_ty = op.request_body_schema_name | to_upper_camel_case %}{% set stream = twin.stream_property | ident("camel") %}Omit<{{ body_ty }}, {{ stream | tojson }}> & { {{ stream }}?: Extract<{{ body_ty }}[{{ stream | tojson }}], false | null | undefined> }{% else %}{{ op.request_body_schema_name | to_upper_camel_case }}{% if op.request_body_is_list %}[]{% endif %}{% endif %},
             {% elif op.request_body_json_type is defined -%}
                 body: {{ m.js_type(op.request_body_json_type) }},
             {% elif op.request_body_kind in ["binary", "multipart"] -%}
@@ -303,12 +317,15 @@ export class {{ resource_type_name }} {
                     {% endif -%}
                     {% if not field.required or field.nullable %} } {% endif -%}
                 {% endfor -%}
+                {% if op.stream_part is defined and op.response_is_event_stream -%}
+                form.field({{ op.stream_part | tojson }}, true);
+                {% endif -%}
                 request.setMultipartBody(form);
                 {% if op.request_body_optional %} } {% endif %}
             {% endif -%}
 
             {% if op.response_is_event_stream and op.event_schema_name is defined -%}
-                return request.sendJsonStream(this.requestCtx, {{ op.event_schema_name | to_upper_camel_case }}Serializer.parse, requestOptions);
+                return request.sendJsonStream(this.requestCtx, {{ op.event_schema_name | to_upper_camel_case }}Serializer.parse, requestOptions{% if declares(op.event_schema_name, "error") %}, true{% endif %});
             {% elif op.response_is_event_stream -%}
                 return request.sendEventStream(this.requestCtx, requestOptions);
             {% elif op.response_is_binary | default(false) -%}
@@ -380,8 +397,9 @@ import { {{ sdk.client_name }}Request, type {{ sdk.client_name }}RequestContext,
 {% else -%}
 import type { {{ sdk.client_name }}RequestContext } from "../request.js";
 {% endif -%}
-{% if streams or "binary" in kinds or "multipart" in kinds -%}
+{% if streams or binaries or "binary" in kinds or "multipart" in kinds -%}
 import {
+    {% if binaries %}type {{ runtime_import("BinaryResponse") }},{% endif %}
     {% if raw_streams %}type {{ runtime_import("EventStream") }},{% endif %}
     {% if typed_streams %}type {{ runtime_import("Stream") }},{% endif %}
     {% if "multipart" in kinds %}MultipartBody, type Upload,{% endif %}

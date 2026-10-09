@@ -11,7 +11,7 @@ use crate::{
     api::{
         Api, Resource, Types,
         resources::request_and_response_roots,
-        types::{self, Type, TypeData},
+        types::{self, EnumVariantType, StructEnumRepr, Type, TypeData},
     },
     postprocessing::Postprocessor,
     template,
@@ -101,6 +101,24 @@ pub(crate) fn generate_with_output_context(
         output_context.unwrap_or(output_dir.as_str()).to_owned(),
     );
     minijinja_env.add_global("_perseid_actual_output_dir", output_dir.as_str().to_owned());
+    minijinja_env.add_global(
+        "param_types",
+        minijinja::Value::from_serialize(param_types(&api)),
+    );
+    let request_only: BTreeSet<String> = (request_only_schemas(&api).into_iter())
+        .map(|name| name.to_upper_camel_case())
+        .collect();
+    minijinja_env.add_global(
+        "request_only_types",
+        minijinja::Value::from_serialize(request_only),
+    );
+    let tri_state: BTreeSet<String> = (tri_state_schemas(&api).into_iter())
+        .map(|name| name.to_upper_camel_case())
+        .collect();
+    minijinja_env.add_global(
+        "tri_state_types",
+        minijinja::Value::from_serialize(tri_state),
+    );
     minijinja_env.add_template(tpl_path, &tpl_source)?;
     let tpl = minijinja_env.get_template(tpl_path)?;
 
@@ -156,8 +174,8 @@ pub(crate) fn for_language(
     if language == "java" {
         api.inline_string_alias_bodies()?;
     }
-    if matches!(language, "cs" | "go" | "rs") {
-        api.inline_flattened_fields()?;
+    if matches!(language, "cs" | "go" | "rs" | "py") {
+        api.inline_flattened_fields(language != "py")?;
     }
     Ok(())
 }
@@ -230,8 +248,42 @@ impl Generator<'_> {
                 .collect::<std::collections::BTreeMap<_, _>>(),
         );
         let request_schemas = request_schemas(&api);
+        let request_only_schemas = request_only_schemas(&api);
+        let tri_state_schemas = tri_state_schemas(&api);
+        // The enums with a `Literal` alias of their values (no schema takes its name), and the open ones.
+        let enum_literals: BTreeSet<String> = (api.types.values())
+            .filter(|t| {
+                matches!(
+                    t.data,
+                    TypeData::StringEnum { .. } | TypeData::IntegerEnum { .. }
+                )
+            })
+            .map(|t| t.name.to_upper_camel_case())
+            .filter(|name| {
+                !api.types
+                    .keys()
+                    .any(|k| k.to_upper_camel_case() == format!("{name}Literal"))
+            })
+            .collect();
+        let open_enums: BTreeSet<String> = (api.types.values())
+            .filter(|t| matches!(t.data, TypeData::StringEnum { open: true, .. }))
+            .map(|t| t.name.to_upper_camel_case())
+            .collect();
+        let closed_enums: BTreeSet<String> = (api.types.values())
+            .filter(|t| matches!(t.data, TypeData::StringEnum { open: false, .. }))
+            .map(|t| t.name.to_upper_camel_case())
+            .collect();
         let errors = errors_context(&api);
         let recursive_aliases = types::recursive_aliases(&api.types);
+        let rust_sizes = template::rust::Sizes::new(&api.types);
+        let convertible_types = match self.tpl_file_ext {
+            "rs" => template::rust::convertible_types(&api.types),
+            _ => BTreeSet::new(),
+        };
+        let alias_targets = match self.tpl_file_ext {
+            "rs" => template::rust::alias_targets(&api.types, &recursive_aliases),
+            _ => std::collections::BTreeMap::new(),
+        };
         for (name, ty) in &api.types {
             let mut referenced_components = ty.referenced_components();
             // A recursive type refers to itself, which is not an import.
@@ -240,6 +292,11 @@ impl Generator<'_> {
             let union_refs = ty.union_refs();
             let patch_body = patch_bodies.contains(name.as_str());
             let inherited_fields = ty.inherited_fields(&api.types);
+            let declared_tags = declared_tags(&api.types, ty);
+            let boxed_variants = match self.tpl_file_ext {
+                "rs" => rust_sizes.boxed_variants(ty),
+                _ => BTreeSet::new(),
+            };
             // Type names, as templates render them, of the schemas `ty` embeds or unites that
             // are not objects (a union, say).
             let non_struct_refs: BTreeSet<String> = ty
@@ -263,11 +320,21 @@ impl Generator<'_> {
                     union_refs,
                     patch_body,
                     inherited_fields,
+                    declared_tags,
+                    boxed_variants,
                     non_struct_refs,
                     output_dir,
                     type_names => type_names.clone(),
                     is_error_schema => api.error_schemas.contains(name),
                     request_schema => request_schemas.contains(name.as_str()),
+                    request_only => request_only_schemas.contains(name.as_str()),
+                    tri_state => tri_state_schemas.contains(name.as_str()),
+                    enum_literals => &enum_literals,
+                    open_enums => &open_enums,
+                    convertible_types => &convertible_types,
+                    alias_targets => &alias_targets,
+                    closed_enums => &closed_enums,
+                    variant_tags => variant_tags(&api.types, ty),
                     ..errors.clone()
                 },
             )?);
@@ -357,10 +424,118 @@ fn errors_context(api: &Api) -> minijinja::Value {
 
 /// Schemas a request can carry: the ones operations send and every schema they reach.
 fn request_schemas(api: &Api) -> BTreeSet<&str> {
-    let mut stack: Vec<&str> = request_and_response_roots(&api.resources)
-        .0
-        .into_iter()
-        .collect();
+    reachable(api, request_and_response_roots(&api.resources).0)
+}
+
+/// Schemas only requests carry: none the SDK decodes (responses, errors, events) reaches them,
+/// nor any schema outside requests, such as a webhook payload.
+fn request_only_schemas(api: &Api) -> BTreeSet<&str> {
+    let requests = request_schemas(api);
+    let mut received = request_and_response_roots(&api.resources).1;
+    received.extend(
+        (api.resources.values().flat_map(|r| &r.operations))
+            .filter_map(|op| op.event_schema_name.as_deref()),
+    );
+    received.extend(
+        api.types
+            .keys()
+            .map(String::as_str)
+            .filter(|name| !requests.contains(name)),
+    );
+    let received = reachable(api, received);
+    requests.difference(&received).copied().collect()
+}
+
+/// Schemas whose optional nullable fields tell `null` from absent: the request-only ones, where
+/// sending `null` clears a value, and PATCH bodies, even when responses carry them too.
+fn tri_state_schemas(api: &Api) -> BTreeSet<&str> {
+    let mut schemas = request_only_schemas(api);
+    schemas.extend(api.resources.values().flat_map(Resource::patch_bodies));
+    schemas
+}
+
+/// The class names of the models requests carry that SDKs also take as their JSON, typed: Python's
+/// `PetParam` dicts. Those are the structs, and the plain unions of them whose variants all hold
+/// the discriminator, so that a dict names its variant.
+fn param_types(api: &Api) -> BTreeSet<String> {
+    let requests = request_schemas(api);
+    let names: BTreeSet<String> = api.types.keys().map(|k| k.to_upper_camel_case()).collect();
+    let free = |name: &str| !names.contains(&format!("{}Param", name.to_upper_camel_case()));
+    let mut params = BTreeSet::new();
+    for name in requests.iter().copied().filter(|n| free(n)) {
+        // A `TypedDict` cannot name a key `""`.
+        if let Some(TypeData::Struct { fields, .. }) = api.types.get(name).map(|t| &t.data)
+            && !fields.iter().any(|f| f.flatten || f.name.is_empty())
+        {
+            params.insert(name.to_upper_camel_case());
+        }
+    }
+    let holds = |variant: &str, field: &str| {
+        matches!(
+            api.types.get(variant).map(|t| &t.data),
+            Some(TypeData::Struct { fields, .. }) if fields.iter().any(|f| f.name == field)
+        )
+    };
+    for name in requests.iter().copied().filter(|n| free(n)) {
+        let Some(TypeData::StructEnum {
+            discriminator_field,
+            repr: StructEnumRepr::InternallyTagged { variants },
+            fields,
+        }) = api.types.get(name).map(|t| &t.data)
+        else {
+            continue;
+        };
+        let refs: Vec<Option<&str>> = (variants.iter())
+            .map(|v| match &v.content {
+                EnumVariantType::Ref {
+                    schema_ref: Some(target),
+                    ..
+                } => Some(target.as_str()),
+                _ => None,
+            })
+            .collect();
+        let distinct = refs.iter().collect::<BTreeSet<_>>().len() == refs.len();
+        let typed = refs.iter().all(|r| {
+            r.is_some_and(|r| {
+                params.contains(&r.to_upper_camel_case()) && holds(r, discriminator_field)
+            })
+        });
+        if fields.is_empty() && distinct && typed {
+            params.insert(name.to_upper_camel_case());
+        }
+    }
+    params
+}
+
+/// The tags the variants of the union `ty` declare instead of the one naming them, by the latter:
+/// OpenAI's `InputMessage` variant is sent as `"type": "message"`.
+fn declared_tags<'a>(
+    types: &'a Types,
+    ty: &'a Type,
+) -> std::collections::BTreeMap<&'a str, &'a str> {
+    let TypeData::StructEnum {
+        discriminator_field,
+        repr: StructEnumRepr::InternallyTagged { variants },
+        ..
+    } = &ty.data
+    else {
+        return Default::default();
+    };
+    (variants.iter())
+        .filter_map(|v| match &v.content {
+            EnumVariantType::Ref {
+                schema_ref: Some(target),
+                ..
+            } => types::declared_tag(types, target, discriminator_field, &v.name)
+                .map(|tag| (v.name.as_str(), tag)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// `roots` and every schema they reach.
+fn reachable<'a>(api: &'a Api, roots: BTreeSet<&'a str>) -> BTreeSet<&'a str> {
+    let mut stack: Vec<&str> = roots.into_iter().collect();
     let mut seen = BTreeSet::new();
     while let Some(name) = stack.pop() {
         if seen.insert(name) {
@@ -373,6 +548,74 @@ fn request_schemas(api: &Api) -> BTreeSet<&str> {
         }
     }
     seen
+}
+
+/// How a struct variant of an internally tagged union carries its tag.
+#[derive(serde::Serialize)]
+struct VariantTag {
+    /// The tag the struct declares, which several variants may share, else the variant's.
+    tag: String,
+    /// The struct's tag property is optional, for callers to leave out.
+    optional: bool,
+    /// The struct's required and known properties, to tell apart the variants of one tag.
+    required: Vec<String>,
+    known: Vec<String>,
+}
+
+/// The `VariantTag` of each struct variant of the internally tagged union `ty`, by variant name.
+fn variant_tags(types: &Types, ty: &Type) -> std::collections::BTreeMap<String, VariantTag> {
+    let TypeData::StructEnum {
+        discriminator_field: field,
+        repr: StructEnumRepr::InternallyTagged { variants },
+        ..
+    } = &ty.data
+    else {
+        return Default::default();
+    };
+    let mut tags = std::collections::BTreeMap::new();
+    for variant in variants {
+        let EnumVariantType::Ref {
+            schema_ref: Some(target),
+            ..
+        } = &variant.content
+        else {
+            continue;
+        };
+        let (mut required, mut known, mut stack, mut seen) =
+            (vec![], vec![], vec![target.as_str()], BTreeSet::new());
+        while let Some(name) = stack.pop() {
+            let Some(TypeData::Struct { fields, .. }) = types.get(name).map(|t| &t.data) else {
+                continue;
+            };
+            for f in fields {
+                match f.r#type.referenced_schema() {
+                    Some(base) if f.flatten => {
+                        if seen.insert(base) {
+                            stack.push(base);
+                        }
+                    }
+                    _ if f.flatten => {}
+                    _ => {
+                        known.push(f.name.clone());
+                        if f.required {
+                            required.push(f.name.clone());
+                        }
+                    }
+                }
+            }
+        }
+        let tag = types::declared_tag(types, target, field, &variant.name).unwrap_or(&variant.name);
+        tags.insert(
+            variant.name.clone(),
+            VariantTag {
+                tag: tag.to_owned(),
+                optional: known.contains(field) && !required.contains(field),
+                required,
+                known,
+            },
+        );
+    }
+    tags
 }
 
 /// Schemas `ty` holds by value that lead back to it, so a language without indirection by

@@ -777,6 +777,73 @@ paths:
         required: true
         content: {application/json: {schema: {type: boolean}}}
       responses: {'204': {description: ok}}
+  # Binary content or an event stream, as OpenAI's speech: bytes, and a `_stream` twin.
+  /speech:
+    post:
+      operationId: create_speech
+      tags: [threads]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [input]
+              properties: {input: {type: string}, stream_format: {type: string, enum: [sse, audio]}}
+      responses:
+        '200':
+          description: ok
+          content:
+            audio/mpeg: {schema: {type: string, format: binary}}
+            text/event-stream: {schema: {$ref: '#/components/schemas/Item'}}
+  # A multipart body whose boolean `stream` part asks for an event stream, as OpenAI's
+  # transcriptions: the twins send it themselves.
+  /transcriptions:
+    post:
+      operationId: create_transcription
+      tags: [threads]
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file]
+              properties:
+                file: {type: string, format: binary}
+                language: {type: string}
+                stream:
+                  anyOf:
+                    - {type: boolean, default: false}
+                    - {type: 'null'}
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json: {schema: {$ref: '#/components/schemas/Item'}}
+            text/event-stream: {schema: {$ref: '#/components/schemas/Item'}}
+  # OpenAI's list shape, paged without a rule: `after` takes the response's `last_id`.
+  /threads:
+    get:
+      operationId: list_threads
+      tags: [threads]
+      parameters:
+        - {name: after, in: query, schema: {type: string}}
+        - {name: limit, in: query, schema: {type: integer}}
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [object, data, has_more]
+                properties:
+                  object: {type: string, const: list}
+                  data: {type: array, items: {$ref: '#/components/schemas/Item'}}
+                  first_id: {type: [string, 'null']}
+                  last_id: {type: [string, 'null']}
+                  has_more: {type: boolean}
 webhooks:
   itemCreated:
     post:
